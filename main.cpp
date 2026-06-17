@@ -35,11 +35,171 @@ struct pixel_format {
     uint8_t padding2;
 };
 
-int main(void) {
+
+void framebuffer_update_request(auto& socket, uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
+    boost::system::error_code error;
+    std::array<uint8_t, 10> framebuffer_update_request = {
+        3, 0,
+        static_cast<uint8_t>(x >> 8), static_cast<uint8_t>(x), static_cast<uint8_t>(y >> 8), static_cast<uint8_t>(y),
+        static_cast<uint8_t>(width >> 8), static_cast<uint8_t>(width), static_cast<uint8_t>(height >> 8), static_cast<uint8_t>(height)
+    };
+    auto len = write(socket, boost::asio::buffer(framebuffer_update_request), error);
+    if (error == boost::asio::error::eof)
+        return;
+    else if (error)
+        throw boost::system::system_error(error);
+    if (len != framebuffer_update_request.size()) {
+        std::cerr << "framebuffer update request send fail" << std::endl;
+    }
+}
+
+void process_server_cut_text(auto& socket) {
+    boost::system::error_code error;
+    std::array<uint8_t, 4> length_buf{};
+    auto len = read(socket, boost::asio::buffer(length_buf), error);
+    if (error == boost::asio::error::eof)
+    {
+        std::cout << "eof" << std::endl;
+        return;
+    }
+    else if (error)
+        throw boost::system::system_error(error);
+    if (len != length_buf.size()) {
+        throw std::runtime_error("server cut text length read fail");
+    }
+
+    uint32_t length =
+        (static_cast<uint32_t>(length_buf[0]) << (3*8)) |
+        (static_cast<uint32_t>(length_buf[1]) << (2*8)) |
+        (static_cast<uint32_t>(length_buf[2]) << (1*8)) |
+        (static_cast<uint32_t>(length_buf[3]) << (0*8)) |
+        0;
+
+    std::vector<char> text(length);
+    len = read(socket, boost::asio::buffer(text), error);
+    if (error == boost::asio::error::eof)
+    {
+        std::cout << "eof" << std::endl;
+        return;
+    }
+    else if (error)
+        throw boost::system::system_error(error);
+    if (len != text.size()) {
+        throw std::runtime_error("server cut text read fail");
+    }
+    text.push_back('\0');
+    std::cout << text.data() << std::endl;
+}
+
+void process_colour_map_entries(auto& socket) {
+    boost::system::error_code error;
+    std::array<uint8_t, 2> colour_count_buf{};
+    auto len = read(socket, boost::asio::buffer(colour_count_buf), error);
+    if (error == boost::asio::error::eof)
+    {
+        std::cout << "eof" << std::endl;
+        return;
+    }
+    else if (error)
+        throw boost::system::system_error(error);
+    if (len != colour_count_buf.size()) {
+        throw std::runtime_error("colour count read fail");
+    }
+
+    uint16_t colour_count = (static_cast<uint16_t>(colour_count_buf[0]) << 8) | colour_count_buf[1];
+    std::vector<uint8_t> colour_map_buf(colour_count*6);
+    len = read(socket, boost::asio::buffer(colour_map_buf), error);
+    if (error == boost::asio::error::eof)
+    {
+        std::cout << "eof" << std::endl;
+        return;
+    }
+    else if (error)
+        throw boost::system::system_error(error);
+    if (len != colour_map_buf.size()) {
+        throw std::runtime_error("colour map read fail");
+    }
+}
+
+void process_server_message(auto& socket, pixel_format& server_pixel_format) {
+    boost::system::error_code error;
+    std::array<uint8_t, 4> framebuffer_update_head{};
+    auto len = read(socket, boost::asio::buffer(framebuffer_update_head), error);
+    if (error == boost::asio::error::eof)
+    {
+        std::cout << "eof" << std::endl;
+        return;
+    }
+    else if (error)
+        throw boost::system::system_error(error);
+    if (len != framebuffer_update_head.size()) {
+        throw std::runtime_error("framebuffer update head read fail");
+    }
+    std::cout << "server message: " << (int)framebuffer_update_head[0] << std::endl;
+    if (framebuffer_update_head[0] == 1) {
+        process_colour_map_entries(socket);
+        return;
+    }
+    if (framebuffer_update_head[0] == 3) {
+        process_server_cut_text(socket);
+        return;
+    }
+    if (framebuffer_update_head[0] != 0) {
+        std::cout << "not framebuffer_update: " << (int)framebuffer_update_head[0] << std::endl;
+        return;
+    }
+    uint16_t rectangles_count = (static_cast<uint16_t>(framebuffer_update_head[2]) << 8) | (framebuffer_update_head[3]);
+    std::cout << "rectangles count: " << rectangles_count << std::endl;
+    for (uint16_t i = 0; i < rectangles_count; i++) {
+        std::array<uint8_t, 12> rectangle{};
+        len = read(socket, boost::asio::buffer(rectangle), error);
+        if (error == boost::asio::error::eof)
+            return;
+        else if (error)
+            throw boost::system::system_error(error);
+        if (len != rectangle.size()) {
+            throw std::runtime_error("framebuffer update rectangle read fail");
+        }
+        uint16_t x = (static_cast<uint16_t>(rectangle[0]) << 8) | rectangle[1];
+        uint16_t y = (static_cast<uint16_t>(rectangle[2]) << 8) | rectangle[3];
+        uint16_t width = (static_cast<uint16_t>(rectangle[4]) << 8) | rectangle[5];
+        uint16_t height = (static_cast<uint16_t>(rectangle[6]) << 8) | rectangle[7];
+        uint16_t encoding_type =
+            (static_cast<uint16_t>(rectangle[8]) << (3*8)) |
+            (static_cast<uint16_t>(rectangle[9]) << (2*8)) |
+            (static_cast<uint16_t>(rectangle[10]) << (1*8)) |
+            (static_cast<uint16_t>(rectangle[11]) << (0*8)) |
+            0;
+        std::cout << "x: " << x << std::endl;
+        std::cout << "y: " << y << std::endl;
+        std::cout << "width: " << width << std::endl;
+        std::cout << "height: " << height << std::endl;
+        if (encoding_type != 0) {
+            throw std::runtime_error("encoding not support");
+        }
+
+        std::vector<uint8_t> pixels(width*height*server_pixel_format.bits_per_pixel/8);
+        len = read(socket, boost::asio::buffer(pixels), error);
+        if (error == boost::asio::error::eof)
+            return;
+        else if (error)
+            throw boost::system::system_error(error);
+        if (len != pixels.size()) {
+            throw std::runtime_error("framebuffer update rectangle pixels read fail");
+        }
+    }
+}
+
+int main(int argc, char** argv) {
     try {
         boost::asio::io_context io_context;
         tcp::resolver resolver(io_context);
-        auto endpoints = resolver.resolve("127.0.0.1", "5901");
+        char* port;
+        if (argc < 2)
+            port = "5900";
+        else
+            port = argv[1];
+        auto endpoints = resolver.resolve("127.0.0.1", port);
         tcp::socket socket(io_context);
         boost::asio::connect(socket, endpoints);
 
@@ -58,11 +218,15 @@ int main(void) {
             return -1;
         }
 
-        socket.write_some(boost::asio::buffer(buf), error);
+        len = write(socket, boost::asio::buffer(buf), error);
         if (error == boost::asio::error::eof)
             return 0;
         else if (error)
             throw boost::system::system_error(error);
+        if (len != buf.size()) {
+            std::cerr << "write support buf failed" << std::endl;
+            return -1;
+        }
 
         {
             std::array<uint8_t,1> security_count{};
@@ -86,7 +250,7 @@ int main(void) {
             }
             std::cout << std::endl;
 
-            socket.write_some(boost::asio::buffer({1}), error);
+            write(socket, boost::asio::buffer(std::array<uint8_t,1>{1}), error);
             if (error == boost::asio::error::eof)
                 return 0;
             else if (error)
@@ -109,13 +273,13 @@ int main(void) {
 
         uint8_t is_shared = true;
         {
-            socket.write_some(boost::asio::buffer({is_shared}), error);
+            write(socket, boost::asio::buffer(std::array<uint8_t,1>{is_shared}), error);
         }
 
         uint16_t fb_width{}, fb_height{};
         pixel_format server_pixel_format{};
         uint32_t name_length{};
-        std::string name{};
+        std::vector<char> name{};
 
         {
             std::array<uint8_t, 24> server_init_buf{};
@@ -144,10 +308,19 @@ int main(void) {
             server_pixel_format.padding1 = server_init_buf[18];
             server_pixel_format.padding2 = server_init_buf[19];
 
-            name_length = server_init_buf[20];
+            name_length =
+                (static_cast<uint32_t>(server_init_buf[20]) << (3*8)) |
+                (static_cast<uint32_t>(server_init_buf[21]) << (2*8)) |
+                (static_cast<uint32_t>(server_init_buf[22]) << (1*8)) |
+                (static_cast<uint32_t>(server_init_buf[23]) << (0*8)) |
+                0;
             std::cout << "name length: " << name_length << std::endl;
             name.resize(name_length);
             len = read(socket, boost::asio::buffer(name), error);
+            if (error == boost::asio::error::eof)
+                return 0;
+            else if (error)
+                throw boost::system::system_error(error);
             if (len != name_length) {
                 std::cerr << "name parse fail" << std::endl;
                 return -1;
@@ -159,7 +332,49 @@ int main(void) {
             std::cout << "true colour: " << (int)server_pixel_format.true_colour_flag << std::endl;
             std::cout << "color max: " << server_pixel_format.red_max << ", " << server_pixel_format.green_max << ", " << server_pixel_format.blue_max << std::endl;
             std::cout << "color shift: " << (int)server_pixel_format.red_shift << ", " << (int)server_pixel_format.green_shift << ", " << (int)server_pixel_format.blue_shift << std::endl;
-            std::cout << "server name: " << name << std::endl;
+            name.push_back('\0');
+            std::cout << "server name: " << name.data() << std::endl;
+        }
+
+        if (true) {
+            std::array<uint8_t, 20> set_format = {
+                0, 0, 0, 0,
+                32, 24, 0, 1,
+                0, 255, 0, 255, 0, 255,
+                16, 8, 0, 0, 0, 0,
+            };
+            len = write(socket, boost::asio::buffer(set_format), error);
+            if (error == boost::asio::error::eof)
+                return 0;
+            else if (error)
+                throw boost::system::system_error(error);
+            if (len != set_format.size()) {
+                std::cerr << "set format send fail" << std::endl;
+            }
+        }
+        if (true) {
+            std::array<uint8_t, 8> set_encodings = {
+                2, 0, // SetEncoding, padding
+                0, 1, // Number of encoding
+                0, 0, 0, 0, // Raw encoding
+            };
+            len = write(socket, boost::asio::buffer(set_encodings), error);
+            if (error == boost::asio::error::eof)
+                return 0;
+            else if (error)
+                throw boost::system::system_error(error);
+            if (len != set_encodings.size()) {
+                std::cerr << "set encoding send fail" << std::endl;
+            }
+        }
+
+        if (true) {
+        }
+
+        while (true) {
+            framebuffer_update_request(socket, 0, 0, fb_width, fb_height);
+            process_server_message(socket, server_pixel_format);
+            sleep(1);
         }
     }
     catch (std::exception& e) {
