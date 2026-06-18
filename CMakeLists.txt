@@ -8,3 +8,5 @@ add_executable(rfb_demo
 
 target_compile_features(rfb_demo PUBLIC cxx_std_20)
 
+target_link_libraries(rfb_demo PUBLIC vulkan_start)
+
