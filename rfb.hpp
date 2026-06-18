@@ -143,14 +143,13 @@ void process_colour_map_entries(auto& socket) {
     }
 }
 
-void process_server_message(auto& socket, pixel_format& server_pixel_format) {
+std::vector<uint8_t> process_server_message(auto& socket, pixel_format& server_pixel_format) {
     boost::system::error_code error;
     std::array<uint8_t, 4> framebuffer_update_head{};
     auto len = read(socket, boost::asio::buffer(framebuffer_update_head), error);
     if (error == boost::asio::error::eof)
     {
-        std::cout << "eof" << std::endl;
-        return;
+        throw std::runtime_error("eof");
     }
     else if (error)
         throw boost::system::system_error(error);
@@ -160,23 +159,24 @@ void process_server_message(auto& socket, pixel_format& server_pixel_format) {
     std::cout << "server message: " << (int)framebuffer_update_head[0] << std::endl;
     if (framebuffer_update_head[0] == 1) {
         process_colour_map_entries(socket);
-        return;
+        return {};
     }
     if (framebuffer_update_head[0] == 3) {
         process_server_cut_text(socket);
-        return;
+        return {};
     }
     if (framebuffer_update_head[0] != 0) {
         std::cout << "not framebuffer_update: " << (int)framebuffer_update_head[0] << std::endl;
-        return;
+        return {};
     }
     uint16_t rectangles_count = from_big_endian_bytes(framebuffer_update_head[2], framebuffer_update_head[3]);
     std::cout << "rectangles count: " << rectangles_count << std::endl;
+    std::vector<uint8_t> last_update{};
     for (uint16_t i = 0; i < rectangles_count; i++) {
         std::array<uint8_t, 12> rectangle{};
         len = read(socket, boost::asio::buffer(rectangle), error);
         if (error == boost::asio::error::eof)
-            return;
+            throw std::runtime_error("eof");
         else if (error)
             throw boost::system::system_error(error);
         if (len != rectangle.size()) {
@@ -198,13 +198,16 @@ void process_server_message(auto& socket, pixel_format& server_pixel_format) {
         std::vector<uint8_t> pixels(width*height*server_pixel_format.bits_per_pixel/8);
         len = read(socket, boost::asio::buffer(pixels), error);
         if (error == boost::asio::error::eof)
-            return;
+            throw std::runtime_error("eof");
         else if (error)
             throw boost::system::system_error(error);
         if (len != pixels.size()) {
             throw std::runtime_error("framebuffer update rectangle pixels read fail");
         }
+
+        last_update = std::move(pixels);
     }
+    return last_update;
 }
 
 struct server_init_message {

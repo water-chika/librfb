@@ -87,6 +87,34 @@ public:
   void destroy() {}
 }; // class record_swapchain_command_buffers in use_app<app::cube>
 
+template<class T>
+class add_rfb : public T {
+public:
+    using parent = T;
+    add_rfb() :
+        m_io_context{},
+        m_resolver{m_io_context},
+        m_socket{m_io_context}
+    {
+        auto endpoints = m_resolver.resolve("127.0.0.1", "5901");
+        boost::asio::connect(m_socket, endpoints);
+
+        rfb_init(m_socket);
+        m_server_init_message = server_init(m_socket);
+        set_format(m_socket);
+        set_encodings(m_socket);
+    }
+    auto get_rfb() {
+        framebuffer_update_request(m_socket, 0, 0, m_server_init_message.fb_width, m_server_init_message.fb_height);
+        return process_server_message(m_socket, m_server_init_message.server_pixel_format);
+    }
+private:
+    boost::asio::io_context m_io_context;
+    tcp::resolver m_resolver;
+    tcp::socket m_socket;
+    server_init_message m_server_init_message;
+};
+
 template <class T> class add_dynamic_draw : public T {
 public:
   using parent = T;
@@ -124,9 +152,10 @@ public:
 
     std::vector<void*> upload_memory_ptrs = parent::get_buffer_memory_ptr_vector();
     uint32_t* upload_ptr = reinterpret_cast<uint32_t*>(upload_memory_ptrs[index]);
+    auto rfb = parent::get_rfb();
     for (int y = 0; y < 1080; y++) {
         for (int x = 0; x < 1920; x++) {
-            upload_ptr[y*1920+x] = 0x00ffff00;
+            upload_ptr[y*1920+x] = reinterpret_cast<uint32_t*>(rfb.data())[y*1920+x];
         }
     }
     auto upload_memory_vector = parent::get_buffer_memory_vector();
@@ -238,6 +267,7 @@ class add_physical_device_and_device_and_draw
     : public
     add_frame_time_analyser<
     add_dynamic_draw <
+    add_rfb<
     add_get_time <
     add_process_suboptimal_image<
         decltype([](auto* p) {p->recreate_surface();std::cout << "recreate surface" << std::endl;}),
@@ -268,7 +298,7 @@ class add_physical_device_and_device_and_draw
     add_recreate_surface<
     typename use_platform<PLATFORM>::template add_vulkan_surface<
     T
-  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 {};
 
 using draw_app =
