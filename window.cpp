@@ -7,6 +7,8 @@
 
 #include "vulkan_start.hpp"
 
+#include "rfb.hpp"
+
 using namespace vulkan_start;
 using namespace vulkan_hpp_helper;
 
