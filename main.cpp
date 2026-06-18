@@ -7,6 +7,29 @@ uint16_t parse_3digits(char d100, char d10, char d) {
     return (d100-'0')*100 + (d10-'0')*10 + (d-'0');
 }
 
+uint16_t from_big_endian_bytes(uint8_t b0, uint8_t b1) {
+    return
+        (static_cast<uint16_t>(b0) << (1*8)) |
+        (static_cast<uint16_t>(b1) << (0*8)) |
+        0;
+}
+uint8_t to_big_endian_byte(uint16_t n, uint8_t i) {
+    assert(i < sizeof(n));
+    return static_cast<uint8_t>(n >> (((sizeof(n)-1)-i)*8));
+}
+uint32_t from_big_endian_bytes(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3) {
+    return
+        (static_cast<uint16_t>(b0) << (3*8)) |
+        (static_cast<uint16_t>(b1) << (2*8)) |
+        (static_cast<uint16_t>(b2) << (1*8)) |
+        (static_cast<uint16_t>(b3) << (0*8)) |
+        0;
+}
+uint8_t to_big_endian_byte(uint32_t n, uint8_t i) {
+    assert(i < sizeof(n));
+    return static_cast<uint8_t>(n >> (((sizeof(n)-1)-i)*8));
+}
+
 std::pair<uint16_t, uint16_t> parse_protocol_version(const std::array<char,12>& message) {
     bool is_rfb = message[0] == 'R' &&
         message[1] == 'F' &&
@@ -40,8 +63,10 @@ void framebuffer_update_request(auto& socket, uint16_t x, uint16_t y, uint16_t w
     boost::system::error_code error;
     std::array<uint8_t, 10> framebuffer_update_request = {
         3, 0,
-        static_cast<uint8_t>(x >> 8), static_cast<uint8_t>(x), static_cast<uint8_t>(y >> 8), static_cast<uint8_t>(y),
-        static_cast<uint8_t>(width >> 8), static_cast<uint8_t>(width), static_cast<uint8_t>(height >> 8), static_cast<uint8_t>(height)
+        to_big_endian_byte(x, 0), to_big_endian_byte(x, 1),
+        to_big_endian_byte(y, 0), to_big_endian_byte(y, 1),
+        to_big_endian_byte(width, 0), to_big_endian_byte(width, 1),
+        to_big_endian_byte(height, 0), to_big_endian_byte(height, 1),
     };
     auto len = write(socket, boost::asio::buffer(framebuffer_update_request), error);
     if (error == boost::asio::error::eof)
@@ -68,12 +93,7 @@ void process_server_cut_text(auto& socket) {
         throw std::runtime_error("server cut text length read fail");
     }
 
-    uint32_t length =
-        (static_cast<uint32_t>(length_buf[0]) << (3*8)) |
-        (static_cast<uint32_t>(length_buf[1]) << (2*8)) |
-        (static_cast<uint32_t>(length_buf[2]) << (1*8)) |
-        (static_cast<uint32_t>(length_buf[3]) << (0*8)) |
-        0;
+    uint32_t length = from_big_endian_bytes(length_buf[0], length_buf[1], length_buf[2], length_buf[3]);
 
     std::vector<char> text(length);
     len = read(socket, boost::asio::buffer(text), error);
@@ -106,7 +126,7 @@ void process_colour_map_entries(auto& socket) {
         throw std::runtime_error("colour count read fail");
     }
 
-    uint16_t colour_count = (static_cast<uint16_t>(colour_count_buf[0]) << 8) | colour_count_buf[1];
+    uint16_t colour_count = from_big_endian_bytes(colour_count_buf[0], colour_count_buf[1]);
     std::vector<uint8_t> colour_map_buf(colour_count*6);
     len = read(socket, boost::asio::buffer(colour_map_buf), error);
     if (error == boost::asio::error::eof)
@@ -148,7 +168,7 @@ void process_server_message(auto& socket, pixel_format& server_pixel_format) {
         std::cout << "not framebuffer_update: " << (int)framebuffer_update_head[0] << std::endl;
         return;
     }
-    uint16_t rectangles_count = (static_cast<uint16_t>(framebuffer_update_head[2]) << 8) | (framebuffer_update_head[3]);
+    uint16_t rectangles_count = from_big_endian_bytes(framebuffer_update_head[2], framebuffer_update_head[3]);
     std::cout << "rectangles count: " << rectangles_count << std::endl;
     for (uint16_t i = 0; i < rectangles_count; i++) {
         std::array<uint8_t, 12> rectangle{};
@@ -160,16 +180,11 @@ void process_server_message(auto& socket, pixel_format& server_pixel_format) {
         if (len != rectangle.size()) {
             throw std::runtime_error("framebuffer update rectangle read fail");
         }
-        uint16_t x = (static_cast<uint16_t>(rectangle[0]) << 8) | rectangle[1];
-        uint16_t y = (static_cast<uint16_t>(rectangle[2]) << 8) | rectangle[3];
-        uint16_t width = (static_cast<uint16_t>(rectangle[4]) << 8) | rectangle[5];
-        uint16_t height = (static_cast<uint16_t>(rectangle[6]) << 8) | rectangle[7];
-        uint16_t encoding_type =
-            (static_cast<uint16_t>(rectangle[8]) << (3*8)) |
-            (static_cast<uint16_t>(rectangle[9]) << (2*8)) |
-            (static_cast<uint16_t>(rectangle[10]) << (1*8)) |
-            (static_cast<uint16_t>(rectangle[11]) << (0*8)) |
-            0;
+        uint16_t x = from_big_endian_bytes(rectangle[0], rectangle[1]);
+        uint16_t y = from_big_endian_bytes(rectangle[2], rectangle[3]);
+        uint16_t width = from_big_endian_bytes(rectangle[4], rectangle[5]);
+        uint16_t height = from_big_endian_bytes(rectangle[6], rectangle[7]);
+        uint16_t encoding_type = from_big_endian_bytes(rectangle[8], rectangle[9], rectangle[10], rectangle[11]);
         std::cout << "x: " << x << std::endl;
         std::cout << "y: " << y << std::endl;
         std::cout << "width: " << width << std::endl;
@@ -263,11 +278,7 @@ int main(int argc, char** argv) {
             else if (error)
                 throw boost::system::system_error(error);
 
-            uint32_t security_result =
-                static_cast<uint32_t>(security_result_buf[0] << (3*8)) |
-                static_cast<uint32_t>(security_result_buf[1] << (2*8)) |
-                static_cast<uint32_t>(security_result_buf[2] << (1*8)) |
-                static_cast<uint32_t>(security_result_buf[3] << (0*8));
+            uint32_t security_result = from_big_endian_bytes(security_result_buf[0], security_result_buf[1], security_result_buf[2], security_result_buf[3]);
             std::cout << "security handshaking result: " << security_result << std::endl;
         }
 
@@ -292,15 +303,15 @@ int main(int argc, char** argv) {
                 std::cerr << "server_init_buf read fail with len: " << len << std::endl;
                 //return -1;
             }
-            fb_width = (static_cast<uint16_t>(server_init_buf[0]) << 8) | (server_init_buf[1]);
-            fb_height = (static_cast<uint16_t>(server_init_buf[2]) << 8) | (server_init_buf[3]);
+            fb_width = from_big_endian_bytes(server_init_buf[0], server_init_buf[1]);
+            fb_height = from_big_endian_bytes(server_init_buf[2], server_init_buf[3]);
             server_pixel_format.bits_per_pixel = server_init_buf[4];
             server_pixel_format.depth = server_init_buf[5];
             server_pixel_format.big_endian_flag = server_init_buf[6];
             server_pixel_format.true_colour_flag = server_init_buf[7];
-            server_pixel_format.red_max = (static_cast<uint16_t>(server_init_buf[8]) << 8) | (server_init_buf[9]);
-            server_pixel_format.green_max = (static_cast<uint16_t>(server_init_buf[10]) << 8) | (server_init_buf[11]);
-            server_pixel_format.blue_max = (static_cast<uint16_t>(server_init_buf[12]) << 8) | (server_init_buf[13]);
+            server_pixel_format.red_max = from_big_endian_bytes(server_init_buf[8], server_init_buf[9]);
+            server_pixel_format.green_max = from_big_endian_bytes(server_init_buf[10], server_init_buf[11]);
+            server_pixel_format.blue_max = from_big_endian_bytes(server_init_buf[12], server_init_buf[13]);
             server_pixel_format.red_shift = server_init_buf[14];
             server_pixel_format.green_shift = server_init_buf[15];
             server_pixel_format.blue_shift = server_init_buf[16];
@@ -308,12 +319,7 @@ int main(int argc, char** argv) {
             server_pixel_format.padding1 = server_init_buf[18];
             server_pixel_format.padding2 = server_init_buf[19];
 
-            name_length =
-                (static_cast<uint32_t>(server_init_buf[20]) << (3*8)) |
-                (static_cast<uint32_t>(server_init_buf[21]) << (2*8)) |
-                (static_cast<uint32_t>(server_init_buf[22]) << (1*8)) |
-                (static_cast<uint32_t>(server_init_buf[23]) << (0*8)) |
-                0;
+            name_length = from_big_endian_bytes(server_init_buf[20], server_init_buf[21], server_init_buf[22], server_init_buf[23]);
             std::cout << "name length: " << name_length << std::endl;
             name.resize(name_length);
             len = read(socket, boost::asio::buffer(name), error);
