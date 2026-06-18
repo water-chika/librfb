@@ -4,8 +4,7 @@ Library for Remote Frame Buffer protocol.
 
 ## TODO
 
-1. Create window.
-2. Present framebuffer to window.
+1. Decode zlib Encoding.
 
 ## Reference
 
