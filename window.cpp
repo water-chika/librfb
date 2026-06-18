@@ -24,6 +24,7 @@ public:
     auto buffers = parent::get_swapchain_command_buffers();
     auto swapchain_images = parent::get_swapchain_images();
     auto queue_family_index = parent::get_queue_family_index();
+    auto image_buffers = parent::get_buffer_vector();
 
     if (buffers.size() != swapchain_images.size()) {
       throw std::runtime_error{
@@ -40,6 +41,44 @@ public:
       auto render_area = vk::Rect2D{}
                              .setOffset(vk::Offset2D{0, 0})
                              .setExtent(swapchain_image_extent);
+      auto subresource_range = vk::ImageSubresourceRange{}.setAspectMask(vk::ImageAspectFlagBits::eColor).setLevelCount(1).setLayerCount(1);
+      auto subresource_layers = vk::ImageSubresourceLayers{}.setAspectMask(vk::ImageAspectFlagBits::eColor).setLayerCount(1);
+      {
+          auto image_memory_barrier = vk::ImageMemoryBarrier2{}
+                .setOldLayout(vk::ImageLayout::eUndefined).setNewLayout(vk::ImageLayout::eTransferDstOptimal)
+                .setImage(swapchain_image)
+                .setSrcStageMask(vk::PipelineStageFlagBits2::eTopOfPipe)
+                .setSrcAccessMask(vk::AccessFlagBits2::eNone)
+                .setDstStageMask(vk::PipelineStageFlagBits2::eTransfer)
+                .setDstAccessMask(vk::AccessFlagBits2::eTransferWrite)
+                .setSubresourceRange(subresource_range);
+          cmd.pipelineBarrier2(
+                  vk::DependencyInfo{}.setImageMemoryBarriers(image_memory_barrier)
+                  );
+      }
+      auto image_buffer = image_buffers[index];
+      auto buffer_image_copy = vk::BufferImageCopy{}
+              .setBufferOffset(0)
+              .setBufferRowLength(1920)
+              .setBufferImageHeight(1080)
+              .setImageSubresource(subresource_layers)
+              .setImageExtent(vk::Extent3D{swapchain_image_extent.width, swapchain_image_extent.height, 1});
+      cmd.copyBufferToImage(image_buffer, swapchain_image, vk::ImageLayout::eTransferDstOptimal, 1,
+              &buffer_image_copy
+              );
+      {
+          auto image_memory_barrier = vk::ImageMemoryBarrier2{}
+                .setOldLayout(vk::ImageLayout::eTransferDstOptimal).setNewLayout(vk::ImageLayout::ePresentSrcKHR)
+                .setImage(swapchain_image)
+                .setSrcStageMask(vk::PipelineStageFlagBits2::eTransfer)
+                .setSrcAccessMask(vk::AccessFlagBits2::eTransferWrite)
+                .setDstStageMask(vk::PipelineStageFlagBits2::eBottomOfPipe)
+                .setDstAccessMask(vk::AccessFlagBits2::eNone)
+                .setSubresourceRange(subresource_range);
+          cmd.pipelineBarrier2(
+                  vk::DependencyInfo{}.setImageMemoryBarriers(image_memory_barrier)
+                  );
+      }
       cmd.end();
     }
   }
@@ -81,6 +120,20 @@ public:
     }
     device.resetFences(acquire_next_image_semaphore_fence);
 
+    std::vector<void*> upload_memory_ptrs = parent::get_buffer_memory_ptr_vector();
+    uint32_t* upload_ptr = reinterpret_cast<uint32_t*>(upload_memory_ptrs[index]);
+    for (int y = 0; y < 1080; y++) {
+        for (int x = 0; x < 1920; x++) {
+            upload_ptr[y*1920+x] = 0x00ffff00;
+        }
+    }
+    auto upload_memory_vector = parent::get_buffer_memory_vector();
+    auto upload_memory = upload_memory_vector[index];
+    device.flushMappedMemoryRanges(vk::MappedMemoryRange{}
+            .setMemory(upload_memory)
+            .setOffset(0)
+            .setSize(vk::WholeSize));
+
     auto time = parent::get_time();
     auto time_in_ms = std::chrono::duration_cast<std::chrono::milliseconds>(time);
     uint64_t frame_index = time_in_ms.count();
@@ -120,8 +173,22 @@ public:
   }
 };
 
+template <class T> class set_vector_size_to_swapchain_image_count : public T {
+public:
+  using parent = T;
+  auto get_vector_size() { return parent::get_swapchain_images().size(); }
+};
+
 template <class T> class add_cube_swapchain_and_pipeline_layout
   : public
+    map_buffer_memory_vector<
+    add_buffer_memory_vector<
+    set_buffer_memory_properties<vk::MemoryPropertyFlagBits::eHostVisible,
+    add_buffer_vector<
+    add_buffer_usage<vk::BufferUsageFlagBits::eTransferSrc,
+    empty_buffer_usage<
+    set_buffer_size<1920*1080*4,
+    set_vector_size_to_swapchain_image_count<
 	add_recreate_surface_for<
 	add_swapchain_images_views<
 	add_recreate_surface_for<
@@ -130,7 +197,7 @@ template <class T> class add_cube_swapchain_and_pipeline_layout
 	add_swapchain<
 	add_swapchain_image_format<
   T
-  >>>>>>>
+  >>>>>>>>>>>>>>>
 {};
 
 template<class T>
@@ -151,12 +218,6 @@ public:
         F f;
         f(this);
     }
-};
-
-template <class T> class set_vector_size_to_swapchain_image_count : public T {
-public:
-  using parent = T;
-  auto get_vector_size() { return parent::get_swapchain_images().size(); }
 };
 
 template <class T> class add_get_time : public T {
