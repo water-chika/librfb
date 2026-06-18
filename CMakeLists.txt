@@ -10,3 +10,10 @@ target_compile_features(rfb_demo PUBLIC cxx_std_20)
 
 target_link_libraries(rfb_demo PUBLIC vulkan_start)
 
+add_executable(rfb_window_demo
+    window.cpp
+)
+
+target_compile_features(rfb_window_demo PUBLIC cxx_std_20)
+
+target_link_libraries(rfb_window_demo PUBLIC vulkan_start)
