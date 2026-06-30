@@ -10,8 +10,11 @@
 
 #include "rfb.hpp"
 
+#include <memory>
+
 using namespace vulkan_start;
 using namespace vulkan_hpp_helper;
+using vulkan_hpp_helper::configure;
 
 #ifdef WIN32
 constexpr auto PLATFORM = vulkan_start::platform::win32;
@@ -22,7 +25,9 @@ constexpr auto PLATFORM = vulkan_start::platform::wayland;
 template <class T> class record_swapchain_command_buffers : public T {
 public:
   using parent = T;
-  record_swapchain_command_buffers() { create(); }
+  record_swapchain_command_buffers(const configure auto& conf) : parent{conf} {
+      create();
+  }
   void create() {
     auto buffers = parent::get_swapchain_command_buffers();
     auto swapchain_images = parent::get_swapchain_images();
@@ -93,7 +98,7 @@ class add_rfb : public T {
 public:
     using parent = T;
     using tcp = boost::asio::ip::tcp;
-    add_rfb() :
+    add_rfb(const configure auto& conf) : parent{conf},
         m_io_context{},
         m_resolver{m_io_context},
         m_socket{m_io_context}
@@ -105,6 +110,13 @@ public:
         m_server_init_message = rfb::server_init(m_socket);
         rfb::set_format(m_socket);
         rfb::set_encodings(m_socket);
+    }
+    add_rfb(add_rfb&&) : parent{empty_configure{}},
+        m_io_context{},
+        m_resolver{m_io_context},
+        m_socket{m_io_context}
+        {
+        std::cerr << "move construct should not be called" << std::endl;
     }
     auto get_rfb() {
         rfb::framebuffer_update_request(m_socket, 0, 0, m_server_init_message.fb_width, m_server_init_message.fb_height);
@@ -138,6 +150,8 @@ public:
     using parent = T;
     static constexpr int FD_INDEX = parent::FDS_SIZE;
     static constexpr int FDS_SIZE = parent::FDS_SIZE+1;
+    add_rfb_pollfd(const configure auto& conf) : parent{conf} {
+    }
     std::array<pollfd, FDS_SIZE> get_fds() {
         std::array<pollfd, FDS_SIZE> res{};
         auto fds = parent::get_fds();
@@ -165,6 +179,10 @@ public:
 template <class T> class add_dynamic_draw : public T {
 public:
   using parent = T;
+  add_dynamic_draw(const configure auto& conf) : parent{conf} {
+  }
+  add_dynamic_draw(const add_dynamic_draw&) = delete;
+  add_dynamic_draw(add_dynamic_draw&&) = default;
   void draw() {
     vk::Device device = parent::get_device();
     vk::SwapchainKHR swapchain = parent::get_swapchain();
@@ -254,11 +272,13 @@ public:
 template <class T> class set_vector_size_to_swapchain_image_count : public T {
 public:
   using parent = T;
+  set_vector_size_to_swapchain_image_count(const configure auto& conf) : parent{conf} {
+  }
   auto get_vector_size() { return parent::get_swapchain_images().size(); }
 };
 
-template <class T> class add_cube_swapchain_and_pipeline_layout
-  : public
+template <class T>
+using add_cube_swapchain_and_pipeline_layout =
     map_buffer_memory_vector<
     add_buffer_memory_vector<
     set_buffer_memory_properties<vk::MemoryPropertyFlagBits::eHostVisible,
@@ -276,12 +296,14 @@ template <class T> class add_cube_swapchain_and_pipeline_layout
 	add_swapchain_image_format<
   T
   >>>>>>>>>>>>>>>
-{};
+;
 
 template<class T>
 class add_queue_wait_idle_to_recreate_surface : public T {
 public:
     using parent = T;
+    add_queue_wait_idle_to_recreate_surface(const configure auto& conf) : parent{conf} {
+    }
     void recreate_surface() {
         auto queue = parent::get_queue();
         queue.waitIdle();
@@ -292,6 +314,8 @@ public:
 template <class F, class T> class add_process_suboptimal_image : public T {
 public:
     using parent = T;
+    add_process_suboptimal_image(const configure auto& conf) : parent{conf} {
+    }
     void process_suboptimal_image() {
         F f;
         f(this);
@@ -300,7 +324,8 @@ public:
 
 template <class T> class add_get_time : public T {
 public:
-    add_get_time() : m_start_time{std::chrono::steady_clock::now()}{
+    using parent = T;
+    add_get_time(const configure auto& conf) : parent{conf}, m_start_time{std::chrono::steady_clock::now()}{
     }
     auto get_time() {
         return std::chrono::steady_clock::now() - m_start_time;
@@ -309,26 +334,48 @@ private:
     std::chrono::steady_clock::time_point m_start_time;
 };
 
-static const char* address;
-static const char* port;
+template<typename T>
+concept contain_ip_address = requires (T t) {
+    t.address;
+    t.port;
+};
+
 template<typename T>
 class set_address : public T {
 public:
+    using parent = T;
+    template<configure Configure>
+        requires contain_ip_address<Configure>
+    set_address(const Configure& conf) : parent{conf},
+        address{conf.address} {
+    }
+    set_address(const configure auto& conf) : parent{conf} {
+    }
     auto get_address() {
         return address;
     }
+    const char* address;
 };
 template<typename T>
 class set_port : public T {
 public:
+    using parent = T;
+    template<configure Configure>
+        requires contain_ip_address<Configure>
+    set_port(const Configure& conf) : parent{conf},
+        port{conf.port} {
+    }
+    set_port(const configure auto& conf) : parent{conf} {
+    }
     auto get_port() {
         return port;
     }
+    const char* port;
 };
 
 template<class T>
-class add_physical_device_and_device_and_draw
-    : public
+using
+add_physical_device_and_device_and_draw =
     add_dynamic_draw <
     add_rfb<
     set_address<
@@ -364,7 +411,16 @@ class add_physical_device_and_device_and_draw
     typename use_platform<PLATFORM>::template add_vulkan_surface<
     T
   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-{};
+;
+
+struct config {
+    const char* address;
+    const char* port;
+};
+template<>
+struct vulkan_hpp_helper::is_configure_structure<config> {
+    static constexpr bool value = true;
+};
 
 using draw_app =
     vulkan_start::run_on_platform<
@@ -379,9 +435,10 @@ int main(int argc, const char* argv[]) {
     if (argc < 3) {
         throw std::logic_error("Usage: rfb_window_demo <address> <port>");
     }
-    address = argv[1];
-    port = argv[2];
-    auto app = draw_app{};
+    auto address = argv[1];
+    auto port = argv[2];
+    auto conf = config{.address=address, .port=port};
+    auto app = draw_app{conf};
   } catch (std::exception &e) {
     std::cerr << e.what() << std::endl;
   }

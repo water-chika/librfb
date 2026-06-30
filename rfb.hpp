@@ -190,7 +190,7 @@ std::vector<uint8_t> process_server_message(auto& socket, pixel_format& server_p
         uint16_t width = from_big_endian_bytes(rectangle[4], rectangle[5]);
         uint16_t height = from_big_endian_bytes(rectangle[6], rectangle[7]);
         uint16_t encoding_type = from_big_endian_bytes(rectangle[8], rectangle[9], rectangle[10], rectangle[11]);
-        if (true) {
+        if (false) {
             std::cout << "x: " << x << std::endl;
             std::cout << "y: " << y << std::endl;
             std::cout << "width: " << width << std::endl;
