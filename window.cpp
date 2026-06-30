@@ -6,6 +6,7 @@
 #endif
 
 #include "vulkan_start.hpp"
+#include <posix.hpp>
 
 #include "rfb.hpp"
 
@@ -91,28 +92,74 @@ template<class T>
 class add_rfb : public T {
 public:
     using parent = T;
+    using tcp = boost::asio::ip::tcp;
     add_rfb() :
         m_io_context{},
         m_resolver{m_io_context},
         m_socket{m_io_context}
     {
-        auto endpoints = m_resolver.resolve("127.0.0.1", "5901");
+        auto endpoints = m_resolver.resolve(parent::get_address(), parent::get_port());
         boost::asio::connect(m_socket, endpoints);
 
-        rfb_init(m_socket);
-        m_server_init_message = server_init(m_socket);
-        set_format(m_socket);
-        set_encodings(m_socket);
+        rfb::rfb_init(m_socket);
+        m_server_init_message = rfb::server_init(m_socket);
+        rfb::set_format(m_socket);
+        rfb::set_encodings(m_socket);
     }
     auto get_rfb() {
-        framebuffer_update_request(m_socket, 0, 0, m_server_init_message.fb_width, m_server_init_message.fb_height);
-        return process_server_message(m_socket, m_server_init_message.server_pixel_format);
+        rfb::framebuffer_update_request(m_socket, 0, 0, m_server_init_message.fb_width, m_server_init_message.fb_height);
+        return rfb::process_server_message(m_socket, m_server_init_message.server_pixel_format);
+    }
+    auto& get_socket() {
+        return m_socket;
+    }
+    auto get_socket_fd() {
+        return m_socket.native_handle();
+    }
+    auto& get_server_pixel_format() {
+        return m_server_init_message.server_pixel_format;
+    }
+    auto get_fb_width() {
+        return m_server_init_message.fb_width;
+    }
+    auto get_fb_height() {
+        return m_server_init_message.fb_height;
     }
 private:
     boost::asio::io_context m_io_context;
     tcp::resolver m_resolver;
     tcp::socket m_socket;
-    server_init_message m_server_init_message;
+    rfb::server_init_message m_server_init_message;
+};
+
+template<typename T>
+class add_rfb_pollfd : public T {
+public:
+    using parent = T;
+    static constexpr int FD_INDEX = parent::FDS_SIZE;
+    static constexpr int FDS_SIZE = parent::FDS_SIZE+1;
+    std::array<pollfd, FDS_SIZE> get_fds() {
+        std::array<pollfd, FDS_SIZE> res{};
+        auto fds = parent::get_fds();
+        std::copy(fds.begin(), fds.end(), res.begin());
+        res.back() = pollfd{
+            .fd = parent::get_socket_fd(),
+            .revents = POLLIN
+        };
+        return res;
+    }
+
+    void process_events(auto& fds) {
+        std::cout << "process" << std::endl;
+        auto frame = rfb::process_server_message(parent::get_socket(), parent::get_server_pixel_format());
+        parent::draw(frame);
+        if (fds[FD_INDEX].revents & POLLIN) {
+            auto frame = rfb::process_server_message(parent::get_socket(), parent::get_server_pixel_format());
+            parent::draw(frame);
+        }
+        rfb::framebuffer_update_request(parent::get_socket(), 0, 0, parent::get_fb_width(), parent::get_fb_height());
+        parent::process_events(fds);
+    }
 };
 
 template <class T> class add_dynamic_draw : public T {
@@ -152,10 +199,10 @@ public:
 
     std::vector<void*> upload_memory_ptrs = parent::get_buffer_memory_ptr_vector();
     uint32_t* upload_ptr = reinterpret_cast<uint32_t*>(upload_memory_ptrs[index]);
-    auto rfb = parent::get_rfb();
+    auto frame = parent::get_rfb();
     for (int y = 0; y < 1080; y++) {
         for (int x = 0; x < 1920; x++) {
-            upload_ptr[y*1920+x] = reinterpret_cast<uint32_t*>(rfb.data())[y*1920+x];
+            upload_ptr[y*1920+x] = reinterpret_cast<uint32_t*>(frame.data())[y*1920+x];
         }
     }
     auto upload_memory_vector = parent::get_buffer_memory_vector();
@@ -262,12 +309,30 @@ private:
     std::chrono::steady_clock::time_point m_start_time;
 };
 
+static const char* address;
+static const char* port;
+template<typename T>
+class set_address : public T {
+public:
+    auto get_address() {
+        return address;
+    }
+};
+template<typename T>
+class set_port : public T {
+public:
+    auto get_port() {
+        return port;
+    }
+};
+
 template<class T>
 class add_physical_device_and_device_and_draw
     : public
-    add_frame_time_analyser<
     add_dynamic_draw <
     add_rfb<
+    set_address<
+    set_port<
     add_get_time <
     add_process_suboptimal_image<
         decltype([](auto* p) {p->recreate_surface();std::cout << "recreate surface" << std::endl;}),
@@ -298,20 +363,25 @@ class add_physical_device_and_device_and_draw
     add_recreate_surface<
     typename use_platform<PLATFORM>::template add_vulkan_surface<
     T
-  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 {};
 
 using draw_app =
-	vulkan_start::run_on_platform<
+    vulkan_start::run_on_platform<
         PLATFORM, add_physical_device_and_device_and_draw
-	>
-	;
+    >
+;
 
 using namespace std::literals;
 
 int main(int argc, const char* argv[]) {
   try {
-      auto app = draw_app{};
+    if (argc < 3) {
+        throw std::logic_error("Usage: rfb_window_demo <address> <port>");
+    }
+    address = argv[1];
+    port = argv[2];
+    auto app = draw_app{};
   } catch (std::exception &e) {
     std::cerr << e.what() << std::endl;
   }

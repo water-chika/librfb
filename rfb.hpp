@@ -3,6 +3,9 @@
 #include <array>
 #include <iostream>
 #include <boost/asio.hpp>
+
+namespace rfb {
+
 using boost::asio::ip::tcp;
 
 uint16_t parse_3digits(char d100, char d10, char d) {
@@ -187,10 +190,12 @@ std::vector<uint8_t> process_server_message(auto& socket, pixel_format& server_p
         uint16_t width = from_big_endian_bytes(rectangle[4], rectangle[5]);
         uint16_t height = from_big_endian_bytes(rectangle[6], rectangle[7]);
         uint16_t encoding_type = from_big_endian_bytes(rectangle[8], rectangle[9], rectangle[10], rectangle[11]);
-        std::cout << "x: " << x << std::endl;
-        std::cout << "y: " << y << std::endl;
-        std::cout << "width: " << width << std::endl;
-        std::cout << "height: " << height << std::endl;
+        if (true) {
+            std::cout << "x: " << x << std::endl;
+            std::cout << "y: " << y << std::endl;
+            std::cout << "width: " << width << std::endl;
+            std::cout << "height: " << height << std::endl;
+        }
         if (encoding_type != 0) {
             throw std::runtime_error("encoding not support");
         }
@@ -411,4 +416,6 @@ int rfb_process(auto host, auto port) {
         process_server_message(socket, server_init_message.server_pixel_format);
         sleep(1);
     }
+}
+
 }
