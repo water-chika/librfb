@@ -137,6 +137,10 @@ public:
     auto get_fb_height() {
         return m_server_init_message.fb_height;
     }
+    auto process_key_event(int key, int state) {
+        std::cout << "key event processing" << std::endl;
+        rfb::key_event(m_socket, 'a', state);
+    }
 private:
     boost::asio::io_context m_io_context;
     tcp::resolver m_resolver;
@@ -423,9 +427,15 @@ struct vulkan_hpp_helper::is_configure_structure<config> {
 };
 
 using draw_app =
-    vulkan_start::run_on_platform<
-        PLATFORM, add_physical_device_and_device_and_draw
-    >
+    use_platform<PLATFORM>::template add_event_loop<
+    add_physical_device_and_device_and_draw<
+    add_instance<
+    use_platform<PLATFORM>::template add_platform_needed_extensions<
+    add_surface_extension<
+    add_empty_extensions<
+    use_platform<PLATFORM>::template add_window<
+    empty_class
+    >>>>>>>
 ;
 
 using namespace std::literals;

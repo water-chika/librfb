@@ -83,6 +83,24 @@ void framebuffer_update_request(auto& socket, uint16_t x, uint16_t y, uint16_t w
     }
 }
 
+void key_event(auto& socket, uint32_t key, uint8_t down_flag) {
+    boost::system::error_code error;
+    std::array<uint8_t, 8> key_event = {
+        4, down_flag, // message-type(4), down-flag
+        0, 0, // padding
+        to_big_endian_byte(key, 0), to_big_endian_byte(key, 1),
+        to_big_endian_byte(key, 2), to_big_endian_byte(key, 3),
+    };
+    auto len = write(socket, boost::asio::buffer(key_event), error);
+    if (error == boost::asio::error::eof)
+        return;
+    else if (error)
+        throw boost::system::system_error(error);
+    if (len != key_event.size()) {
+        std::cerr << "key event send fail" << std::endl;
+    }
+}
+
 void process_server_cut_text(auto& socket) {
     boost::system::error_code error;
     std::array<uint8_t, 4> length_buf{};
@@ -159,7 +177,7 @@ std::vector<uint8_t> process_server_message(auto& socket, pixel_format& server_p
     if (len != framebuffer_update_head.size()) {
         throw std::runtime_error("framebuffer update head read fail");
     }
-    std::cout << "server message: " << (int)framebuffer_update_head[0] << std::endl;
+    //std::cout << "server message: " << (int)framebuffer_update_head[0] << std::endl;
     if (framebuffer_update_head[0] == 1) {
         process_colour_map_entries(socket);
         return {};
@@ -173,7 +191,7 @@ std::vector<uint8_t> process_server_message(auto& socket, pixel_format& server_p
         return {};
     }
     uint16_t rectangles_count = from_big_endian_bytes(framebuffer_update_head[2], framebuffer_update_head[3]);
-    std::cout << "rectangles count: " << rectangles_count << std::endl;
+    //std::cout << "rectangles count: " << rectangles_count << std::endl;
     std::vector<uint8_t> last_update{};
     for (uint16_t i = 0; i < rectangles_count; i++) {
         std::array<uint8_t, 12> rectangle{};
