@@ -6,6 +6,7 @@
 #endif
 
 #include "vulkan_start.hpp"
+#include "xkb_helper.hpp"
 #include <posix.hpp>
 
 #include "rfb.hpp"
@@ -139,7 +140,14 @@ public:
     }
     auto process_key_event(int key, int state) {
         std::cout << "key event processing" << std::endl;
-        rfb::key_event(m_socket, 'a', state);
+        auto keysym = parent::get_keysym(key);
+        std::cout << keysym << std::endl;
+        rfb::key_event(m_socket, keysym, state);
+    }
+    auto process_keysym_event(int keysym, int state) {
+        std::cout << "keysym event processing" << std::endl;
+        std::cout << keysym << std::endl;
+        rfb::key_event(m_socket, keysym, state);
     }
 private:
     boost::asio::io_context m_io_context;
@@ -422,7 +430,7 @@ struct config {
     const char* port;
 };
 template<>
-struct vulkan_hpp_helper::is_configure_structure<config> {
+struct cpp_helper::is_configure_structure<config> {
     static constexpr bool value = true;
 };
 

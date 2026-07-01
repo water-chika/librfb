@@ -19,4 +19,5 @@ target_compile_features(rfb_window_demo PUBLIC cxx_std_20)
 target_link_libraries(rfb_window_demo PUBLIC
     vulkan_start
     posix_cpp
+    xkb_helper
 )
