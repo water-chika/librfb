@@ -9,6 +9,8 @@
 #include "xkb_helper.hpp"
 #include <posix.hpp>
 
+#include "linux/input-event-codes.h"
+
 #include "rfb.hpp"
 
 #include <memory>
@@ -149,11 +151,38 @@ public:
         std::cout << keysym << std::endl;
         rfb::key_event(m_socket, keysym, state);
     }
+    void process_pointer_motion_event(int x, int y) {
+        rfb::pointer_event(m_socket, 0, x, y);
+        previous_x = x;
+        previous_y = y;
+    }
+    void process_pointer_button_event(int button, int button_state) {
+        std::cout << "pointer button event processing" << std::endl;
+        int button_mask = 0;
+        if (button_state == WL_POINTER_BUTTON_STATE_PRESSED) {
+            if (button == BTN_LEFT) {
+                button_mask = (1<<0);
+            }
+            else if (button == BTN_MIDDLE) {
+                button_mask = (1<<2);
+            }
+            else if (button == BTN_RIGHT) {
+                button_mask = (1<<2);
+            }
+            else {
+                std::cerr << "unknown pointer button" << std::endl;
+            }
+        }
+        rfb::pointer_event(m_socket, button_mask, previous_x, previous_y);
+    }
 private:
     boost::asio::io_context m_io_context;
     tcp::resolver m_resolver;
     tcp::socket m_socket;
     rfb::server_init_message m_server_init_message;
+
+    int previous_x;
+    int previous_y;
 };
 
 template<typename T>
