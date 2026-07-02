@@ -157,8 +157,13 @@ public:
         std::cerr << "move construct should not be called" << std::endl;
     }
     auto get_rfb() {
-        rfb::framebuffer_update_request(m_socket, 0, 0, m_server_init_message.fb_width, m_server_init_message.fb_height);
-        return rfb::process_server_message(m_socket, m_server_init_message.server_pixel_format);
+        while (true) {
+            rfb::framebuffer_update_request(m_socket, 0, 0, m_server_init_message.fb_width, m_server_init_message.fb_height);
+            auto frame = rfb::process_server_message(m_socket, m_server_init_message.server_pixel_format);
+            if (frame.size() > 0) {
+                return frame;
+            }
+        }
     }
     auto& get_socket() {
         return m_socket;
