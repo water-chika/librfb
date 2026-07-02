@@ -365,7 +365,7 @@ using add_image_used_to_scale =
     add_image_memory_property<vk::MemoryPropertyFlagBits::eHostVisible,
     add_empty_image_memory_properties<
     add_images<
-    add_image_format<vk::Format::eR8G8B8A8Srgb,
+    add_image_format<vk::Format::eB8G8R8A8Unorm,
     add_image_type<vk::ImageType::e2D,
     add_image_usage<vk::ImageUsageFlagBits::eTransferSrc,
     add_empty_image_usages<
