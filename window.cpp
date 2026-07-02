@@ -187,6 +187,11 @@ public:
         rfb::key_event(m_socket, keysym, state);
     }
     void process_pointer_motion_event(int x, int y) {
+        auto fb_width = get_fb_width();
+        auto fb_height = get_fb_height();
+        auto [surface_width, surface_height] = parent::get_surface_resolution();
+        x = x * fb_width / surface_width;
+        y = y * fb_height / surface_height;
         rfb::pointer_event(m_socket, 0, x, y);
         previous_x = x;
         previous_y = y;
