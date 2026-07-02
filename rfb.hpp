@@ -101,6 +101,23 @@ void key_event(auto& socket, uint32_t key, uint8_t down_flag) {
     }
 }
 
+void pointer_event(auto& socket, uint8_t button_mask, uint16_t x, uint16_t y) {
+    boost::system::error_code error;
+    std::array<uint8_t, 6> pointer_event = {
+        5, button_mask, // message-type(5), button-mask
+        to_big_endian_byte(x, 0), to_big_endian_byte(x, 1),
+        to_big_endian_byte(y, 0), to_big_endian_byte(y, 1),
+    };
+    auto len = write(socket, boost::asio::buffer(pointer_event), error);
+    if (error == boost::asio::error::eof)
+        return;
+    else if (error)
+        throw boost::system::system_error(error);
+    if (len != pointer_event.size()) {
+        std::cerr << "key event send fail" << std::endl;
+    }
+}
+
 void process_server_cut_text(auto& socket) {
     boost::system::error_code error;
     std::array<uint8_t, 4> length_buf{};
