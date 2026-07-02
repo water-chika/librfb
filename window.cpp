@@ -36,6 +36,11 @@ public:
     auto swapchain_images = parent::get_swapchain_images();
     auto queue_family_index = parent::get_queue_family_index();
     auto image_buffers = parent::get_buffer_vector();
+    auto images = parent::get_images();
+
+    vk::Extent2D swapchain_image_extent =
+        parent::get_swapchain_image_extent();
+    vk::Extent3D image_extent = parent::get_image_extent();
 
     if (buffers.size() != swapchain_images.size()) {
       throw std::runtime_error{
@@ -45,10 +50,9 @@ public:
     for (uint32_t index = 0; index < buffers.size(); index++) {
       vk::Image swapchain_image = swapchain_images[index];
       vk::CommandBuffer cmd = buffers[index];
+      vk::Image image = images[index];
 
       cmd.begin(vk::CommandBufferBeginInfo{});
-      vk::Extent2D swapchain_image_extent =
-          parent::get_swapchain_image_extent();
       auto render_area = vk::Rect2D{}
                              .setOffset(vk::Offset2D{0, 0})
                              .setExtent(swapchain_image_extent);
@@ -57,7 +61,7 @@ public:
       {
           auto image_memory_barrier = vk::ImageMemoryBarrier2{}
                 .setOldLayout(vk::ImageLayout::eUndefined).setNewLayout(vk::ImageLayout::eTransferDstOptimal)
-                .setImage(swapchain_image)
+                .setImage(image)
                 .setSrcStageMask(vk::PipelineStageFlagBits2::eTopOfPipe)
                 .setSrcAccessMask(vk::AccessFlagBits2::eNone)
                 .setDstStageMask(vk::PipelineStageFlagBits2::eTransfer)
@@ -73,10 +77,41 @@ public:
               .setBufferRowLength(1920)
               .setBufferImageHeight(1080)
               .setImageSubresource(subresource_layers)
-              .setImageExtent(vk::Extent3D{swapchain_image_extent.width, swapchain_image_extent.height, 1});
-      cmd.copyBufferToImage(image_buffer, swapchain_image, vk::ImageLayout::eTransferDstOptimal, 1,
+              .setImageExtent(vk::Extent3D{image_extent.width, image_extent.height, 1});
+      cmd.copyBufferToImage(image_buffer, image, vk::ImageLayout::eTransferDstOptimal, 1,
               &buffer_image_copy
               );
+      {
+          auto image_memory_barriers = std::array<vk::ImageMemoryBarrier2, 2>{
+              vk::ImageMemoryBarrier2{}
+                .setOldLayout(vk::ImageLayout::eTransferDstOptimal).setNewLayout(vk::ImageLayout::eTransferSrcOptimal)
+                .setImage(image)
+                .setSrcStageMask(vk::PipelineStageFlagBits2::eTransfer)
+                .setSrcAccessMask(vk::AccessFlagBits2::eTransferWrite)
+                .setDstStageMask(vk::PipelineStageFlagBits2::eTransfer)
+                .setDstAccessMask(vk::AccessFlagBits2::eTransferRead)
+                .setSubresourceRange(subresource_range),
+              vk::ImageMemoryBarrier2{}
+                .setOldLayout(vk::ImageLayout::eUndefined).setNewLayout(vk::ImageLayout::eTransferDstOptimal)
+                .setImage(swapchain_image)
+                .setSrcStageMask(vk::PipelineStageFlagBits2::eTopOfPipe)
+                .setSrcAccessMask(vk::AccessFlagBits2::eNone)
+                .setDstStageMask(vk::PipelineStageFlagBits2::eTransfer)
+                .setDstAccessMask(vk::AccessFlagBits2::eTransferWrite)
+                .setSubresourceRange(subresource_range),
+          };
+          cmd.pipelineBarrier2(
+                  vk::DependencyInfo{}.setImageMemoryBarriers(image_memory_barriers)
+                  );
+      }
+      auto image_blit = vk::ImageBlit{}
+        .setSrcSubresource(subresource_layers)
+        .setSrcOffsets(std::array<vk::Offset3D,2>{vk::Offset3D{}, vk::Offset3D{(int)image_extent.width, (int)image_extent.height, 0}})
+        .setDstSubresource(subresource_layers)
+        .setDstOffsets(std::array<vk::Offset3D,2>{vk::Offset3D{}, vk::Offset3D{(int)swapchain_image_extent.width, (int)swapchain_image_extent.height, 0}})
+      ;
+      cmd.blitImage(image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image, vk::ImageLayout::eTransferDstOptimal,
+              1, &image_blit, vk::Filter::eNearest);
       {
           auto image_memory_barrier = vk::ImageMemoryBarrier2{}
                 .setOldLayout(vk::ImageLayout::eTransferDstOptimal).setNewLayout(vk::ImageLayout::ePresentSrcKHR)
@@ -318,8 +353,27 @@ public:
   auto get_vector_size() { return parent::get_swapchain_images().size(); }
 };
 
+template<typename T>
+using add_image_used_to_scale =
+    map_image_memory_vector<
+    add_images_memories<
+    add_image_memory_property<vk::MemoryPropertyFlagBits::eHostVisible,
+    add_empty_image_memory_properties<
+    add_images<
+    add_image_format<vk::Format::eR8G8B8A8Srgb,
+    add_image_type<vk::ImageType::e2D,
+    add_image_usage<vk::ImageUsageFlagBits::eTransferSrc,
+    add_empty_image_usages<
+    set_image_samples<vk::SampleCountFlagBits::e1,
+    set_image_tiling<vk::ImageTiling::eLinear,
+    set_image_extent<vk::Extent2D{1920,1080},
+    add_image_count_equal_swapchain_image_count<
+    T
+    >>>>>>>>>>>>>
+;
+
 template <class T>
-using add_cube_swapchain_and_pipeline_layout =
+using add_swapchain_and_pipeline_layout =
     map_buffer_memory_vector<
     add_buffer_memory_vector<
     set_buffer_memory_properties<vk::MemoryPropertyFlagBits::eHostVisible,
@@ -328,6 +382,7 @@ using add_cube_swapchain_and_pipeline_layout =
     empty_buffer_usage<
     set_buffer_size<1920*1080*4,
     set_vector_size_to_swapchain_image_count<
+    add_image_used_to_scale<
 	add_recreate_surface_for<
 	add_swapchain_images_views<
 	add_recreate_surface_for<
@@ -336,7 +391,7 @@ using add_cube_swapchain_and_pipeline_layout =
 	add_swapchain<
 	add_swapchain_image_format<
   T
-  >>>>>>>>>>>>>>>
+  >>>>>>>>>>>>>>>>
 ;
 
 template<class T>
@@ -433,7 +488,7 @@ add_physical_device_and_device_and_draw =
     add_get_format_clear_color_value_type <
     add_recreate_surface_for<
     add_swapchain_command_buffers <
-	add_cube_swapchain_and_pipeline_layout<
+	add_swapchain_and_pipeline_layout<
     typename use_platform_add_swapchain_image_extent<PLATFORM>::template add_swapchain_image_extent<
 	add_command_pool <
 	add_queue <
