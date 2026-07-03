@@ -158,6 +158,11 @@ public:
     }
     auto get_rfb() {
         while (true) {
+            if (pointer_sended_x != pointer_x || pointer_sended_y != pointer_y) {
+                rfb::pointer_event(m_socket, 0, pointer_x, pointer_y);
+                pointer_sended_x = pointer_x;
+                pointer_sended_y = pointer_y;
+            }
             rfb::framebuffer_update_request(m_socket, 0, 0, m_server_init_message.fb_width, m_server_init_message.fb_height);
             auto frame = rfb::process_server_message(m_socket, m_server_init_message.server_pixel_format);
             if (frame.size() > 0) {
@@ -197,9 +202,8 @@ public:
         auto [surface_width, surface_height] = parent::get_surface_resolution();
         x = x * fb_width / surface_width;
         y = y * fb_height / surface_height;
-        rfb::pointer_event(m_socket, 0, x, y);
-        previous_x = x;
-        previous_y = y;
+        pointer_x = x;
+        pointer_y = y;
     }
     void process_pointer_button_event(int button, int button_state) {
         std::cout << "pointer button event processing" << std::endl;
@@ -218,7 +222,7 @@ public:
                 std::cerr << "unknown pointer button" << std::endl;
             }
         }
-        rfb::pointer_event(m_socket, button_mask, previous_x, previous_y);
+        rfb::pointer_event(m_socket, button_mask, pointer_x, pointer_y);
     }
 private:
     boost::asio::io_context m_io_context;
@@ -226,8 +230,10 @@ private:
     tcp::socket m_socket;
     rfb::server_init_message m_server_init_message;
 
-    int previous_x;
-    int previous_y;
+    int pointer_sended_x;
+    int pointer_sended_y;
+    int pointer_x;
+    int pointer_y;
 };
 
 template<typename T>
