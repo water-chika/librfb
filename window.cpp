@@ -159,7 +159,7 @@ public:
     auto get_rfb() {
         while (true) {
             if (pointer_sended_x != pointer_x || pointer_sended_y != pointer_y) {
-                rfb::pointer_event(m_socket, 0, pointer_x, pointer_y);
+                rfb::pointer_event(m_socket, pointer_button_mask, pointer_x, pointer_y);
                 pointer_sended_x = pointer_x;
                 pointer_sended_y = pointer_y;
             }
@@ -207,22 +207,37 @@ public:
     }
     void process_pointer_button_event(int button, int button_state) {
         std::cout << "pointer button event processing" << std::endl;
-        int button_mask = 0;
+        int button_mask = pointer_button_mask;
         if (button_state == WL_POINTER_BUTTON_STATE_PRESSED) {
             if (button == BTN_LEFT) {
-                button_mask = (1<<0);
+                button_mask |= (1<<0);
             }
             else if (button == BTN_MIDDLE) {
-                button_mask = (1<<2);
+                button_mask |= (1<<2);
             }
             else if (button == BTN_RIGHT) {
-                button_mask = (1<<2);
+                button_mask |= (1<<2);
+            }
+            else {
+                std::cerr << "unknown pointer button" << std::endl;
+            }
+        }
+        else if (button_state == WL_POINTER_BUTTON_STATE_RELEASED) {
+            if (button == BTN_LEFT) {
+                button_mask &= ~(1<<0);
+            }
+            else if (button == BTN_MIDDLE) {
+                button_mask &= ~(1<<2);
+            }
+            else if (button == BTN_RIGHT) {
+                button_mask &= ~(1<<2);
             }
             else {
                 std::cerr << "unknown pointer button" << std::endl;
             }
         }
         rfb::pointer_event(m_socket, button_mask, pointer_x, pointer_y);
+        pointer_button_mask = button_mask;
     }
 private:
     boost::asio::io_context m_io_context;
@@ -234,6 +249,7 @@ private:
     int pointer_sended_y;
     int pointer_x;
     int pointer_y;
+    int pointer_button_mask;
 };
 
 template<typename T>
@@ -501,6 +517,7 @@ public:
 template<class T>
 using
 add_physical_device_and_device_and_draw =
+    add_frame_time_analyser<
     add_dynamic_draw <
     add_rfb<
     set_address<
@@ -536,7 +553,7 @@ add_physical_device_and_device_and_draw =
     add_recreate_surface<
     typename use_platform<PLATFORM>::template add_vulkan_surface<
     T
-  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 ;
 
 struct config {
