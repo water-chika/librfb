@@ -106,9 +106,9 @@ public:
       }
       auto image_blit = vk::ImageBlit{}
         .setSrcSubresource(subresource_layers)
-        .setSrcOffsets(std::array<vk::Offset3D,2>{vk::Offset3D{}, vk::Offset3D{(int)image_extent.width, (int)image_extent.height, 0}})
+        .setSrcOffsets(std::array<vk::Offset3D,2>{vk::Offset3D{}, vk::Offset3D{(int)image_extent.width, (int)image_extent.height, 1}})
         .setDstSubresource(subresource_layers)
-        .setDstOffsets(std::array<vk::Offset3D,2>{vk::Offset3D{}, vk::Offset3D{(int)swapchain_image_extent.width, (int)swapchain_image_extent.height, 0}})
+        .setDstOffsets(std::array<vk::Offset3D,2>{vk::Offset3D{}, vk::Offset3D{(int)swapchain_image_extent.width, (int)swapchain_image_extent.height, 1}})
       ;
       cmd.blitImage(image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image, vk::ImageLayout::eTransferDstOptimal,
               1, &image_blit, vk::Filter::eNearest);
@@ -379,13 +379,14 @@ using add_image_used_to_scale =
     add_image_format<vk::Format::eB8G8R8A8Unorm,
     add_image_type<vk::ImageType::e2D,
     add_image_usage<vk::ImageUsageFlagBits::eTransferSrc,
+    add_image_usage<vk::ImageUsageFlagBits::eTransferDst,
     add_empty_image_usages<
     set_image_samples<vk::SampleCountFlagBits::e1,
     set_image_tiling<vk::ImageTiling::eLinear,
     set_image_extent<vk::Extent2D{1920,1080},
     add_image_count_equal_swapchain_image_count<
     T
-    >>>>>>>>>>>>>
+    >>>>>>>>>>>>>>
 ;
 
 template <class T>
@@ -485,6 +486,18 @@ public:
     const char* port;
 };
 
+template<typename T>
+class add_device_nexts : public T {
+public:
+    using parent = T;
+    add_device_nexts(const configure auto& conf) : parent{conf} {
+    }
+    using structure_chain = vk::StructureChain<vk::PhysicalDeviceSynchronization2Features>;
+    void set_structure_chain(structure_chain& chain) {
+        chain.get().setSynchronization2(true);
+    }
+};
+
 template<class T>
 using
 add_physical_device_and_device_and_draw =
@@ -509,6 +522,7 @@ add_physical_device_and_device_and_draw =
 	add_command_pool <
 	add_queue <
 	add_device <
+    add_device_nexts<
 	add_swapchain_extension <
 	add_empty_extensions <
 	add_find_properties <
@@ -522,7 +536,7 @@ add_physical_device_and_device_and_draw =
     add_recreate_surface<
     typename use_platform<PLATFORM>::template add_vulkan_surface<
     T
-  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 ;
 
 struct config {
