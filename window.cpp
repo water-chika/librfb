@@ -193,7 +193,7 @@ public:
     }
     auto process_keysym_event(int keysym, int state) {
         std::cout << "keysym event processing" << std::endl;
-        std::cout << keysym << std::endl;
+        std::cout << std::format("{:#x}", keysym) << std::endl;
         rfb::key_event(m_socket, keysym, state);
     }
     void process_pointer_motion_event(int x, int y) {
