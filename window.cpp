@@ -513,9 +513,6 @@ using
 add_physical_device_and_device_and_draw =
     add_frame_time_analyser<
     add_dynamic_draw <
-    add_rfb<
-    set_address<
-    set_port<
     add_get_time <
     add_process_suboptimal_image<
         decltype([](auto* p) {p->recreate_surface();std::cout << "recreate surface" << std::endl;}),
@@ -528,6 +525,9 @@ add_physical_device_and_device_and_draw =
     add_get_format_clear_color_value_type <
     add_recreate_surface_for<
     add_swapchain_command_buffers <
+    add_rfb<
+    set_address<
+    set_port<
 	add_swapchain_and_pipeline_layout<
     typename use_platform_add_swapchain_image_extent<PLATFORM>::template add_swapchain_image_extent<
 	add_command_pool <
