@@ -185,12 +185,6 @@ public:
     auto get_fb_height() {
         return m_server_init_message.fb_height;
     }
-    auto process_key_event(int key, int state) {
-        std::cout << "key event processing" << std::endl;
-        auto keysym = parent::get_keysym(key);
-        std::cout << keysym << std::endl;
-        rfb::key_event(m_socket, keysym, state);
-    }
     auto process_keysym_event(int keysym, int state) {
         std::cout << "keysym event processing" << std::endl;
         std::cout << std::format("{:#x}", keysym) << std::endl;
