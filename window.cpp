@@ -74,8 +74,8 @@ public:
       auto image_buffer = image_buffers[index];
       auto buffer_image_copy = vk::BufferImageCopy{}
               .setBufferOffset(0)
-              .setBufferRowLength(1920)
-              .setBufferImageHeight(1080)
+              .setBufferRowLength(image_extent.width)
+              .setBufferImageHeight(image_extent.height)
               .setImageSubresource(subresource_layers)
               .setImageExtent(vk::Extent3D{image_extent.width, image_extent.height, 1});
       cmd.copyBufferToImage(image_buffer, image, vk::ImageLayout::eTransferDstOptimal, 1,
@@ -320,9 +320,11 @@ public:
     std::vector<void*> upload_memory_ptrs = parent::get_buffer_memory_ptr_vector();
     uint32_t* upload_ptr = reinterpret_cast<uint32_t*>(upload_memory_ptrs[index]);
     auto frame = parent::get_rfb();
-    for (int y = 0; y < 1080; y++) {
-        for (int x = 0; x < 1920; x++) {
-            upload_ptr[y*1920+x] = reinterpret_cast<uint32_t*>(frame.data())[y*1920+x];
+    auto fb_width = parent::get_fb_width();
+    auto fb_height = parent::get_fb_height();
+    for (int y = 0; y < fb_height; y++) {
+        for (int x = 0; x < fb_width; x++) {
+            upload_ptr[y*fb_width+x] = reinterpret_cast<uint32_t*>(frame.data())[y*fb_width+x];
         }
     }
     auto upload_memory_vector = parent::get_buffer_memory_vector();
@@ -380,84 +382,6 @@ public:
 };
 
 template<typename T>
-using add_image_used_to_scale =
-    map_image_memory_vector<
-    add_images_memories<
-    add_image_memory_property<vk::MemoryPropertyFlagBits::eHostVisible,
-    add_empty_image_memory_properties<
-    add_images<
-    add_image_format<vk::Format::eB8G8R8A8Unorm,
-    add_image_type<vk::ImageType::e2D,
-    add_image_usage<vk::ImageUsageFlagBits::eTransferSrc,
-    add_image_usage<vk::ImageUsageFlagBits::eTransferDst,
-    add_empty_image_usages<
-    set_image_samples<vk::SampleCountFlagBits::e1,
-    set_image_tiling<vk::ImageTiling::eLinear,
-    set_image_extent<vk::Extent2D{1920,1080},
-    add_image_count_equal_swapchain_image_count<
-    T
-    >>>>>>>>>>>>>>
-;
-
-template <class T>
-using add_swapchain_and_pipeline_layout =
-    map_buffer_memory_vector<
-    add_buffer_memory_vector<
-    set_buffer_memory_properties<vk::MemoryPropertyFlagBits::eHostVisible,
-    add_buffer_vector<
-    add_buffer_usage<vk::BufferUsageFlagBits::eTransferSrc,
-    empty_buffer_usage<
-    set_buffer_size<1920*1080*4,
-    set_vector_size_to_swapchain_image_count<
-    add_image_used_to_scale<
-	add_recreate_surface_for<
-	add_swapchain_images_views<
-	add_recreate_surface_for<
-	add_swapchain_images<
-	add_recreate_surface_for<
-	add_swapchain<
-	add_swapchain_image_format<
-  T
-  >>>>>>>>>>>>>>>>
-;
-
-template<class T>
-class add_queue_wait_idle_to_recreate_surface : public T {
-public:
-    using parent = T;
-    add_queue_wait_idle_to_recreate_surface(const configure auto& conf) : parent{conf} {
-    }
-    void recreate_surface() {
-        auto queue = parent::get_queue();
-        queue.waitIdle();
-        parent::recreate_surface();
-    }
-};
-
-template <class F, class T> class add_process_suboptimal_image : public T {
-public:
-    using parent = T;
-    add_process_suboptimal_image(const configure auto& conf) : parent{conf} {
-    }
-    void process_suboptimal_image() {
-        F f;
-        f(this);
-    }
-};
-
-template <class T> class add_get_time : public T {
-public:
-    using parent = T;
-    add_get_time(const configure auto& conf) : parent{conf}, m_start_time{std::chrono::steady_clock::now()}{
-    }
-    auto get_time() {
-        return std::chrono::steady_clock::now() - m_start_time;
-    }
-private:
-    std::chrono::steady_clock::time_point m_start_time;
-};
-
-template<typename T>
 concept contain_ip_address = requires (T t) {
     t.address;
     t.port;
@@ -497,6 +421,107 @@ public:
 };
 
 template<typename T>
+class set_image_extent_equal_to_fb_extent : public T {
+public:
+    using parent = T;
+    set_image_extent_equal_to_fb_extent(const configure auto& conf) : parent{conf} {
+    }
+    auto get_image_extent() {
+        return vk::Extent3D{parent::get_fb_width(), parent::get_fb_height(), 1};
+    }
+};
+
+template<typename T>
+using add_image_used_to_scale =
+    map_image_memory_vector<
+    add_images_memories<
+    add_image_memory_property<vk::MemoryPropertyFlagBits::eHostVisible,
+    add_empty_image_memory_properties<
+    add_images<
+    add_image_format<vk::Format::eB8G8R8A8Unorm,
+    add_image_type<vk::ImageType::e2D,
+    add_image_usage<vk::ImageUsageFlagBits::eTransferSrc,
+    add_image_usage<vk::ImageUsageFlagBits::eTransferDst,
+    add_empty_image_usages<
+    set_image_samples<vk::SampleCountFlagBits::e1,
+    set_image_tiling<vk::ImageTiling::eLinear,
+    set_image_extent_equal_to_fb_extent<
+    add_image_count_equal_swapchain_image_count<
+    T
+    >>>>>>>>>>>>>>
+;
+
+template<typename T>
+class set_buffer_size_equal_to_fb_size : public T {
+public:
+    using parent = T;
+    set_buffer_size_equal_to_fb_size(const configure auto& conf) : parent{conf} {
+    }
+    auto get_buffer_size() { return parent::get_fb_width() * parent::get_fb_height() * 4; }
+};
+
+template <class T>
+using add_swapchain_and_pipeline_layout =
+    map_buffer_memory_vector<
+    add_buffer_memory_vector<
+    set_buffer_memory_properties<vk::MemoryPropertyFlagBits::eHostVisible,
+    add_buffer_vector<
+    add_buffer_usage<vk::BufferUsageFlagBits::eTransferSrc,
+    empty_buffer_usage<
+    set_buffer_size_equal_to_fb_size<
+    set_vector_size_to_swapchain_image_count<
+    add_image_used_to_scale<
+    add_rfb<
+    set_address<
+    set_port<
+	add_recreate_surface_for<
+	add_swapchain_images_views<
+	add_recreate_surface_for<
+	add_swapchain_images<
+	add_recreate_surface_for<
+	add_swapchain<
+	add_swapchain_image_format<
+  T
+  >>>>>>>>>>>>>>>>>>>
+;
+
+template<class T>
+class add_queue_wait_idle_to_recreate_surface : public T {
+public:
+    using parent = T;
+    add_queue_wait_idle_to_recreate_surface(const configure auto& conf) : parent{conf} {
+    }
+    void recreate_surface() {
+        auto queue = parent::get_queue();
+        queue.waitIdle();
+        parent::recreate_surface();
+    }
+};
+
+template <class F, class T> class add_process_suboptimal_image : public T {
+public:
+    using parent = T;
+    add_process_suboptimal_image(const configure auto& conf) : parent{conf} {
+    }
+    void process_suboptimal_image() {
+        F f;
+        f(this);
+    }
+};
+
+template <class T> class add_get_time : public T {
+public:
+    using parent = T;
+    add_get_time(const configure auto& conf) : parent{conf}, m_start_time{std::chrono::steady_clock::now()}{
+    }
+    auto get_time() {
+        return std::chrono::steady_clock::now() - m_start_time;
+    }
+private:
+    std::chrono::steady_clock::time_point m_start_time;
+};
+
+template<typename T>
 class add_device_nexts : public T {
 public:
     using parent = T;
@@ -525,9 +550,6 @@ add_physical_device_and_device_and_draw =
     add_get_format_clear_color_value_type <
     add_recreate_surface_for<
     add_swapchain_command_buffers <
-    add_rfb<
-    set_address<
-    set_port<
 	add_swapchain_and_pipeline_layout<
     typename use_platform_add_swapchain_image_extent<PLATFORM>::template add_swapchain_image_extent<
 	add_command_pool <
@@ -547,7 +569,7 @@ add_physical_device_and_device_and_draw =
     add_recreate_surface<
     typename use_platform<PLATFORM>::template add_vulkan_surface<
     T
-  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 ;
 
 struct config {
