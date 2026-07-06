@@ -5,6 +5,40 @@
 #include <boost/asio.hpp>
 
 namespace rfb {
+enum class encoding : uint32_t {
+    raw = 0,
+    zrle = 16,
+};
+}
+
+template<>
+class std::formatter<rfb::encoding, char> {
+public:
+    template<typename ParseContext>
+    constexpr ParseContext::iterator parse(ParseContext& ctx) {
+        auto ite = ctx.begin();
+        if (ite == ctx.end()) {
+            return ite;
+        }
+        return ite;
+    }
+    template<typename FormatContext>
+    FormatContext::iterator format(rfb::encoding encoding, FormatContext& ctx) const {
+        std::string str;
+        if (encoding == rfb::encoding::raw) {
+            str = "raw";
+        }
+        else if (encoding == rfb::encoding::zrle) {
+            str = "ZRLE";
+        }
+        else {
+            str = "unknow";
+        }
+        return std::copy(str.begin(), str.end(), ctx.out());
+    }
+};
+
+namespace rfb {
 
 using boost::asio::ip::tcp;
 
@@ -34,6 +68,14 @@ uint8_t to_big_endian_byte(uint32_t n, uint8_t i) {
     assert(i < sizeof(n));
     return static_cast<uint8_t>(n >> (((sizeof(n)-1)-i)*8));
 }
+uint32_t to_big_endian(uint32_t n) {
+    return
+        ((n&(0xff<<(3*8))) >> (3*8)) |
+        ((n&(0xff<<(2*8))) >> (1*8)) |
+        ((n&(0xff<<(1*8))) << (1*8)) |
+        ((n&(0xff<<(0*8))) << (3*8)) |
+        0;
+}
 
 std::pair<uint16_t, uint16_t> parse_protocol_version(const std::array<char,12>& message) {
     bool is_rfb = message[0] == 'R' &&
@@ -62,7 +104,6 @@ struct pixel_format {
     uint8_t padding1;
     uint8_t padding2;
 };
-
 
 void framebuffer_update_request(auto& socket, uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
     boost::system::error_code error;
@@ -181,6 +222,73 @@ void process_colour_map_entries(auto& socket) {
     }
 }
 
+auto process_framebuffer_update(auto& socket, auto& framebuffer_update_head, pixel_format& server_pixel_format) {
+    boost::system::error_code error;
+    uint16_t rectangles_count = from_big_endian_bytes(framebuffer_update_head[2], framebuffer_update_head[3]);
+    //std::cout << "rectangles count: " << rectangles_count << std::endl;
+    std::vector<uint8_t> last_update{};
+    for (uint16_t i = 0; i < rectangles_count; i++) {
+        std::array<uint8_t, 12> rectangle{};
+        auto len = read(socket, boost::asio::buffer(rectangle), error);
+        if (error == boost::asio::error::eof)
+            throw std::runtime_error("eof");
+        else if (error)
+            throw boost::system::system_error(error);
+        if (len != rectangle.size()) {
+            throw std::runtime_error("framebuffer update rectangle read fail");
+        }
+        uint16_t x = from_big_endian_bytes(rectangle[0], rectangle[1]);
+        uint16_t y = from_big_endian_bytes(rectangle[2], rectangle[3]);
+        uint16_t width = from_big_endian_bytes(rectangle[4], rectangle[5]);
+        uint16_t height = from_big_endian_bytes(rectangle[6], rectangle[7]);
+        auto encoding_type = static_cast<encoding>(from_big_endian_bytes(rectangle[8], rectangle[9], rectangle[10], rectangle[11]));
+        if (false) {
+            std::cout << "x: " << x << std::endl;
+            std::cout << "y: " << y << std::endl;
+            std::cout << "width: " << width << std::endl;
+            std::cout << "height: " << height << std::endl;
+        }
+        if (encoding_type == encoding::raw) {
+            std::vector<uint8_t> pixels(width*height*server_pixel_format.bits_per_pixel/8);
+            len = read(socket, boost::asio::buffer(pixels), error);
+            if (error == boost::asio::error::eof)
+                throw std::runtime_error("eof");
+            else if (error)
+                throw boost::system::system_error(error);
+            if (len != pixels.size()) {
+                throw std::runtime_error("framebuffer update rectangle pixels read fail");
+            }
+
+            last_update = std::move(pixels);
+        }
+        else if (encoding_type == encoding::zrle) {
+            std::array<uint8_t, 4> length_buf;
+            auto len = read(socket, boost::asio::buffer(length_buf), error);
+            if (error == boost::asio::error::eof)
+                throw std::runtime_error("eof");
+            else if (error)
+                throw boost::system::system_error(error);
+            if (len != length_buf.size()) {
+                throw std::runtime_error("framebuffer update rectangle zrle length read fail");
+            }
+            auto length = from_big_endian_bytes(length_buf[0], length_buf[1], length_buf[2], length_buf[3]);
+            auto zlib_data = std::vector<uint8_t>(length);
+            len = read(socket, boost::asio::buffer(zlib_data), error);
+            if (error == boost::asio::error::eof)
+                throw std::runtime_error("eof");
+            else if (error)
+                throw boost::system::system_error(error);
+            if (len != zlib_data.size()) {
+                throw std::runtime_error("framebuffer update rectangle zrle zlib data read fail");
+            }
+        }
+        else {
+            throw std::runtime_error(std::format("encoding not support: {}", encoding_type));
+        }
+    }
+    return last_update;
+}
+
 std::vector<uint8_t> process_server_message(auto& socket, pixel_format& server_pixel_format) {
     boost::system::error_code error;
     std::array<uint8_t, 4> framebuffer_update_head{};
@@ -195,59 +303,21 @@ std::vector<uint8_t> process_server_message(auto& socket, pixel_format& server_p
         throw std::runtime_error("framebuffer update head read fail");
     }
     //std::cout << "server message: " << (int)framebuffer_update_head[0] << std::endl;
-    if (framebuffer_update_head[0] == 1) {
+    if (framebuffer_update_head[0] == 0) {
+        return process_framebuffer_update(socket, framebuffer_update_head, server_pixel_format);
+    }
+    else if (framebuffer_update_head[0] == 1) {
         process_colour_map_entries(socket);
         return {};
     }
-    if (framebuffer_update_head[0] == 3) {
+    else if (framebuffer_update_head[0] == 3) {
         process_server_cut_text(socket);
         return {};
     }
-    if (framebuffer_update_head[0] != 0) {
-        std::cout << "not framebuffer_update: " << (int)framebuffer_update_head[0] << std::endl;
+    else {
+        std::cout << "not implemented message type: " << (int)framebuffer_update_head[0] << std::endl;
         return {};
     }
-    uint16_t rectangles_count = from_big_endian_bytes(framebuffer_update_head[2], framebuffer_update_head[3]);
-    //std::cout << "rectangles count: " << rectangles_count << std::endl;
-    std::vector<uint8_t> last_update{};
-    for (uint16_t i = 0; i < rectangles_count; i++) {
-        std::array<uint8_t, 12> rectangle{};
-        len = read(socket, boost::asio::buffer(rectangle), error);
-        if (error == boost::asio::error::eof)
-            throw std::runtime_error("eof");
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != rectangle.size()) {
-            throw std::runtime_error("framebuffer update rectangle read fail");
-        }
-        uint16_t x = from_big_endian_bytes(rectangle[0], rectangle[1]);
-        uint16_t y = from_big_endian_bytes(rectangle[2], rectangle[3]);
-        uint16_t width = from_big_endian_bytes(rectangle[4], rectangle[5]);
-        uint16_t height = from_big_endian_bytes(rectangle[6], rectangle[7]);
-        uint16_t encoding_type = from_big_endian_bytes(rectangle[8], rectangle[9], rectangle[10], rectangle[11]);
-        if (false) {
-            std::cout << "x: " << x << std::endl;
-            std::cout << "y: " << y << std::endl;
-            std::cout << "width: " << width << std::endl;
-            std::cout << "height: " << height << std::endl;
-        }
-        if (encoding_type != 0) {
-            throw std::runtime_error("encoding not support");
-        }
-
-        std::vector<uint8_t> pixels(width*height*server_pixel_format.bits_per_pixel/8);
-        len = read(socket, boost::asio::buffer(pixels), error);
-        if (error == boost::asio::error::eof)
-            throw std::runtime_error("eof");
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != pixels.size()) {
-            throw std::runtime_error("framebuffer update rectangle pixels read fail");
-        }
-
-        last_update = std::move(pixels);
-    }
-    return last_update;
 }
 
 struct server_init_message {
@@ -343,11 +413,21 @@ int set_format(auto& socket)
 int set_encodings(auto& socket)
 {
     boost::system::error_code error;
-    std::array<uint8_t, 8> set_encodings = {
+    // order is a priority hint
+    auto supported_encodings = std::to_array<uint32_t>({
+            to_big_endian(0), // Raw
+            to_big_endian(1), // Copy-Rect
+            to_big_endian(6), // Zlib
+            to_big_endian(7), // Tight
+            to_big_endian(15),// TRLE
+            to_big_endian(16),// ZRLE
+            to_big_endian(21),// JPEG
+            to_big_endian(50),// H264
+    });
+    auto set_encodings = std::to_array<uint8_t>({
         2, 0, // SetEncoding, padding
-        0, 1, // Number of encoding
-        0, 0, 0, 0, // Raw encoding
-    };
+        0, supported_encodings.size(), // Number of encoding
+    });
     auto len = write(socket, boost::asio::buffer(set_encodings), error);
     if (error == boost::asio::error::eof)
         return 0;
@@ -355,6 +435,14 @@ int set_encodings(auto& socket)
         throw boost::system::system_error(error);
     if (len != set_encodings.size()) {
         std::cerr << "set encoding send fail" << std::endl;
+    }
+    len = write(socket, boost::asio::buffer(supported_encodings), error);
+    if (error == boost::asio::error::eof)
+        return 0;
+    else if (error)
+        throw boost::system::system_error(error);
+    if (len != supported_encodings.size()*sizeof(supported_encodings[0])) {
+        std::cerr << "supported_encodings send fail" << std::endl;
     }
     return 0;
 }
