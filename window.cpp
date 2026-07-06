@@ -137,7 +137,7 @@ public:
     using parent = T;
     using tcp = boost::asio::ip::tcp;
     add_rfb(const configure auto& conf) : parent{conf},
-        rfb{parent::get_address(), parent::get_port()}
+        rfb{conf}
     {
     }
     auto get_rfb(std::span<uint8_t> frame) {
@@ -318,44 +318,6 @@ public:
   auto get_vector_size() { return parent::get_swapchain_images().size(); }
 };
 
-template<typename T>
-concept contain_ip_address = requires (T t) {
-    t.address;
-    t.port;
-};
-
-template<typename T>
-class set_address : public T {
-public:
-    using parent = T;
-    template<configure Configure>
-        requires contain_ip_address<Configure>
-    set_address(const Configure& conf) : parent{conf},
-        address{conf.address} {
-    }
-    set_address(const configure auto& conf) : parent{conf} {
-    }
-    auto get_address() {
-        return address;
-    }
-    const char* address;
-};
-template<typename T>
-class set_port : public T {
-public:
-    using parent = T;
-    template<configure Configure>
-        requires contain_ip_address<Configure>
-    set_port(const Configure& conf) : parent{conf},
-        port{conf.port} {
-    }
-    set_port(const configure auto& conf) : parent{conf} {
-    }
-    auto get_port() {
-        return port;
-    }
-    const char* port;
-};
 
 template<typename T>
 class set_image_extent_equal_to_fb_extent : public T {
@@ -409,8 +371,8 @@ using add_swapchain_and_pipeline_layout =
     set_vector_size_to_swapchain_image_count<
     add_image_used_to_scale<
     add_rfb<
-    set_address<
-    set_port<
+    rfb::set_address<
+    rfb::set_port<
 	add_recreate_surface_for<
 	add_swapchain_images_views<
 	add_recreate_surface_for<
@@ -509,15 +471,6 @@ add_physical_device_and_device_and_draw =
   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 ;
 
-struct config {
-    const char* address;
-    const char* port;
-};
-template<>
-struct cpp_helper::is_configure_structure<config> {
-    static constexpr bool value = true;
-};
-
 using draw_app =
     use_platform<PLATFORM>::template add_event_loop<
     add_physical_device_and_device_and_draw<
@@ -539,7 +492,7 @@ int main(int argc, const char* argv[]) {
     }
     auto address = argv[1];
     auto port = argv[2];
-    auto conf = config{.address=address, .port=port};
+    auto conf = rfb::config{.address=address, .port=port};
     auto app = draw_app{conf};
   } catch (std::exception &e) {
     std::cerr << e.what() << std::endl;

@@ -10,7 +10,7 @@ int main(int argc, char** argv) {
         }
         address = argv[1];
         port = argv[2];
-        rfb::rfb::rfb_process(address, port);
+        rfb::rfb_process(address, port);
     }
     catch (std::exception& e) {
         std::cerr << e.what() << std::endl;
