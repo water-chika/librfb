@@ -259,7 +259,7 @@ public:
                 std::cout << "height: " << height << std::endl;
             }
             if (encoding_type == encoding::raw) {
-                std::vector<uint8_t> pixels(width*height*m_server_init_message.server_pixel_format.bits_per_pixel/8);
+                auto pixels = frame;
                 len = read(socket, boost::asio::buffer(pixels), error);
                 if (error == boost::asio::error::eof)
                     throw std::runtime_error("eof");
@@ -268,8 +268,6 @@ public:
                 if (len != pixels.size()) {
                     throw std::runtime_error("framebuffer update rectangle pixels read fail");
                 }
-
-                last_update = std::move(pixels);
             }
             else if (encoding_type == encoding::zrle) {
                 std::array<uint8_t, 4> length_buf;
@@ -282,6 +280,7 @@ public:
                     throw std::runtime_error("framebuffer update rectangle zrle length read fail");
                 }
                 auto length = from_big_endian_bytes(length_buf[0], length_buf[1], length_buf[2], length_buf[3]);
+                //std::cout << "zlib length: " << length << std::endl;
                 auto zlib_data = std::vector<uint8_t>(length);
                 len = read(socket, boost::asio::buffer(zlib_data), error);
                 if (error == boost::asio::error::eof)
@@ -293,61 +292,79 @@ public:
                 }
 
                 constexpr int CHUNK = 1024;
-                static z_stream strm = {};
-                static int ret = deflateInit(&strm, Z_DEFAULT_COMPRESSION);
-                if (ret != Z_OK) {
-                    throw std::runtime_error("deflateInit error");
-                }
 
-                strm.avail_in = zlib_data.size();
-                strm.next_in = zlib_data.data();
+                zlib_stream.avail_in = zlib_data.size();
+                zlib_stream.next_in = zlib_data.data();
 
                 std::vector<uint8_t> data{};
 
                 do {
                     auto data_previous_size = data.size();
                     data.resize(data.size() + CHUNK);
-                    strm.avail_out = CHUNK;
-                    strm.next_out = data.data() + data_previous_size;
+                    zlib_stream.avail_out = CHUNK;
+                    zlib_stream.next_out = data.data() + data_previous_size;
 
-                    ret = deflate(&strm, Z_NO_FLUSH);
-                    auto have = CHUNK - strm.avail_out;
-                } while (strm.avail_out == 0);
-                data.resize(data.size() - strm.avail_out);
+                    auto ret = deflate(&zlib_stream, Z_NO_FLUSH);
+                    if (ret == Z_STREAM_ERROR) {
+                        throw std::runtime_error{"zlib deflate error"};
+                    }
+                    auto have = CHUNK - zlib_stream.avail_out;
+                } while (zlib_stream.avail_out == 0);
+                data.resize(data.size() - zlib_stream.avail_out);
 
+                int data_offset = 0;
                 auto fb_width = get_width();
                 auto fb_height = get_height();
-                for (int x = 0; x < fb_width; x+=64) {
-                    for (int y = 0; y < fb_width; y+=64) {
+                for (int x = fb_width; x < fb_width; x+=64) {
+                    for (int y = fb_width; y < fb_width; y+=64) {
                         width = x+64 < fb_width? 64 : fb_width - x;
                         height = y+64 < fb_height? 64 : fb_height - y;
-                        std::array<uint8_t,1> subencoding{};
-                        len = read(socket, boost::asio::buffer(subencoding), error);
-                        if (error == boost::asio::error::eof)
-                            throw std::runtime_error("eof");
-                        else if (error)
-                            throw boost::system::system_error(error);
-                        if (len != subencoding.size()) {
-                            throw std::runtime_error("framebuffer update rectangle zrle subencoding read fail");
+                        auto subencoding = data[data_offset];
+                        data_offset++;
+                        if (subencoding == 0) {
+                            int bytes_per_cpixel = 3;
+                            for (int x_ = 0; x_ < width; x_++) {
+                                for (int y_ = 0; y_ < height; y_++) {
+                                    auto ptr = &data[data_offset + (y_*width*bytes_per_cpixel + x_)*3];
+                                    frame[(y+y_)*fb_width + (x+x_)] = from_big_endian_bytes(ptr[0], ptr[1], ptr[2], 0);
+                                }
+                            }
+                            data_offset += 64*64*bytes_per_cpixel;
                         }
-                        if (subencoding[0] == 0) {
+                        else if (subencoding > 1 && subencoding < 128) {
+                            int bytes_per_cpixel = 3;
+                            int palette_size = subencoding;
+                            auto palette = std::span{&data[data_offset], palette_size*bytes_per_cpixel};
+                            data_offset += palette_size*bytes_per_cpixel;
+                            int bits_per_packed_pixels = 0;
+                            if (palette_size > 2) bits_per_packed_pixels = 2;
+                            if (palette_size > 4) bits_per_packed_pixels = 4;
+                            if (palette_size > 16) bits_per_packed_pixels = 8;
+                            auto packed_pixels = std::span{&data[data_offset], (width*bits_per_packed_pixels+7)/8*height};
+                            data_offset += (width*bits_per_packed_pixels+7)/8*height;
+
+                            for (int x_ = 0; x_ < width; x_++) {
+                                for (int y_ = 0; y_ < height; y_++) {
+                                    auto palette_index = packed_pixels[y_*width + x_];
+                                    auto ptr = &palette[palette_index*3];
+                                    frame[(y+y_)*fb_width + (x+x_)] = from_big_endian_bytes(ptr[0], ptr[1], ptr[2], 0);
+                                }
+                            }
                         }
                         else {
-                            throw std::runtime_error("framebuffer update rectangle zrle subencoding not supportted");
+                            throw std::runtime_error(std::format("framebuffer update rectangle zrle subencoding not supportted: {}", subencoding));
                         }
                     }
                 }
-
-                //deflateEnd(&strm);
             }
             else {
                 throw std::runtime_error(std::format("encoding not support: {}", encoding_type));
             }
+            frame_updated = true;
         }
-        return last_update;
     }
 
-    std::vector<uint8_t> process_server_message() {
+    void process_server_message() {
         boost::system::error_code error;
         std::array<uint8_t, 4> framebuffer_update_head{};
         auto len = read(socket, boost::asio::buffer(framebuffer_update_head), error);
@@ -362,19 +379,16 @@ public:
         }
         //std::cout << "server message: " << (int)framebuffer_update_head[0] << std::endl;
         if (framebuffer_update_head[0] == 0) {
-            return process_framebuffer_update(framebuffer_update_head);
+            process_framebuffer_update(framebuffer_update_head);
         }
         else if (framebuffer_update_head[0] == 1) {
             process_colour_map_entries();
-            return {};
         }
         else if (framebuffer_update_head[0] == 3) {
             process_server_cut_text();
-            return {};
         }
         else {
             std::cout << "not implemented message type: " << (int)framebuffer_update_head[0] << std::endl;
-            return {};
         }
     }
 
@@ -594,7 +608,8 @@ public:
         : 
         io_context{},
         resolver{io_context},
-        socket{io_context}
+        socket{io_context},
+        zlib_stream{}
     {
         auto endpoints = resolver.resolve(host, port);
         boost::asio::connect(socket, endpoints);
@@ -603,12 +618,35 @@ public:
         m_server_init_message = server_init();
         set_format();
         set_encodings();
+
+        int ret = deflateInit(&zlib_stream, Z_DEFAULT_COMPRESSION);
+        if (ret != Z_OK) {
+            throw std::runtime_error("deflateInit error");
+        }
+    }
+    ~rfb() {
+        deflateEnd(&zlib_stream);
+    }
+    void set_frame(std::span<uint8_t> f) {
+        frame = f;
+    }
+    auto get_frame() {
+        return frame;
+    }
+    bool is_frame_updated() {
+        return frame_updated;
+    }
+    void reset_frame_updated() {
+        frame_updated = false;
     }
 private:
     boost::asio::io_context io_context;
     tcp::resolver resolver;
     tcp::socket socket;
     server_init_message m_server_init_message;
+    z_stream zlib_stream;
+    std::span<uint8_t> frame;
+    bool frame_updated;
 }; // class rfb
 
 } // namespace rfb

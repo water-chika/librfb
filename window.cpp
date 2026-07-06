@@ -140,17 +140,19 @@ public:
         rfb{parent::get_address(), parent::get_port()}
     {
     }
-    auto get_rfb() {
+    auto get_rfb(std::span<uint8_t> frame) {
         while (true) {
             if (pointer_sended_x != pointer_x || pointer_sended_y != pointer_y) {
                 rfb.pointer_event(pointer_button_mask, pointer_x, pointer_y);
                 pointer_sended_x = pointer_x;
                 pointer_sended_y = pointer_y;
             }
+            rfb.set_frame(frame);
+            rfb.reset_frame_updated();
             rfb.framebuffer_update_request(0, 0, rfb.get_width(), rfb.get_height());
-            auto frame = rfb.process_server_message();
-            if (frame.size() > 0) {
-                return frame;
+            rfb.process_server_message();
+            if (rfb.is_frame_updated()) {
+                return rfb.get_frame();
             }
         }
     }
@@ -257,15 +259,11 @@ public:
     device.resetFences(acquire_next_image_semaphore_fence);
 
     std::vector<void*> upload_memory_ptrs = parent::get_buffer_memory_ptr_vector();
-    uint32_t* upload_ptr = reinterpret_cast<uint32_t*>(upload_memory_ptrs[index]);
-    auto frame = parent::get_rfb();
+    uint8_t* upload_ptr = reinterpret_cast<uint8_t*>(upload_memory_ptrs[index]);
+    auto upload_buffer_size = parent::get_buffer_size();
+    parent::get_rfb(std::span{upload_ptr, upload_buffer_size});
     auto fb_width = parent::get_fb_width();
     auto fb_height = parent::get_fb_height();
-    for (int y = 0; y < fb_height; y++) {
-        for (int x = 0; x < fb_width; x++) {
-            upload_ptr[y*fb_width+x] = reinterpret_cast<uint32_t*>(frame.data())[y*fb_width+x];
-        }
-    }
     auto upload_memory_vector = parent::get_buffer_memory_vector();
     auto upload_memory = upload_memory_vector[index];
     device.flushMappedMemoryRanges(vk::MappedMemoryRange{}
