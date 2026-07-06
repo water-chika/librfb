@@ -304,7 +304,7 @@ public:
                     zlib_stream.avail_out = CHUNK;
                     zlib_stream.next_out = data.data() + data_previous_size;
 
-                    auto ret = deflate(&zlib_stream, Z_NO_FLUSH);
+                    auto ret = inflate(&zlib_stream, Z_NO_FLUSH);
                     if (ret == Z_STREAM_ERROR) {
                         throw std::runtime_error{"zlib deflate error"};
                     }
@@ -315,44 +315,107 @@ public:
                 int data_offset = 0;
                 auto fb_width = get_width();
                 auto fb_height = get_height();
-                for (int x = fb_width; x < fb_width; x+=64) {
-                    for (int y = fb_width; y < fb_width; y+=64) {
+                for (int x = 0; x < fb_width; x+=64) {
+                    for (int y = 0; y < fb_height; y+=64) {
                         width = x+64 < fb_width? 64 : fb_width - x;
                         height = y+64 < fb_height? 64 : fb_height - y;
                         auto subencoding = data[data_offset];
                         data_offset++;
+                        int bytes_per_cpixel = 3;
                         if (subencoding == 0) {
-                            int bytes_per_cpixel = 3;
                             for (int x_ = 0; x_ < width; x_++) {
                                 for (int y_ = 0; y_ < height; y_++) {
-                                    auto ptr = &data[data_offset + (y_*width*bytes_per_cpixel + x_)*3];
+                                    auto ptr = &data[data_offset + (y_*width + x_)*3];
                                     frame[(y+y_)*fb_width + (x+x_)] = from_big_endian_bytes(ptr[0], ptr[1], ptr[2], 0);
                                 }
                             }
-                            data_offset += 64*64*bytes_per_cpixel;
+                            data_offset += width*height*bytes_per_cpixel;
                         }
-                        else if (subencoding > 1 && subencoding < 128) {
-                            int bytes_per_cpixel = 3;
+                        else if (subencoding == 1) {
+                            auto ptr = &data[data_offset];
+                            data_offset+=bytes_per_cpixel;
+                            uint32_t pixel_value = from_big_endian_bytes(ptr[0], ptr[1], ptr[2], 0);
+                            for (int x_ = 0; x_ < width; x_++) {
+                                for (int y_ = 0; y_ < height; y_++) {
+                                    frame[(y+y_)*fb_width + (x+x_)] = from_big_endian_bytes(ptr[0], ptr[1], ptr[2], 0);
+                                }
+                            }
+                        }
+                        else if (subencoding > 1 && subencoding < 16) {
                             int palette_size = subencoding;
                             auto palette = std::span{&data[data_offset], palette_size*bytes_per_cpixel};
                             data_offset += palette_size*bytes_per_cpixel;
-                            int bits_per_packed_pixels = 0;
+                            int bits_per_packed_pixels = 1;
                             if (palette_size > 2) bits_per_packed_pixels = 2;
                             if (palette_size > 4) bits_per_packed_pixels = 4;
-                            if (palette_size > 16) bits_per_packed_pixels = 8;
+                            int palette_index_mask = 0b1;
+                            if (palette_size > 2) palette_index_mask = 0b11;
+                            if (palette_size > 4) palette_index_mask = 0b1111;
                             auto packed_pixels = std::span{&data[data_offset], (width*bits_per_packed_pixels+7)/8*height};
                             data_offset += (width*bits_per_packed_pixels+7)/8*height;
 
-                            for (int x_ = 0; x_ < width; x_++) {
-                                for (int y_ = 0; y_ < height; y_++) {
-                                    auto palette_index = packed_pixels[y_*width + x_];
+                            for (int y_ = 0; y_ < height; y_++) {
+                                auto packed_row_pixels = std::span{&packed_pixels[(y_*width*bits_per_packed_pixels+7)/8], (width*bits_per_packed_pixels+7)/8};
+                                for (int x_ = 0; x_ < width; x_++) {
+                                    auto palette_index = (packed_row_pixels[x_*bits_per_packed_pixels/8] >> ((x_*bits_per_packed_pixels)%8)) & palette_index_mask;
+                                    if (palette_index >= palette_size) palette_index = 0;
                                     auto ptr = &palette[palette_index*3];
                                     frame[(y+y_)*fb_width + (x+x_)] = from_big_endian_bytes(ptr[0], ptr[1], ptr[2], 0);
                                 }
                             }
                         }
+                        else if (subencoding == 128) {
+                            int run = 0;
+                            while (run < width*height) {
+                                auto ptr = &data[data_offset];
+                                uint32_t pixel_value = from_big_endian_bytes(ptr[0], ptr[1], ptr[2], 0);
+                                data_offset += bytes_per_cpixel;
+                                ptr = &data[data_offset];
+                                int count_255 = 0;
+                                while (ptr[count_255] == 255) count_255++;
+                                int run_length = 255*count_255 + ptr[count_255] + 1;
+                                run += run_length;
+                                data_offset += count_255 + 1;
+
+                                for (int i = 0; i < run_length; i++) {
+                                    int y_ = (run+i)/64, x_ = (run+i)%64;
+                                    frame[(y+y_)*fb_width + (x+x_)] = pixel_value;
+                                }
+                            }
+                        }
+                        else if (subencoding >= 130 && subencoding <= 255) {
+                            int palette_size = subencoding - 128;
+                            auto palette = std::span{&data[data_offset], palette_size*bytes_per_cpixel};
+                            data_offset += palette_size*bytes_per_cpixel;
+                            int run = 0;
+                            while (run < width*height) {
+                                auto ptr = &data[data_offset];
+                                data_offset++;
+                                if (ptr[0] < 128) {
+                                    int palette_index = ptr[0];
+                                    run++;
+                                }
+                                else {
+                                    int palette_index = ptr[0]-128;
+                                    if (palette_index*3+2 >= palette_size) palette_index = 0;
+                                    uint32_t pixel_value = from_big_endian_bytes(palette[palette_index*3], palette[palette_index*3+1], palette[palette_index*3+2], 0);
+                                    ptr = &data[data_offset];
+                                    int count_255 = 0;
+                                    while (ptr[count_255] == 255) count_255++;
+                                    int run_length = 255*count_255 + ptr[count_255] + 1;
+                                    run += 255*count_255 + ptr[count_255] + 1;
+                                    data_offset += count_255+1;
+
+                                    for (int i = 0; i < run_length; i++) {
+                                        int y_ = (run+i)/64, x_ = (run+i)%64;
+                                        frame[(y+y_)*fb_width + (x+x_)] = pixel_value;
+                                    }
+                                }
+                            }
+                        }
                         else {
-                            throw std::runtime_error(std::format("framebuffer update rectangle zrle subencoding not supportted: {}", subencoding));
+                            break;
+                            //throw std::runtime_error(std::format("framebuffer update rectangle zrle subencoding not supportted: {}", subencoding));
                         }
                     }
                 }
@@ -619,13 +682,13 @@ public:
         set_format();
         set_encodings();
 
-        int ret = deflateInit(&zlib_stream, Z_DEFAULT_COMPRESSION);
+        int ret = inflateInit(&zlib_stream);
         if (ret != Z_OK) {
             throw std::runtime_error("deflateInit error");
         }
     }
     ~rfb() {
-        deflateEnd(&zlib_stream);
+        inflateEnd(&zlib_stream);
     }
     void set_frame(std::span<uint8_t> f) {
         frame = f;
