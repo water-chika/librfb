@@ -137,58 +137,33 @@ public:
     using parent = T;
     using tcp = boost::asio::ip::tcp;
     add_rfb(const configure auto& conf) : parent{conf},
-        m_io_context{},
-        m_resolver{m_io_context},
-        m_socket{m_io_context}
+        rfb{parent::get_address(), parent::get_port()}
     {
-        auto endpoints = m_resolver.resolve(parent::get_address(), parent::get_port());
-        boost::asio::connect(m_socket, endpoints);
-
-        rfb::rfb_init(m_socket);
-        m_server_init_message = rfb::server_init(m_socket);
-        rfb::set_format(m_socket);
-        rfb::set_encodings(m_socket);
-    }
-    add_rfb(add_rfb&&) : parent{empty_configure{}},
-        m_io_context{},
-        m_resolver{m_io_context},
-        m_socket{m_io_context}
-        {
-        std::cerr << "move construct should not be called" << std::endl;
     }
     auto get_rfb() {
         while (true) {
             if (pointer_sended_x != pointer_x || pointer_sended_y != pointer_y) {
-                rfb::pointer_event(m_socket, pointer_button_mask, pointer_x, pointer_y);
+                rfb.pointer_event(pointer_button_mask, pointer_x, pointer_y);
                 pointer_sended_x = pointer_x;
                 pointer_sended_y = pointer_y;
             }
-            rfb::framebuffer_update_request(m_socket, 0, 0, m_server_init_message.fb_width, m_server_init_message.fb_height);
-            auto frame = rfb::process_server_message(m_socket, m_server_init_message.server_pixel_format);
+            rfb.framebuffer_update_request(0, 0, rfb.get_width(), rfb.get_height());
+            auto frame = rfb.process_server_message();
             if (frame.size() > 0) {
                 return frame;
             }
         }
     }
-    auto& get_socket() {
-        return m_socket;
-    }
-    auto get_socket_fd() {
-        return m_socket.native_handle();
-    }
-    auto& get_server_pixel_format() {
-        return m_server_init_message.server_pixel_format;
-    }
-    auto get_fb_width() {
-        return m_server_init_message.fb_width;
-    }
-    auto get_fb_height() {
-        return m_server_init_message.fb_height;
-    }
     auto process_keysym_event(int keysym, int state) {
         std::cout << "keysym event processing" << std::endl;
         std::cout << std::format("{:#x}", keysym) << std::endl;
-        rfb::key_event(m_socket, keysym, state);
+        rfb.key_event(keysym, state);
+    }
+    auto get_fb_width() {
+        return rfb.get_width();
+    }
+    auto get_fb_height() {
+        return rfb.get_height();
     }
     void process_pointer_motion_event(int x, int y) {
         auto fb_width = get_fb_width();
@@ -230,52 +205,16 @@ public:
                 std::cerr << "unknown pointer button" << std::endl;
             }
         }
-        rfb::pointer_event(m_socket, button_mask, pointer_x, pointer_y);
+        rfb.pointer_event(button_mask, pointer_x, pointer_y);
         pointer_button_mask = button_mask;
     }
 private:
-    boost::asio::io_context m_io_context;
-    tcp::resolver m_resolver;
-    tcp::socket m_socket;
-    rfb::server_init_message m_server_init_message;
-
+    rfb::rfb rfb;
     int pointer_sended_x;
     int pointer_sended_y;
     int pointer_x;
     int pointer_y;
     int pointer_button_mask;
-};
-
-template<typename T>
-class add_rfb_pollfd : public T {
-public:
-    using parent = T;
-    static constexpr int FD_INDEX = parent::FDS_SIZE;
-    static constexpr int FDS_SIZE = parent::FDS_SIZE+1;
-    add_rfb_pollfd(const configure auto& conf) : parent{conf} {
-    }
-    std::array<pollfd, FDS_SIZE> get_fds() {
-        std::array<pollfd, FDS_SIZE> res{};
-        auto fds = parent::get_fds();
-        std::copy(fds.begin(), fds.end(), res.begin());
-        res.back() = pollfd{
-            .fd = parent::get_socket_fd(),
-            .revents = POLLIN
-        };
-        return res;
-    }
-
-    void process_events(auto& fds) {
-        std::cout << "process" << std::endl;
-        auto frame = rfb::process_server_message(parent::get_socket(), parent::get_server_pixel_format());
-        parent::draw(frame);
-        if (fds[FD_INDEX].revents & POLLIN) {
-            auto frame = rfb::process_server_message(parent::get_socket(), parent::get_server_pixel_format());
-            parent::draw(frame);
-        }
-        rfb::framebuffer_update_request(parent::get_socket(), 0, 0, parent::get_fb_width(), parent::get_fb_height());
-        parent::process_events(fds);
-    }
 };
 
 template <class T> class add_dynamic_draw : public T {
