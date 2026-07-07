@@ -2,6 +2,7 @@
 
 #include <array>
 #include <iostream>
+#include <map>
 #include <boost/asio.hpp>
 
 #include <cpp_helper.hpp>
@@ -18,6 +19,15 @@ enum class encoding : uint32_t {
     raw = 0,
     zrle = 16,
 };
+static auto encoding_str_map = std::map<rfb::encoding, const char*>{
+    {encoding::raw, "raw"},
+    {encoding::zrle, "ZRLE"},
+};
+
+auto& operator<<(std::ostream& out, rfb::encoding encode) {
+    return out << encoding_str_map[encode];
+}
+
 }
 
 template<>
@@ -89,6 +99,7 @@ public:
                 std::cout << "y: " << y << std::endl;
                 std::cout << "width: " << width << std::endl;
                 std::cout << "height: " << height << std::endl;
+                std::cout << "encoding_type: " << encoding_type << std::endl;
             }
             if (encoding_type == encoding::raw) {
                 auto pixels = frame;

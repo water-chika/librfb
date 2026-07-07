@@ -17,7 +17,8 @@
 
 using namespace vulkan_start;
 using namespace vulkan_hpp_helper;
-using vulkan_hpp_helper::configure;
+using cpp_helper::configure;
+using cpp_helper::empty_configurable_class;
 
 #ifdef WIN32
 constexpr auto PLATFORM = vulkan_start::platform::win32;
@@ -211,7 +212,23 @@ public:
         pointer_button_mask = button_mask;
     }
 private:
-    rfb::rfb rfb;
+    using rfb_env =
+        rfb::add_rfb<
+        rfb::add_process_framebuffer_update<
+        rfb::add_zrle<
+        rfb::init_rfb<
+        rfb::add_set_encodings<
+        rfb::set_supported_encodings_from_configure<
+        rfb::add_set_format<
+        rfb::add_server_init<
+        rfb::add_client_init<
+        rfb::add_connection<
+        rfb::set_port<
+        rfb::set_address<
+        empty_configurable_class
+        >>>>>>>>>>>>
+    ;
+    rfb_env rfb;
     int pointer_sended_x;
     int pointer_sended_y;
     int pointer_x;
@@ -485,14 +502,27 @@ using draw_app =
 
 using namespace std::literals;
 
+struct config {
+    const char* address;
+    const char* port;
+    std::vector<uint32_t> supported_encodings;
+};
+
+template<>
+struct cpp_helper::is_configure_structure<config> {
+    static constexpr bool value = true;
+};
+
 int main(int argc, const char* argv[]) {
   try {
-    if (argc < 3) {
-        throw std::logic_error("Usage: rfb_window_demo <address> <port>");
+    if (argc < 4) {
+        throw std::logic_error("Usage: rfb_window_demo <address> <port> <encoding>");
     }
     auto address = argv[1];
     auto port = argv[2];
-    auto conf = rfb::config{.address=address, .port=port};
+    auto encoding = strtol(argv[3], NULL, 10);
+    std::cout << encoding << std::endl;
+    auto conf = config{.address=address, .port=port, .supported_encodings = { rfb::to_big_endian(encoding), 0}};
     auto app = draw_app{conf};
   } catch (std::exception &e) {
     std::cerr << e.what() << std::endl;
