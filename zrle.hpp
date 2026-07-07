@@ -21,6 +21,9 @@ public:
     ~add_zrle() {
         inflateEnd(&zlib_stream);
     }
+    uint32_t cpixel_to_pixel(std::span<uint8_t> c) {
+        return c[0] | (c[0]<<(1*8)) | (c[0]<<(2*8));
+    }
     void zrle_decode(std::span<uint8_t> zlib_data, int x, int y, int width, int height, std::span<uint8_t> frame) {
         constexpr int CHUNK = 1024;
 
@@ -46,29 +49,28 @@ public:
         int data_offset = 0;
         auto fb_width = width;
         auto fb_height = height;
-        for (int x = 0; x < fb_width; x+=64) {
-            for (int y = 0; y < fb_height; y+=64) {
-                int tile_width = x+64 < fb_width? 64 : fb_width - x;
-                int tile_height = y+64 < fb_height? 64 : fb_height - y;
+        for (int y = 0; y < fb_height; y+=64) {
+            for (int x = 0; x < fb_width; x+=64) {
+                int tile_width = fb_width - x >= 64 ? 64 : fb_width - x;
+                int tile_height = fb_height - y >= 64 ? 64 : fb_height - y;
                 auto subencoding = data[data_offset];
                 data_offset++;
                 int bytes_per_cpixel = 3;
                 if (subencoding == 0) {
                     for (int x_ = 0; x_ < tile_width; x_++) {
                         for (int y_ = 0; y_ < tile_height; y_++) {
-                            auto ptr = &data[data_offset + (y_*tile_width + x_)*3];
-                            frame[(y+y_)*fb_width + (x+x_)] = from_big_endian_bytes(ptr[0], ptr[1], ptr[2], 0);
+                            auto ptr = std::span{&data[data_offset + (y_*tile_width + x_)*3], 3};
+                            frame[(y+y_)*fb_width + (x+x_)] = cpixel_to_pixel(ptr);
                         }
                     }
                     data_offset += tile_width*tile_height*bytes_per_cpixel;
                 }
                 else if (subencoding == 1) {
-                    auto ptr = &data[data_offset];
+                    auto pixel = cpixel_to_pixel(std::span{&data[data_offset], 3});
                     data_offset+=bytes_per_cpixel;
-                    uint32_t pixel_value = from_big_endian_bytes(ptr[0], ptr[1], ptr[2], 0);
                     for (int x_ = 0; x_ < tile_width; x_++) {
                         for (int y_ = 0; y_ < tile_height; y_++) {
-                            frame[(y+y_)*fb_width + (x+x_)] = from_big_endian_bytes(ptr[0], ptr[1], ptr[2], 0);
+                            frame[(y+y_)*fb_width + (x+x_)] = pixel;
                         }
                     }
                 }
@@ -85,23 +87,21 @@ public:
                     auto packed_pixels = std::span{&data[data_offset], (tile_width*bits_per_packed_pixels+7)/8*tile_height};
                     data_offset += (tile_width*bits_per_packed_pixels+7)/8*tile_height;
 
-                    for (int y_ = 0; y_ < height; y_++) {
+                    for (int y_ = 0; y_ < tile_height; y_++) {
                         auto packed_row_pixels = std::span{&packed_pixels[(y_*tile_width*bits_per_packed_pixels+7)/8], (tile_width*bits_per_packed_pixels+7)/8};
                         for (int x_ = 0; x_ < tile_width; x_++) {
                             auto palette_index = (packed_row_pixels[x_*bits_per_packed_pixels/8] >> ((x_*bits_per_packed_pixels)%8)) & palette_index_mask;
                             if (palette_index >= palette_size) palette_index = 0;
-                            auto ptr = &palette[palette_index*3];
-                            frame[(y+y_)*fb_width + (x+x_)] = from_big_endian_bytes(ptr[0], ptr[1], ptr[2], 0);
+                            frame[(y+y_)*fb_width + (x+x_)] = cpixel_to_pixel(std::span{&palette[palette_index*3], 3});
                         }
                     }
                 }
                 else if (subencoding == 128) {
                     int run = 0;
                     while (run < tile_width*tile_height) {
-                        auto ptr = &data[data_offset];
-                        uint32_t pixel_value = from_big_endian_bytes(ptr[0], ptr[1], ptr[2], 0);
+                        uint32_t pixel_value = cpixel_to_pixel(std::span{&data[data_offset], 3});
                         data_offset += bytes_per_cpixel;
-                        ptr = &data[data_offset];
+                        auto ptr = &data[data_offset];
                         int count_255 = 0;
                         while (ptr[count_255] == 255) count_255++;
                         int run_length = 255*count_255 + ptr[count_255] + 1;
@@ -129,7 +129,7 @@ public:
                         else {
                             int palette_index = ptr[0]-128;
                             if (palette_index*3+2 >= palette_size) palette_index = 0;
-                            uint32_t pixel_value = from_big_endian_bytes(palette[palette_index*3], palette[palette_index*3+1], palette[palette_index*3+2], 0);
+                            uint32_t pixel_value = cpixel_to_pixel(std::span{&palette[palette_index*3],3});
                             ptr = &data[data_offset];
                             int count_255 = 0;
                             while (ptr[count_255] == 255) count_255++;
@@ -145,8 +145,7 @@ public:
                     }
                 }
                 else {
-                    break;
-                    //throw std::runtime_error(std::format("framebuffer update rectangle zrle subencoding not supportted: {}", subencoding));
+                    throw std::runtime_error(std::format("framebuffer update rectangle zrle subencoding not supportted: {}", subencoding));
                 }
             }
         }
