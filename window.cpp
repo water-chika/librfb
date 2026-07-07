@@ -515,14 +515,16 @@ struct cpp_helper::is_configure_structure<config> {
 
 int main(int argc, const char* argv[]) {
   try {
-    if (argc < 4) {
+    if (argc < 3) {
         throw std::logic_error("Usage: rfb_window_demo <address> <port> <encoding>");
     }
     auto address = argv[1];
     auto port = argv[2];
-    auto encoding = strtol(argv[3], NULL, 10);
-    std::cout << encoding << std::endl;
-    auto conf = config{.address=address, .port=port, .supported_encodings = { rfb::to_big_endian(encoding), 0}};
+    uint32_t encoding = 16;
+    if (argc > 3) {
+        encoding = strtol(argv[3], NULL, 10);
+    }
+    auto conf = config{.address=address, .port=port, .supported_encodings = { rfb::to_big_endian(encoding) }};
     auto app = draw_app{conf};
   } catch (std::exception &e) {
     std::cerr << e.what() << std::endl;
