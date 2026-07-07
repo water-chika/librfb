@@ -18,10 +18,12 @@ namespace rfb {
 enum class encoding : uint32_t {
     raw = 0,
     zrle = 16,
+    h264 = 50,
 };
 static auto encoding_str_map = std::map<rfb::encoding, const char*>{
     {encoding::raw, "raw"},
     {encoding::zrle, "ZRLE"},
+    {encoding::h264, "H264"},
 };
 
 auto& operator<<(std::ostream& out, rfb::encoding encode) {
@@ -70,7 +72,9 @@ template<typename T>
 class add_process_framebuffer_update : public T{
 public:
     using parent = T;
-    add_process_framebuffer_update(const configure auto& conf) : parent{conf} {
+    add_process_framebuffer_update(const configure auto& conf) : parent{conf},
+        internal_frame(parent::get_width()*parent::get_height()*4)
+    {
     }
 
     auto process_framebuffer_update(auto& framebuffer_update_head) {
@@ -89,6 +93,8 @@ public:
             if (len != rectangle.size()) {
                 throw std::runtime_error("framebuffer update rectangle read fail");
             }
+            uint16_t fb_width = parent::get_width();
+            uint16_t fb_height = parent::get_height();
             uint16_t x = from_big_endian_bytes(rectangle[0], rectangle[1]);
             uint16_t y = from_big_endian_bytes(rectangle[2], rectangle[3]);
             uint16_t width = from_big_endian_bytes(rectangle[4], rectangle[5]);
@@ -102,7 +108,7 @@ public:
                 std::cout << "encoding_type: " << encoding_type << std::endl;
             }
             if (encoding_type == encoding::raw) {
-                auto pixels = frame;
+                auto pixels = std::vector<uint8_t>(width*height*4);
                 len = read(socket, boost::asio::buffer(pixels), error);
                 if (error == boost::asio::error::eof)
                     throw std::runtime_error("eof");
@@ -110,6 +116,14 @@ public:
                     throw boost::system::system_error(error);
                 if (len != pixels.size()) {
                     throw std::runtime_error("framebuffer update rectangle pixels read fail");
+                }
+                for (int  y_ = 0; y_ < height; y_++) {
+                    for (int x_ = 0; x_ < width; x_++) {
+                        internal_frame[((y+y_)*fb_width+(x+x_))*4+0] = pixels[(y_*width + x_)*4+0];
+                        internal_frame[((y+y_)*fb_width+(x+x_))*4+1] = pixels[(y_*width + x_)*4+1];
+                        internal_frame[((y+y_)*fb_width+(x+x_))*4+2] = pixels[(y_*width + x_)*4+2];
+                        internal_frame[((y+y_)*fb_width+(x+x_))*4+3] = pixels[(y_*width + x_)*4+3];
+                    }
                 }
             }
             else if (encoding_type == encoding::zrle) {
@@ -133,13 +147,22 @@ public:
                 if (len != zlib_data.size()) {
                     throw std::runtime_error("framebuffer update rectangle zrle zlib data read fail");
                 }
-                parent::zrle_decode(zlib_data, x, y, width, height, frame);
+                parent::zrle_decode(zlib_data, x, y, width, height, internal_frame);
+            }
+            else if (encoding_type == encoding::h264) {
+                std::array<uint8_t, 8> message;
+                parent::rfb_read(message);
+                auto length = from_big_endian_bytes(message[0], message[1], message[2], message[3]);
+                auto flags = from_big_endian_bytes(message[4], message[5], message[6], message[7]);
+                auto h264_data = std::vector<uint8_t>(length);
+                parent::rfb_read(h264_data);
             }
             else {
                 throw std::runtime_error(std::format("encoding not support: {}", encoding_type));
             }
-            frame_updated = true;
         }
+        std::copy(internal_frame.begin(), internal_frame.end(), frame.begin());
+        frame_updated = true;
     }
     void set_frame(std::span<uint8_t> f) {
         frame = f;
@@ -154,6 +177,7 @@ public:
         frame_updated = false;
     }
 private:
+    std::vector<uint8_t> internal_frame;
     std::span<uint8_t> frame;
     bool frame_updated;
 };
@@ -172,6 +196,17 @@ public:
     }
     auto& get_socket() {
         return socket;
+    }
+    void rfb_read(auto& buf) {
+        boost::system::error_code error;
+        auto len = read(socket, boost::asio::buffer(buf), error);
+        if (error == boost::asio::error::eof)
+            throw std::runtime_error("eof");
+        else if (error)
+            throw boost::system::system_error(error);
+        if (len != buf.size()) {
+            throw std::runtime_error("read fail");
+        }
     }
 private:
     boost::asio::io_context io_context;
@@ -538,8 +573,9 @@ public:
     }
     void framebuffer_update_request(uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
         boost::system::error_code error;
+        bool incremental_update = true;
         std::array<uint8_t, 10> framebuffer_update_request = {
-            3, 0,
+            3, incremental_update,
             to_big_endian_byte(x, 0), to_big_endian_byte(x, 1),
             to_big_endian_byte(y, 0), to_big_endian_byte(y, 1),
             to_big_endian_byte(width, 0), to_big_endian_byte(width, 1),
