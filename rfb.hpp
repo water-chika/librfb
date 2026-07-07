@@ -390,8 +390,8 @@ public:
         boost::system::error_code error;
         // order is a priority hint
         auto supported_encodings = std::to_array<uint32_t>({
-                to_big_endian(0), // Raw
                 to_big_endian(16),// ZRLE
+                to_big_endian(0), // Raw
                 to_big_endian(1), // Copy-Rect
                 to_big_endian(6), // Zlib
                 to_big_endian(7), // Tight
