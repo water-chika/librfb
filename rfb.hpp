@@ -359,6 +359,79 @@ public:
 };
 
 template<typename T>
+class set_supported_encodings_from_configure : public T {
+public:
+    using parent = T;
+    set_supported_encodings_from_configure(const configure auto& conf) : parent{conf},
+        supported_encodings{conf.supported_encodings}
+    {
+    }
+    auto get_supported_encodings() {
+        return supported_encodings;
+    }
+private:
+    std::vector<uint32_t> supported_encodings;
+};
+
+template<typename T>
+class set_default_supported_encodings : public T {
+public:
+    using parent = T;
+    set_default_supported_encodings(const configure auto& conf) : parent{conf}
+    {
+    }
+    auto get_supported_encodings() {
+        return std::to_array<uint32_t>({
+                to_big_endian(16),// ZRLE
+                to_big_endian(0), // Raw
+                //to_big_endian(1), // Copy-Rect
+                //to_big_endian(6), // Zlib
+                //to_big_endian(7), // Tight
+                //to_big_endian(15),// TRLE
+                //to_big_endian(21),// JPEG
+                //to_big_endian(50),// H264
+        });
+
+    }
+};
+
+template<typename T>
+class add_set_encodings : public T {
+public:
+    using parent = T;
+    add_set_encodings(const configure auto& conf) : parent{conf} {
+    }
+    int set_encodings()
+    {
+        boost::system::error_code error;
+        // order is a priority hint
+        auto supported_encodings = parent::get_supported_encodings();
+        auto set_encodings = std::to_array<uint8_t>({
+            2, 0, // SetEncoding, padding
+            0, supported_encodings.size(), // Number of encoding
+        });
+        auto& socket = parent::get_socket();
+        auto len = write(socket, boost::asio::buffer(set_encodings), error);
+        if (error == boost::asio::error::eof)
+            return 0;
+        else if (error)
+            throw boost::system::system_error(error);
+        if (len != set_encodings.size()) {
+            std::cerr << "set encoding send fail" << std::endl;
+        }
+        len = write(socket, boost::asio::buffer(supported_encodings), error);
+        if (error == boost::asio::error::eof)
+            return 0;
+        else if (error)
+            throw boost::system::system_error(error);
+        if (len != supported_encodings.size()*sizeof(supported_encodings[0])) {
+            std::cerr << "supported_encodings send fail" << std::endl;
+        }
+        return 0;
+    }
+};
+
+template<typename T>
 class add_set_format : public T {
 public:
     using parent = T;
@@ -381,44 +454,6 @@ public:
             throw boost::system::system_error(error);
         if (len != set_format.size()) {
             std::cerr << "set format send fail" << std::endl;
-        }
-        return 0;
-    }
-
-    int set_encodings()
-    {
-        boost::system::error_code error;
-        // order is a priority hint
-        auto supported_encodings = std::to_array<uint32_t>({
-                to_big_endian(16),// ZRLE
-                to_big_endian(0), // Raw
-                to_big_endian(1), // Copy-Rect
-                to_big_endian(6), // Zlib
-                to_big_endian(7), // Tight
-                to_big_endian(15),// TRLE
-                to_big_endian(21),// JPEG
-                to_big_endian(50),// H264
-        });
-        auto set_encodings = std::to_array<uint8_t>({
-            2, 0, // SetEncoding, padding
-            0, supported_encodings.size(), // Number of encoding
-        });
-        auto& socket = parent::get_socket();
-        auto len = write(socket, boost::asio::buffer(set_encodings), error);
-        if (error == boost::asio::error::eof)
-            return 0;
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != set_encodings.size()) {
-            std::cerr << "set encoding send fail" << std::endl;
-        }
-        len = write(socket, boost::asio::buffer(supported_encodings), error);
-        if (error == boost::asio::error::eof)
-            return 0;
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != supported_encodings.size()*sizeof(supported_encodings[0])) {
-            std::cerr << "supported_encodings send fail" << std::endl;
         }
         return 0;
     }
@@ -483,25 +518,10 @@ public:
     const char* port;
 };
 
-template<typename T>
-using add_rfb_parent =
-    add_process_framebuffer_update<
-    add_zrle<
-    init_rfb<
-    add_set_format<
-    add_server_init<
-    add_client_init<
-    add_connection<
-    set_port<
-    set_address<
-    T
-    >>>>>>>>>
-;
-
 template <typename T>
-class add_rfb : public add_rfb_parent<T>{
+class add_rfb : public T {
 public:
-    using parent = add_rfb_parent<T>;
+    using parent = T;
     add_rfb(const configure auto& conf) : parent{conf}
     {
     }
@@ -657,7 +677,21 @@ public:
     }
 }; // class rfb
 
-using rfb = add_rfb<empty_configurable_class>;
+using rfb = add_rfb<
+    add_process_framebuffer_update<
+    add_zrle<
+    init_rfb<
+    add_set_encodings<
+    set_default_supported_encodings<
+    add_set_format<
+    add_server_init<
+    add_client_init<
+    add_connection<
+    set_port<
+    set_address<
+    empty_configurable_class
+    >>>>>>>>>>>>
+;
 struct config {
     const char* address;
     const char* port;
