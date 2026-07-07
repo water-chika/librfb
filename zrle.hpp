@@ -24,8 +24,10 @@ public:
     uint32_t cpixel_to_pixel(std::span<uint8_t> c) {
         return c[0] | (c[0]<<(1*8)) | (c[0]<<(2*8));
     }
-    void zrle_decode(std::span<uint8_t> zlib_data, int x, int y, int width, int height, std::span<uint8_t> frame) {
+    void zrle_decode(std::span<uint8_t> zlib_data, int x, int y, int width, int height, std::span<uint8_t> frame_u8) {
         constexpr int CHUNK = 1024;
+
+        auto frame = reinterpret_cast<uint32_t*>(frame_u8.data());
 
         zlib_stream.avail_in = zlib_data.size();
         zlib_stream.next_in = zlib_data.data();
@@ -134,13 +136,13 @@ public:
                             int count_255 = 0;
                             while (ptr[count_255] == 255) count_255++;
                             int run_length = 255*count_255 + ptr[count_255] + 1;
-                            run += 255*count_255 + ptr[count_255] + 1;
-                            data_offset += count_255+1;
-
                             for (int i = 0; i < run_length; i++) {
-                                int y_ = (run+i)/64, x_ = (run+i)%64;
+                                int y_ = (run+i)/tile_width, x_ = (run+i)%tile_width;
                                 frame[(y+y_)*fb_width + (x+x_)] = pixel_value;
                             }
+
+                            run += 255*count_255 + ptr[count_255] + 1;
+                            data_offset += count_255+1;
                         }
                     }
                 }
