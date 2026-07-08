@@ -503,13 +503,14 @@ public:
             if (rfb.is_frame_updated()) {
                 parent::draw();
                 rfb.reset_frame_updated();
-                parent::update_pointer_position();
                 rfb.framebuffer_update_request(0, 0, rfb.get_width(), rfb.get_height());
+                parent::update_pointer_position();
             }
             previous_time = now;
         }
         else if (now - previous_time > 30ms) {
             parent::update_pointer_position();
+            previous_time = now;
         }
         parent::process_events(fds);
     }
