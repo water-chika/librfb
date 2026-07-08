@@ -141,31 +141,28 @@ public:
     {
     }
     auto get_rfb(std::span<uint8_t> frame) {
-        while (true) {
-            if (pointer_sended_x != pointer_x || pointer_sended_y != pointer_y) {
-                rfb.pointer_event(pointer_button_mask, pointer_x, pointer_y);
-                pointer_sended_x = pointer_x;
-                pointer_sended_y = pointer_y;
-            }
-            rfb.set_frame(frame);
-            rfb.reset_frame_updated();
-            rfb.framebuffer_update_request(0, 0, rfb.get_width(), rfb.get_height());
-            rfb.process_server_message();
-            if (rfb.is_frame_updated()) {
-                return rfb.get_frame();
-            }
-        }
+        rfb.get_frame(frame);
     }
     auto process_keysym_event(int keysym, int state) {
         std::cout << "keysym event processing" << std::endl;
         std::cout << std::format("{:#x}", keysym) << std::endl;
         rfb.key_event(keysym, state);
     }
+    auto& get_rfb() {
+        return rfb;
+    }
     auto get_fb_width() {
         return rfb.get_width();
     }
     auto get_fb_height() {
         return rfb.get_height();
+    }
+    void update_pointer_position() {
+        if (pointer_sended_x != pointer_x || pointer_sended_y != pointer_y) {
+            pointer_sended_x = pointer_x;
+            pointer_sended_y = pointer_y;
+            rfb.pointer_event(pointer_button_mask, pointer_x, pointer_y);
+        }
     }
     void process_pointer_motion_event(int x, int y) {
         auto fb_width = get_fb_width();
@@ -487,16 +484,60 @@ add_physical_device_and_device_and_draw =
   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 ;
 
+template<typename T>
+class add_rfb_socket_pollfd : public T {
+public:
+    using parent = T;
+    add_rfb_socket_pollfd(const configure auto& conf) : parent{conf} {
+        auto& rfb = parent::get_rfb();
+        rfb.framebuffer_update_request(0, 0, rfb.get_width(), rfb.get_height());
+    }
+    static constexpr int FDS_INDEX = parent::FDS_SIZE;
+    static constexpr int FDS_SIZE = parent::FDS_SIZE+1;
+    void process_events(auto& fds) {
+        auto& rfb = parent::get_rfb();
+        assert(fds[FDS_INDEX].fd == rfb.get_socket());
+        auto now = std::chrono::steady_clock::now();
+        if (fds[FDS_INDEX].revents & POLLIN) {
+            rfb.process_server_message();
+            if (rfb.is_frame_updated()) {
+                parent::draw();
+                rfb.reset_frame_updated();
+                parent::update_pointer_position();
+                rfb.framebuffer_update_request(0, 0, rfb.get_width(), rfb.get_height());
+            }
+            previous_time = now;
+        }
+        else if (now - previous_time > 30ms) {
+            parent::update_pointer_position();
+        }
+        parent::process_events(fds);
+    }
+    std::vector<pollfd> get_fds() {
+        auto fds = parent::get_fds();
+        auto& rfb = parent::get_rfb();
+        fds.emplace_back(pollfd{
+                .fd = rfb.get_socket(),
+                .events = POLLIN,
+                });
+        return fds;
+    }
+private:
+    std::chrono::steady_clock::time_point previous_time;
+};
+
 using draw_app =
-    use_platform<PLATFORM>::template add_event_loop<
+    use_platform<PLATFORM>::template add_pollfds_loop<
+    add_rfb_socket_pollfd<
     add_physical_device_and_device_and_draw<
+    posix::add_empty_pollfd_array<
     add_instance<
     use_platform<PLATFORM>::template add_platform_needed_extensions<
     add_surface_extension<
     add_empty_extensions<
     use_platform<PLATFORM>::template add_window<
     empty_class
-    >>>>>>>
+    >>>>>>>>>
 ;
 
 using namespace std::literals;

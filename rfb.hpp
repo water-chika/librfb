@@ -150,14 +150,13 @@ public:
                 throw std::runtime_error(std::format("encoding not support: {}", encoding_type));
             }
         }
-        std::copy(internal_frame.begin(), internal_frame.end(), frame.begin());
         frame_updated = true;
     }
-    void set_frame(std::span<uint8_t> f) {
-        frame = f;
+    void get_frame(std::span<uint8_t> frame) {
+        std::copy(internal_frame.begin(), internal_frame.end(), frame.begin());
     }
     auto get_frame() {
-        return frame;
+        return internal_frame;
     }
     bool is_frame_updated() {
         return frame_updated;
@@ -167,7 +166,6 @@ public:
     }
 private:
     std::vector<uint8_t> internal_frame;
-    std::span<uint8_t> frame;
     bool frame_updated;
 };
 
@@ -241,6 +239,9 @@ public:
                 s += len;
             }
         }
+    }
+    auto get_socket() {
+        return connection.get_socket();
     }
 private:
     using connection_t =
@@ -553,8 +554,7 @@ public:
     add_rfb(const configure auto& conf) : parent{conf}
     {
     }
-    void framebuffer_update_request(uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
-        bool incremental_update = true;
+    void framebuffer_update_request(uint16_t x, uint16_t y, uint16_t width, uint16_t height, bool incremental_update = true) {
         std::array<uint8_t, 10> framebuffer_update_request = {
             3, incremental_update,
             to_big_endian_byte(x, 0), to_big_endian_byte(x, 1),
