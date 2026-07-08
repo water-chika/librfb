@@ -136,7 +136,6 @@ template<class T>
 class add_rfb : public T {
 public:
     using parent = T;
-    using tcp = boost::asio::ip::tcp;
     add_rfb(const configure auto& conf) : parent{conf},
         rfb{conf}
     {
@@ -504,7 +503,7 @@ using namespace std::literals;
 
 struct config {
     const char* address;
-    const char* port;
+    uint16_t port;
     std::vector<uint32_t> supported_encodings;
 };
 
@@ -519,7 +518,7 @@ int main(int argc, const char* argv[]) {
         throw std::logic_error("Usage: rfb_window_demo <address> <port> <encoding>");
     }
     auto address = argv[1];
-    auto port = argv[2];
+    auto port = strtol(argv[2], NULL, 10);
     uint32_t encoding = 16;
     if (argc > 3) {
         encoding = strtol(argv[3], NULL, 10);

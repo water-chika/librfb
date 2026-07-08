@@ -3,6 +3,8 @@
 #include "zlib.h"
 
 #include "utility.hpp"
+#include <span>
+#include <format>
 
 namespace rfb {
 

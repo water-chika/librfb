@@ -10,6 +10,7 @@ add_library(rfb
 target_link_libraries(rfb PUBLIC
     z
     cpp_helper
+    socket_helper
 )
 
 add_executable(rfb_demo

@@ -3,9 +3,9 @@
 #include <array>
 #include <iostream>
 #include <map>
-#include <boost/asio.hpp>
 
 #include <cpp_helper.hpp>
+#include <socket_helper.hpp>
 
 namespace rfb {
 using cpp_helper::configure;
@@ -61,8 +61,6 @@ public:
 
 namespace rfb {
 
-using boost::asio::ip::tcp;
-
 uint16_t parse_3digits(char d100, char d10, char d) {
     return (d100-'0')*100 + (d10-'0')*10 + (d-'0');
 }
@@ -78,20 +76,16 @@ public:
     }
 
     auto process_framebuffer_update(auto& framebuffer_update_head) {
-        boost::system::error_code error;
         uint16_t rectangles_count = from_big_endian_bytes(framebuffer_update_head[2], framebuffer_update_head[3]);
         //std::cout << "rectangles count: " << rectangles_count << std::endl;
         std::vector<uint8_t> last_update{};
-        auto& socket = parent::get_socket();
         for (uint16_t i = 0; i < rectangles_count; i++) {
             std::array<uint8_t, 12> rectangle{};
-            auto len = read(socket, boost::asio::buffer(rectangle), error);
-            if (error == boost::asio::error::eof)
-                throw std::runtime_error("eof");
-            else if (error)
-                throw boost::system::system_error(error);
-            if (len != rectangle.size()) {
-                throw std::runtime_error("framebuffer update rectangle read fail");
+            try{
+            parent::rfb_read(rectangle);
+            }
+            catch (std::exception& e) {
+                throw std::runtime_error(std::format("framebuffer update rectangle read fail: {}", e.what()));
             }
             uint16_t fb_width = parent::get_width();
             uint16_t fb_height = parent::get_height();
@@ -109,13 +103,12 @@ public:
             }
             if (encoding_type == encoding::raw) {
                 auto pixels = std::vector<uint8_t>(width*height*4);
-                len = read(socket, boost::asio::buffer(pixels), error);
-                if (error == boost::asio::error::eof)
-                    throw std::runtime_error("eof");
-                else if (error)
-                    throw boost::system::system_error(error);
-                if (len != pixels.size()) {
-                    throw std::runtime_error("framebuffer update rectangle pixels read fail");
+                try{
+                parent::rfb_read(pixels);
+                }
+                catch (std::exception& e) {
+                    throw std::runtime_error(std::format("framebuffer update rectangle pixels read fail: {}",
+                                e.what()));
                 }
                 for (int  y_ = 0; y_ < height; y_++) {
                     for (int x_ = 0; x_ < width; x_++) {
@@ -128,23 +121,19 @@ public:
             }
             else if (encoding_type == encoding::zrle) {
                 std::array<uint8_t, 4> length_buf;
-                auto len = read(socket, boost::asio::buffer(length_buf), error);
-                if (error == boost::asio::error::eof)
-                    throw std::runtime_error("eof");
-                else if (error)
-                    throw boost::system::system_error(error);
-                if (len != length_buf.size()) {
+                try{
+                parent::rfb_read(length_buf);
+                }
+                catch (std::exception& e) {
                     throw std::runtime_error("framebuffer update rectangle zrle length read fail");
                 }
                 auto length = from_big_endian_bytes(length_buf[0], length_buf[1], length_buf[2], length_buf[3]);
                 //std::cout << "zlib length: " << length << std::endl;
                 auto zlib_data = std::vector<uint8_t>(length);
-                len = read(socket, boost::asio::buffer(zlib_data), error);
-                if (error == boost::asio::error::eof)
-                    throw std::runtime_error("eof");
-                else if (error)
-                    throw boost::system::system_error(error);
-                if (len != zlib_data.size()) {
+                try{
+                parent::rfb_read(zlib_data);
+                }
+                catch (std::exception& e) {
                     throw std::runtime_error("framebuffer update rectangle zrle zlib data read fail");
                 }
                 parent::zrle_decode(zlib_data, x, y, width, height, internal_frame);
@@ -183,35 +172,85 @@ private:
 };
 
 template<typename T>
+concept contain_ip_address = requires (T t) {
+    t.address;
+    t.port;
+};
+
+template<typename T>
+class set_address : public T {
+public:
+    using parent = T;
+    template<configure Configure>
+        requires contain_ip_address<Configure>
+    set_address(const Configure& conf) : parent{conf},
+        address{conf.address} {
+    }
+    set_address(const configure auto& conf) : parent{conf} {
+    }
+    auto get_address() {
+        return address;
+    }
+    const char* address;
+};
+template<typename T>
+class set_port : public T {
+public:
+    using parent = T;
+    template<configure Configure>
+        requires contain_ip_address<Configure>
+    set_port(const Configure& conf) : parent{conf},
+        port{conf.port} {
+    }
+    set_port(const configure auto& conf) : parent{conf} {
+    }
+    auto get_port() {
+        return port;
+    }
+    uint16_t port;
+};
+
+template<typename T>
 class add_connection : public T {
 public:
     using parent = T;
     add_connection(const configure auto& conf) : parent{conf},
-        io_context{},
-        resolver{io_context},
-        socket{io_context}
+        connection{conf}
     {
-        auto endpoints = resolver.resolve(parent::get_address(), parent::get_port());
-        boost::asio::connect(socket, endpoints);
-    }
-    auto& get_socket() {
-        return socket;
     }
     void rfb_read(auto& buf) {
-        boost::system::error_code error;
-        auto len = read(socket, boost::asio::buffer(buf), error);
-        if (error == boost::asio::error::eof)
-            throw std::runtime_error("eof");
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != buf.size()) {
-            throw std::runtime_error("read fail");
+        int s = 0;
+        size_t buf_bytes_count = buf.size()*sizeof(buf[0]);
+        while (s < buf_bytes_count) {
+            auto len = read(connection.get_socket(), buf.data()+s, buf_bytes_count-s);
+            if (len < 0)
+                throw std::runtime_error{"read fail"};
+            else {
+                s += len;
+            }
+        }
+    }
+    void rfb_write(const auto& buf) {
+        int s = 0;
+        size_t buf_bytes_count = buf.size()*sizeof(buf[0]);
+        while (s < buf_bytes_count) {
+            auto len = write(connection.get_socket(), buf.data()+s, buf_bytes_count-s);
+            if (len < 0)
+                throw std::runtime_error{"write fail"};
+            else {
+                s += len;
+            }
         }
     }
 private:
-    boost::asio::io_context io_context;
-    tcp::resolver resolver;
-    tcp::socket socket;
+    using connection_t =
+        socket_helper::connect_address_port<
+        set_port<
+        set_address<
+        socket_helper::add_socket<
+        empty_configurable_class
+        >>>>;
+    connection_t connection;
 };
 
 struct pixel_format {
@@ -250,16 +289,12 @@ public:
         uint32_t name_length{};
         std::vector<char> name{};
 
-        boost::system::error_code error;
         std::array<uint8_t, 24> server_init_buf{};
-        auto& socket = parent::get_socket();
-        auto len = read(socket, boost::asio::buffer(server_init_buf), error);
-        if (error == boost::asio::error::eof)
-            throw std::runtime_error("eof");
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != server_init_buf.size()) {
-            std::cerr << "server_init_buf read fail with len: " << len << std::endl;
+        try{
+        parent::rfb_read(server_init_buf);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error{std::format("server_init_buf read fail: {}", e.what())};
         }
         fb_width = from_big_endian_bytes(server_init_buf[0], server_init_buf[1]);
         fb_height = from_big_endian_bytes(server_init_buf[2], server_init_buf[3]);
@@ -280,12 +315,10 @@ public:
         name_length = from_big_endian_bytes(server_init_buf[20], server_init_buf[21], server_init_buf[22], server_init_buf[23]);
         std::cout << "name length: " << name_length << std::endl;
         name.resize(name_length);
-        len = read(socket, boost::asio::buffer(name), error);
-        if (error == boost::asio::error::eof)
-            throw std::runtime_error("eof");
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != name_length) {
+        try{
+        parent::rfb_read(name);
+        }
+        catch (std::exception& e) {
             std::cerr << "name parse fail" << std::endl;
         }
         std::cout << "fb resolution: " << fb_width << "x" << fb_height << std::endl;
@@ -328,14 +361,13 @@ public:
 
     int client_init() {
         std::array<char, 12> buf;
-        boost::system::error_code error;
-        auto& socket = parent::get_socket();
-        size_t len = read(socket, boost::asio::buffer(buf), error);
-        if (error == boost::asio::error::eof)
-            return 0;
-        else if (error)
-            throw boost::system::system_error(error);
-        std::cout << "get response: "; std::cout.write(buf.data(), len);
+        try{
+        parent::rfb_read(buf);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error{std::format("client init fail: {}", e.what())};
+        }
+        std::cout << "get response: "; std::cout.write(buf.data(), buf.size());
         auto [major, minor] = parse_protocol_version(buf);
         std::cout << "RFB version: " << major << "." << minor << std::endl;
         if (major != 3 || minor != 8) {
@@ -343,31 +375,30 @@ public:
             return -1;
         }
 
-        len = write(socket, boost::asio::buffer(buf), error);
-        if (error == boost::asio::error::eof)
-            return 0;
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != buf.size()) {
-            std::cerr << "write support buf failed" << std::endl;
-            return -1;
+        try{
+        parent::rfb_write(buf);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error{std::format("client init write fail: {}", e.what())};
         }
 
         {
             std::array<uint8_t,1> security_count{};
-            size_t len = read(socket, boost::asio::buffer(security_count), error);
-            if (error == boost::asio::error::eof)
-                return 0;
-            else if (error)
-                throw boost::system::system_error(error);
+            try{
+            parent::rfb_read(security_count);
+            }
+            catch (std::exception& e) {
+                throw std::runtime_error{std::format("security count read fail: {}", e.what())};
+            }
             std::cout << "Server supportted security count: " << static_cast<int>(security_count[0]) << std::endl;
 
             std::vector<uint8_t> security_types(security_count[0]);
-            len = read(socket, boost::asio::buffer(security_types), error);
-            if (error == boost::asio::error::eof)
-                return 0;
-            else if (error)
-                throw boost::system::system_error(error);
+            try{
+            parent::rfb_read(security_types);
+            }
+            catch (std::exception& e) {
+                throw std::runtime_error{std::format("security types read fail: {}", e.what())};
+            }
             bool exist_none = false;
             for (int i = 0; i < security_types.size(); i++) {
                 std::cout << static_cast<int>(security_types[i]) << ",";
@@ -375,30 +406,30 @@ public:
             }
             std::cout << std::endl;
 
-            write(socket, boost::asio::buffer(std::array<uint8_t,1>{1}), error);
-            if (error == boost::asio::error::eof)
-                return 0;
-            else if (error)
-                throw boost::system::system_error(error);
+            try{
+            parent::rfb_write(std::array<uint8_t, 1>{1});
+            }
+            catch (std::exception& e) {
+                throw std::runtime_error{std::format("security write fail: {}", e.what())};
+            }
 
             std::array<uint8_t, 4> security_result_buf{};
-            len = read(socket, boost::asio::buffer(security_result_buf), error);
-            if (error == boost::asio::error::eof)
-                return 0;
-            else if (error)
-                throw boost::system::system_error(error);
+            try{
+            parent::rfb_read(security_result_buf);
+            }
+            catch (std::exception& e) {
+                throw std::runtime_error{std::format("security result read fail: {}", e.what())};
+            }
 
             uint32_t security_result = from_big_endian_bytes(security_result_buf[0], security_result_buf[1], security_result_buf[2], security_result_buf[3]);
             std::cout << "security handshaking result: " << security_result << std::endl;
         }
         std::array<uint8_t,1> is_shared = {true};
-        {
-            boost::system::error_code error;
-            write(socket, boost::asio::buffer(is_shared), error);
-            if (error == boost::asio::error::eof)
-                return 0;
-            else if (error)
-                throw boost::system::system_error(error);
+        try{
+        parent::rfb_write(is_shared);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error{std::format("send is_shared fail: {}", e.what())};
         }
         return 0;
     }
@@ -449,29 +480,23 @@ public:
     }
     int set_encodings()
     {
-        boost::system::error_code error;
         // order is a priority hint
         auto supported_encodings = parent::get_supported_encodings();
         auto set_encodings = std::to_array<uint8_t>({
             2, 0, // SetEncoding, padding
             0, supported_encodings.size(), // Number of encoding
         });
-        auto& socket = parent::get_socket();
-        auto len = write(socket, boost::asio::buffer(set_encodings), error);
-        if (error == boost::asio::error::eof)
-            return 0;
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != set_encodings.size()) {
-            std::cerr << "set encoding send fail" << std::endl;
+        try{
+        parent::rfb_write(set_encodings);
         }
-        len = write(socket, boost::asio::buffer(supported_encodings), error);
-        if (error == boost::asio::error::eof)
-            return 0;
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != supported_encodings.size()*sizeof(supported_encodings[0])) {
-            std::cerr << "supported_encodings send fail" << std::endl;
+        catch (std::exception& e) {
+            throw std::runtime_error{std::format("set encoding send fail: {}", e.what())};
+        }
+        try{
+        parent::rfb_write(supported_encodings);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error{std::format("supported_encodings send fail: {}", e.what())};
         }
         return 0;
     }
@@ -485,21 +510,17 @@ public:
     }
     int set_format()
     {
-        boost::system::error_code error;
         std::array<uint8_t, 20> set_format = {
             0, 0, 0, 0,
             32, 24, 0, 1,
             0, 255, 0, 255, 0, 255,
             16, 8, 0, 0, 0, 0,
         };
-        auto& socket = parent::get_socket();
-        auto len = write(socket, boost::asio::buffer(set_format), error);
-        if (error == boost::asio::error::eof)
-            return 0;
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != set_format.size()) {
-            std::cerr << "set format send fail" << std::endl;
+        try{
+        parent::rfb_write(set_format);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error{std::format("set format send fail: {}", e.what())};
         }
         return 0;
     }
@@ -525,45 +546,6 @@ private:
     server_init_message server_info;
 };
 
-template<typename T>
-concept contain_ip_address = requires (T t) {
-    t.address;
-    t.port;
-};
-
-template<typename T>
-class set_address : public T {
-public:
-    using parent = T;
-    template<configure Configure>
-        requires contain_ip_address<Configure>
-    set_address(const Configure& conf) : parent{conf},
-        address{conf.address} {
-    }
-    set_address(const configure auto& conf) : parent{conf} {
-    }
-    auto get_address() {
-        return address;
-    }
-    const char* address;
-};
-template<typename T>
-class set_port : public T {
-public:
-    using parent = T;
-    template<configure Configure>
-        requires contain_ip_address<Configure>
-    set_port(const Configure& conf) : parent{conf},
-        port{conf.port} {
-    }
-    set_port(const configure auto& conf) : parent{conf} {
-    }
-    auto get_port() {
-        return port;
-    }
-    const char* port;
-};
-
 template <typename T>
 class add_rfb : public T {
 public:
@@ -572,7 +554,6 @@ public:
     {
     }
     void framebuffer_update_request(uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
-        boost::system::error_code error;
         bool incremental_update = true;
         std::array<uint8_t, 10> framebuffer_update_request = {
             3, incremental_update,
@@ -581,82 +562,59 @@ public:
             to_big_endian_byte(width, 0), to_big_endian_byte(width, 1),
             to_big_endian_byte(height, 0), to_big_endian_byte(height, 1),
         };
-        auto& socket = parent::get_socket();
-        auto len = write(socket, boost::asio::buffer(framebuffer_update_request), error);
-        if (error == boost::asio::error::eof)
-            return;
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != framebuffer_update_request.size()) {
-            std::cerr << "framebuffer update request send fail" << std::endl;
+        try{
+        parent::rfb_write(framebuffer_update_request);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error{std::format("framebuffer update request send fail: {}", e.what())};
         }
     }
 
     void key_event(uint32_t key, uint8_t down_flag) {
-        boost::system::error_code error;
         std::array<uint8_t, 8> key_event = {
             4, down_flag, // message-type(4), down-flag
             0, 0, // padding
             to_big_endian_byte(key, 0), to_big_endian_byte(key, 1),
             to_big_endian_byte(key, 2), to_big_endian_byte(key, 3),
         };
-        auto& socket = parent::get_socket();
-        auto len = write(socket, boost::asio::buffer(key_event), error);
-        if (error == boost::asio::error::eof)
-            return;
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != key_event.size()) {
-            std::cerr << "key event send fail" << std::endl;
+        try{
+        parent::rfb_write(key_event);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error{std::format("key event send fail: {}", e.what())};
         }
     }
 
     void pointer_event(uint8_t button_mask, uint16_t x, uint16_t y) {
-        boost::system::error_code error;
         std::array<uint8_t, 6> pointer_event = {
             5, button_mask, // message-type(5), button-mask
             to_big_endian_byte(x, 0), to_big_endian_byte(x, 1),
             to_big_endian_byte(y, 0), to_big_endian_byte(y, 1),
         };
-        auto& socket = parent::get_socket();
-        auto len = write(socket, boost::asio::buffer(pointer_event), error);
-        if (error == boost::asio::error::eof)
-            return;
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != pointer_event.size()) {
-            std::cerr << "key event send fail" << std::endl;
+        try{
+        parent::rfb_write(pointer_event);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error{std::format("pointer event send fail: {}", e.what())};
         }
     }
 
     void process_server_cut_text() {
-        boost::system::error_code error;
         std::array<uint8_t, 4> length_buf{};
-        auto& socket = parent::get_socket();
-        auto len = read(socket, boost::asio::buffer(length_buf), error);
-        if (error == boost::asio::error::eof)
-        {
-            std::cout << "eof" << std::endl;
-            return;
+        try{
+        parent::rfb_read(length_buf);
         }
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != length_buf.size()) {
+        catch (std::exception& e) {
             throw std::runtime_error("server cut text length read fail");
         }
 
         uint32_t length = from_big_endian_bytes(length_buf[0], length_buf[1], length_buf[2], length_buf[3]);
 
         std::vector<char> text(length);
-        len = read(socket, boost::asio::buffer(text), error);
-        if (error == boost::asio::error::eof)
-        {
-            std::cout << "eof" << std::endl;
-            return;
+        try{
+        parent::rfb_read(text);
         }
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != text.size()) {
+        catch (std::exception& e) {
             throw std::runtime_error("server cut text read fail");
         }
         text.push_back('\0');
@@ -664,48 +622,30 @@ public:
     }
 
     void process_colour_map_entries() {
-        boost::system::error_code error;
         std::array<uint8_t, 2> colour_count_buf{};
-        auto& socket = parent::get_socket();
-        auto len = read(socket, boost::asio::buffer(colour_count_buf), error);
-        if (error == boost::asio::error::eof)
-        {
-            std::cout << "eof" << std::endl;
-            return;
+        try{
+        parent::rfb_read(colour_count_buf);
         }
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != colour_count_buf.size()) {
+        catch (std::exception& e) {
             throw std::runtime_error("colour count read fail");
         }
 
         uint16_t colour_count = from_big_endian_bytes(colour_count_buf[0], colour_count_buf[1]);
         std::vector<uint8_t> colour_map_buf(colour_count*6);
-        len = read(socket, boost::asio::buffer(colour_map_buf), error);
-        if (error == boost::asio::error::eof)
-        {
-            std::cout << "eof" << std::endl;
-            return;
+        try{
+        parent::rfb_read(colour_map_buf);
         }
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != colour_map_buf.size()) {
+        catch (std::exception& e) {
             throw std::runtime_error("colour map read fail");
         }
     }
 
     void process_server_message() {
-        boost::system::error_code error;
         std::array<uint8_t, 4> framebuffer_update_head{};
-        auto& socket = parent::get_socket();
-        auto len = read(socket, boost::asio::buffer(framebuffer_update_head), error);
-        if (error == boost::asio::error::eof)
-        {
-            throw std::runtime_error("eof");
+        try{
+        parent::rfb_read(framebuffer_update_head);
         }
-        else if (error)
-            throw boost::system::system_error(error);
-        if (len != framebuffer_update_head.size()) {
+        catch (std::exception& e) {
             throw std::runtime_error("framebuffer update head read fail");
         }
         //std::cout << "server message: " << (int)framebuffer_update_head[0] << std::endl;
@@ -741,7 +681,7 @@ using rfb = add_rfb<
 ;
 struct config {
     const char* address;
-    const char* port;
+    uint16_t port;
 };
 static int rfb_process(auto host, auto port) {
     rfb rfb{config{host, port}};
