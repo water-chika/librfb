@@ -159,10 +159,26 @@ public:
     }
     void update_pointer_position() {
         if (pointer_sended_x != pointer_x || pointer_sended_y != pointer_y) {
+            rfb.pointer_event(pointer_button_mask, pointer_x, pointer_y);
             pointer_sended_x = pointer_x;
             pointer_sended_y = pointer_y;
-            rfb.pointer_event(pointer_button_mask, pointer_x, pointer_y);
         }
+    }
+    void process_pointer_axis_event(uint32_t axis, int value) {
+        int button_mask = pointer_button_mask;
+        if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+            if (value < 0) {
+                button_mask |= (1<<3);
+            }
+            else if (value > 0) {
+                button_mask |= (1<<4);
+            }
+        }
+        std::cout << "pointer axis value: " << axis << " " << value << std::endl;
+        rfb.pointer_event(button_mask, pointer_x, pointer_y);
+        rfb.pointer_event(pointer_button_mask, pointer_x, pointer_y);
+        pointer_sended_x = pointer_x;
+        pointer_sended_y = pointer_y;
     }
     void process_pointer_motion_event(int x, int y) {
         auto fb_width = get_fb_width();
@@ -181,7 +197,7 @@ public:
                 button_mask |= (1<<0);
             }
             else if (button == BTN_MIDDLE) {
-                button_mask |= (1<<2);
+                button_mask |= (1<<1);
             }
             else if (button == BTN_RIGHT) {
                 button_mask |= (1<<2);
@@ -205,6 +221,8 @@ public:
             }
         }
         rfb.pointer_event(button_mask, pointer_x, pointer_y);
+        pointer_sended_x = pointer_x;
+        pointer_sended_y = pointer_y;
         pointer_button_mask = button_mask;
     }
 private:
