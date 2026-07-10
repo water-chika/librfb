@@ -47,19 +47,21 @@ public:
                 auto fb_width = parent::get_width();
                 auto fb_height = parent::get_height();
                 auto framebuffer = reinterpret_cast<uint32_t*>(frame_u8.data());
-                for (int x_ = 0; x_ < width; x_++) {
-                    for (int y_ = 0; y_ < height; y_++) {
-                        uint32_t Y = frame->data[0][y_*frame->linesize[0] + x_];
-                        uint32_t U = frame->data[1][y_/2*frame->linesize[1] + x_/2];
-                        uint32_t V = frame->data[2][y_/2*frame->linesize[2] + x_/2];
-                        uint32_t B = static_cast<uint32_t>(1.164*(Y - 16)                   + 2.018*(U - 128));
-                        uint32_t G = static_cast<uint32_t>(1.164*(Y - 16) - 0.813*(V - 128) - 0.391*(U - 128));
-                        uint32_t R = static_cast<uint32_t>(1.164*(Y - 16) + 1.596*(V - 128));
-                        framebuffer[(sy+y_)*fb_width + (sx+x_)] =
-                            (R<<(2*8)) |
-                            (G<<(1*8)) |
-                            (B<<(0*8)) |
-                            0;
+                if (frame->format == AV_PIX_FMT_YUV420P) {
+                    for (int x_ = 0; x_ < width; x_++) {
+                        for (int y_ = 0; y_ < height; y_++) {
+                            uint32_t Y = frame->data[0][y_*frame->linesize[0] + x_];
+                            uint32_t U = frame->data[1][y_/2*frame->linesize[1] + x_/2];
+                            uint32_t V = frame->data[2][y_/2*frame->linesize[2] + x_/2];
+                            uint8_t B = static_cast<uint8_t>(1.164*(Y - 16)                   + 2.018*(U - 128));
+                            uint8_t G = static_cast<uint8_t>(1.164*(Y - 16) - 0.813*(V - 128) - 0.391*(U - 128));
+                            uint8_t R = static_cast<uint8_t>(1.164*(Y - 16) + 1.596*(V - 128));
+                            framebuffer[(sy+y_)*fb_width + (sx+x_)] =
+                                (R<<(2*8)) |
+                                (G<<(1*8)) |
+                                (B<<(0*8)) |
+                                0;
+                        }
                     }
                 }
             }
