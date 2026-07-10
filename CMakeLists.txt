@@ -11,6 +11,9 @@ target_link_libraries(rfb PUBLIC
     z
     cpp_helper
     socket_helper
+    avcodec
+    avdevice
+    avutil
 )
 
 add_executable(rfb_demo

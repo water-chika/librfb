@@ -1,5 +1,9 @@
 #pragma once
 
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
+
 #include <array>
 #include <iostream>
 #include <map>
@@ -7,12 +11,15 @@
 #include <cpp_helper.hpp>
 #include <socket_helper.hpp>
 
+#define INPUT_SIZE 4096
+
 namespace rfb {
 using cpp_helper::configure;
 using cpp_helper::empty_configurable_class;
 }
 
 #include "zrle.hpp"
+#include "h264.hpp"
 
 namespace rfb {
 enum class encoding : uint32_t {
@@ -145,6 +152,7 @@ public:
                 auto flags = from_big_endian_bytes(message[4], message[5], message[6], message[7]);
                 auto h264_data = std::vector<uint8_t>(length);
                 parent::rfb_read(h264_data);
+                parent::h264_decode(h264_data, x, y, width, height, internal_frame);
             }
             else {
                 throw std::runtime_error(std::format("encoding not support: {}", encoding_type));
@@ -666,6 +674,7 @@ public:
 
 using rfb = add_rfb<
     add_process_framebuffer_update<
+    add_decode_h264<
     add_zrle<
     init_rfb<
     add_set_encodings<
@@ -677,7 +686,7 @@ using rfb = add_rfb<
     set_port<
     set_address<
     empty_configurable_class
-    >>>>>>>>>>>>
+    >>>>>>>>>>>>>
 ;
 struct config {
     const char* address;
