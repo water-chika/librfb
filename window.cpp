@@ -524,6 +524,40 @@ public:
     }
 };
 
+template<typename T>
+class add_queue_create_infos : public T {
+public:
+    using parent = T;
+    add_queue_create_infos(const configure auto& conf) : parent{conf} {
+        auto physical_device = parent::get_physical_device();
+        auto properties = physical_device.getQueueFamilyProperties();
+        for (int i = 0; i < properties.size(); i++) {
+            if (properties[i].queueFlags & vk::QueueFlagBits::eVideoDecodeKHR) {
+                video_queue_family_index = i;
+                break;
+            }
+        }
+    }
+
+    auto get_queue_create_infos() {
+        auto priorities = std::vector{1.0f, 1.0f};
+        uint32_t queue_family_index = parent::get_queue_family_index();
+        return std::vector{
+            vk::DeviceQueueCreateInfo{}.setQueueCount(priorities.size())
+                .setQueuePriorities(priorities)
+                .setQueueFamilyIndex(queue_family_index),
+            vk::DeviceQueueCreateInfo{}.setQueueCount(priorities.size())
+                .setQueuePriorities(priorities)
+                .setQueueFamilyIndex(video_queue_family_index),
+        };
+    }
+    auto get_decode_queue_family_index() {
+        return video_queue_family_index;
+    }
+private:
+    uint32_t video_queue_family_index;
+};
+
 template<class T>
 using
 add_physical_device_and_device_and_draw =
@@ -544,9 +578,14 @@ add_physical_device_and_device_and_draw =
 	add_swapchain_and_pipeline_layout<
     typename use_platform_add_swapchain_image_extent<PLATFORM>::template add_swapchain_image_extent<
 	add_command_pool <
+    add_decode_queue<
 	add_queue <
 	add_device <
+    add_queue_create_infos<
     add_device_nexts<
+    add_video_decode_h264_extension<
+    add_video_decode_queue_extension<
+    add_video_queue_extension<
 	add_swapchain_extension <
 	add_empty_extensions <
 	add_find_properties <
@@ -560,7 +599,7 @@ add_physical_device_and_device_and_draw =
     add_recreate_surface<
     typename use_platform<PLATFORM>::template add_vulkan_surface<
     T
-  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 ;
 
 template<typename T>
