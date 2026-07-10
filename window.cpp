@@ -157,41 +157,81 @@ public:
     auto get_fb_height() {
         return rfb.get_height();
     }
+    void send_pointer_event(uint32_t button_mask, int x, int y) {
+        rfb.pointer_event(button_mask, x, y);
+    }
+private:
+    using rfb_env =
+        rfb::add_rfb<
+        rfb::add_process_framebuffer_update<
+        rfb::add_zrle<
+        rfb::init_rfb<
+        rfb::add_set_encodings<
+        rfb::set_supported_encodings_from_configure<
+        rfb::add_set_format<
+        rfb::add_server_init<
+        rfb::add_client_init<
+        rfb::add_connection<
+        rfb::set_port<
+        rfb::set_address<
+        empty_configurable_class
+        >>>>>>>>>>>>
+    ;
+    rfb_env rfb;
+    int pointer_sended_x;
+    int pointer_sended_y;
+    int pointer_x;
+    int pointer_y;
+    int pointer_button_mask;
+};
+
+template<class T>
+class add_rfb_process_pointer : public T {
+public:
+    using parent = T;
+    add_rfb_process_pointer(const configure auto& conf) : parent{conf},
+        sended_x{},
+        sended_y{},
+        latest_x{},
+        latest_y{},
+        button_mask{}
+    {
+    }
+    void update_pointer(uint32_t mask, int x, int y) {
+        parent::send_pointer_event(mask, x, y);
+        sended_x = x;
+        sended_y = y;
+    }
     void update_pointer_position() {
-        if (pointer_sended_x != pointer_x || pointer_sended_y != pointer_y) {
-            rfb.pointer_event(pointer_button_mask, pointer_x, pointer_y);
-            pointer_sended_x = pointer_x;
-            pointer_sended_y = pointer_y;
+        if (sended_x != latest_x || sended_y != latest_y) {
+            update_pointer(button_mask, latest_x, latest_y);
         }
     }
     void process_pointer_axis_event(uint32_t axis, int value) {
-        int button_mask = pointer_button_mask;
+        int mask = button_mask;
         if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
             if (value < 0) {
-                button_mask |= (1<<3);
+                mask |= (1<<3);
             }
             else if (value > 0) {
-                button_mask |= (1<<4);
+                mask |= (1<<4);
             }
         }
         std::cout << "pointer axis value: " << axis << " " << value << std::endl;
-        rfb.pointer_event(button_mask, pointer_x, pointer_y);
-        rfb.pointer_event(pointer_button_mask, pointer_x, pointer_y);
-        pointer_sended_x = pointer_x;
-        pointer_sended_y = pointer_y;
+        update_pointer(mask, latest_x, latest_y);
+        update_pointer(button_mask, latest_x, latest_y);
     }
     void process_pointer_motion_event(int x, int y) {
-        auto fb_width = get_fb_width();
-        auto fb_height = get_fb_height();
+        auto fb_width = parent::get_fb_width();
+        auto fb_height = parent::get_fb_height();
         auto [surface_width, surface_height] = parent::get_surface_resolution();
         x = x * fb_width / surface_width;
         y = y * fb_height / surface_height;
-        pointer_x = x;
-        pointer_y = y;
+        latest_x = x;
+        latest_y = y;
     }
     void process_pointer_button_event(int button, int button_state) {
         std::cout << "pointer button event processing" << std::endl;
-        int button_mask = pointer_button_mask;
         if (button_state == WL_POINTER_BUTTON_STATE_PRESSED) {
             if (button == BTN_LEFT) {
                 button_mask |= (1<<0);
@@ -220,34 +260,14 @@ public:
                 std::cerr << "unknown pointer button" << std::endl;
             }
         }
-        rfb.pointer_event(button_mask, pointer_x, pointer_y);
-        pointer_sended_x = pointer_x;
-        pointer_sended_y = pointer_y;
-        pointer_button_mask = button_mask;
+        update_pointer(button_mask, latest_x, latest_y);
     }
 private:
-    using rfb_env =
-        rfb::add_rfb<
-        rfb::add_process_framebuffer_update<
-        rfb::add_zrle<
-        rfb::init_rfb<
-        rfb::add_set_encodings<
-        rfb::set_supported_encodings_from_configure<
-        rfb::add_set_format<
-        rfb::add_server_init<
-        rfb::add_client_init<
-        rfb::add_connection<
-        rfb::set_port<
-        rfb::set_address<
-        empty_configurable_class
-        >>>>>>>>>>>>
-    ;
-    rfb_env rfb;
-    int pointer_sended_x;
-    int pointer_sended_y;
-    int pointer_x;
-    int pointer_y;
-    int pointer_button_mask;
+    int sended_x;
+    int sended_y;
+    int latest_x;
+    int latest_y;
+    int button_mask;
 };
 
 template <class T> class add_dynamic_draw : public T {
@@ -401,6 +421,7 @@ using add_swapchain_and_pipeline_layout =
     set_buffer_size_equal_to_fb_size<
     set_vector_size_to_swapchain_image_count<
     add_image_used_to_scale<
+    add_rfb_process_pointer<
     add_rfb<
     rfb::set_address<
     rfb::set_port<
@@ -412,7 +433,7 @@ using add_swapchain_and_pipeline_layout =
 	add_swapchain<
 	add_swapchain_image_format<
   T
-  >>>>>>>>>>>>>>>>>>>
+  >>>>>>>>>>>>>>>>>>>>
 ;
 
 template<class T>
