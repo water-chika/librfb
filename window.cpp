@@ -160,6 +160,15 @@ public:
     void send_pointer_event(uint32_t button_mask, int x, int y) {
         rfb.pointer_event(button_mask, x, y);
     }
+    void request_framebuffer_update(int x, int y, int width, int height) {
+        rfb.framebuffer_update_request(x, y, width, height);
+    }
+    void request_framebuffer_update(int x=0, int y=0) {
+        request_framebuffer_update(x, y, get_fb_width(), get_fb_height());
+    }
+    void process_rfb_server_message() {
+        rfb.process_server_message();
+    }
 private:
     using rfb_env =
         rfb::add_rfb<
@@ -268,6 +277,37 @@ private:
     int latest_x;
     int latest_y;
     int button_mask;
+};
+
+template<class T>
+class add_rfb_latency_analyser : public T {
+public:
+    using parent = T;
+    add_rfb_latency_analyser(const configure auto& conf) : parent{conf},
+        framebuffer_update_request_time{std::chrono::steady_clock::now()},
+        latency{}
+    {
+    }
+    using clock = std::chrono::steady_clock;
+    auto draw() {
+        auto draw_time = clock::now();
+        latency = draw_time - framebuffer_update_request_time; // This ignores render and present latency
+        return parent::draw();
+    }
+    void request_framebuffer_update(int x, int y, int width, int height) {
+        framebuffer_update_request_time = clock::now();
+        return parent::request_framebuffer_update(x, y, width, height);
+    }
+    void request_framebuffer_update(int x=0, int y=0) {
+        framebuffer_update_request_time = clock::now();
+        return parent::request_framebuffer_update(x, y);
+    }
+    auto get_rfb_latency() {
+        return latency;
+    }
+private:
+    clock::time_point framebuffer_update_request_time;
+    clock::duration latency;
 };
 
 template <class T> class add_dynamic_draw : public T {
@@ -528,8 +568,7 @@ class add_rfb_socket_pollfd : public T {
 public:
     using parent = T;
     add_rfb_socket_pollfd(const configure auto& conf) : parent{conf} {
-        auto& rfb = parent::get_rfb();
-        rfb.framebuffer_update_request(0, 0, rfb.get_width(), rfb.get_height());
+        parent::request_framebuffer_update();
     }
     static constexpr int FDS_INDEX = parent::FDS_SIZE;
     static constexpr int FDS_SIZE = parent::FDS_SIZE+1;
@@ -538,11 +577,11 @@ public:
         assert(fds[FDS_INDEX].fd == rfb.get_socket());
         auto now = std::chrono::steady_clock::now();
         if (fds[FDS_INDEX].revents & POLLIN) {
-            rfb.process_server_message();
+            parent::process_rfb_server_message();
             if (rfb.is_frame_updated()) {
                 parent::draw();
                 rfb.reset_frame_updated();
-                rfb.framebuffer_update_request(0, 0, rfb.get_width(), rfb.get_height());
+                parent::request_framebuffer_update();
                 parent::update_pointer_position();
             }
             previous_time = now;
@@ -566,9 +605,35 @@ private:
     std::chrono::steady_clock::time_point previous_time;
 };
 
+template<typename T>
+class add_info_printer: public T {
+public:
+    using parent = T;
+    add_info_printer(const configure auto& conf) : parent{conf} {
+    }
+    using clock = std::chrono::steady_clock;
+    void process_events(auto& fds) {
+        auto now = clock::now();
+        if (now - previous_time > 500ms) {
+            previous_time = now;
+            //auto rfb_latency = parent::get_rfb_latency();
+            //auto rfb_latency_ms = rfb_latency / 1000000ns;
+            auto cpu_frame_time = parent::get_cpu_frame_time();
+            auto cpu_frame_time_ms = cpu_frame_time / 1000000ns;
+            float fps = cpu_frame_time > 0ns ? (100s / cpu_frame_time)/100.0 : 0;
+            std::clog << std::format("cpu frame time: {:5}ms, fps: {:6}\r", cpu_frame_time_ms, fps);
+        }
+        parent::process_events(fds);
+    }
+private:
+    clock::time_point previous_time;
+};
+
 using draw_app =
     use_platform<PLATFORM>::template add_pollfds_loop<
+    add_info_printer<
     add_rfb_socket_pollfd<
+    add_rfb_latency_analyser<
     add_physical_device_and_device_and_draw<
     posix::add_empty_pollfd_array<
     add_instance<
@@ -577,7 +642,7 @@ using draw_app =
     add_empty_extensions<
     use_platform<PLATFORM>::template add_window<
     empty_class
-    >>>>>>>>>
+    >>>>>>>>>>>
 ;
 
 using namespace std::literals;
