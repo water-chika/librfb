@@ -50,12 +50,12 @@ public:
                 if (frame->format == AV_PIX_FMT_YUV420P) {
                     for (int x_ = 0; x_ < width; x_++) {
                         for (int y_ = 0; y_ < height; y_++) {
-                            uint32_t Y = frame->data[0][y_*frame->linesize[0] + x_];
-                            uint32_t U = frame->data[1][y_/2*frame->linesize[1] + x_/2];
-                            uint32_t V = frame->data[2][y_/2*frame->linesize[2] + x_/2];
-                            uint8_t B = static_cast<uint8_t>(1.164*(Y - 16)                   + 2.018*(U - 128));
-                            uint8_t G = static_cast<uint8_t>(1.164*(Y - 16) - 0.813*(V - 128) - 0.391*(U - 128));
-                            uint8_t R = static_cast<uint8_t>(1.164*(Y - 16) + 1.596*(V - 128));
+                            float Y = frame->data[0][y_*frame->linesize[0] + x_];
+                            float Cb = frame->data[1][y_/2*frame->linesize[1] + x_/2];
+                            float Cr = frame->data[2][y_/2*frame->linesize[2] + x_/2];
+                            uint8_t R = static_cast<uint8_t>(Y + 1.402*(Cr-128));
+                            uint8_t G = static_cast<uint8_t>(Y - 0.34414*(Cb-128) - 0.71414*(Cr-128));
+                            uint8_t B = static_cast<uint8_t>(Y + 1.772*(Cb-128));
                             framebuffer[(sy+y_)*fb_width + (sx+x_)] =
                                 (R<<(2*8)) |
                                 (G<<(1*8)) |
