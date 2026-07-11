@@ -578,12 +578,12 @@ public:
         assert(fds[FDS_INDEX].fd == rfb.get_socket());
         auto now = std::chrono::steady_clock::now();
         if (fds[FDS_INDEX].revents & POLLIN) {
+            parent::request_framebuffer_update();
+            parent::update_pointer_position();
             parent::process_rfb_server_message();
             if (rfb.is_frame_updated()) {
-                parent::draw();
                 rfb.reset_frame_updated();
-                parent::request_framebuffer_update();
-                parent::update_pointer_position();
+                parent::draw();
             }
             previous_time = now;
         }
