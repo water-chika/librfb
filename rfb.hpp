@@ -100,7 +100,8 @@ public:
             uint16_t y = from_big_endian_bytes(rectangle[2], rectangle[3]);
             uint16_t width = from_big_endian_bytes(rectangle[4], rectangle[5]);
             uint16_t height = from_big_endian_bytes(rectangle[6], rectangle[7]);
-            auto encoding_type = static_cast<encoding>(from_big_endian_bytes(rectangle[8], rectangle[9], rectangle[10], rectangle[11]));
+            encoding_type = static_cast<encoding>(from_big_endian_bytes(rectangle[8], rectangle[9], rectangle[10], rectangle[11]));
+            frame_network_byte_count = 0;
             if (false) {
                 std::cout << "x: " << x << std::endl;
                 std::cout << "y: " << y << std::endl;
@@ -110,6 +111,7 @@ public:
             }
             if (encoding_type == encoding::raw) {
                 auto pixels = std::vector<uint8_t>(width*height*4);
+                frame_network_byte_count += width*height*4;
                 try{
                 parent::rfb_read(pixels);
                 }
@@ -137,6 +139,7 @@ public:
                 auto length = from_big_endian_bytes(length_buf[0], length_buf[1], length_buf[2], length_buf[3]);
                 //std::cout << "zlib length: " << length << std::endl;
                 auto zlib_data = std::vector<uint8_t>(length);
+                frame_network_byte_count += length;
                 try{
                 parent::rfb_read(zlib_data);
                 }
@@ -151,6 +154,7 @@ public:
                 auto length = from_big_endian_bytes(message[0], message[1], message[2], message[3]);
                 auto flags = from_big_endian_bytes(message[4], message[5], message[6], message[7]);
                 auto h264_data = std::vector<uint8_t>(length);
+                frame_network_byte_count += length;
                 parent::rfb_read(h264_data);
                 parent::h264_decode(h264_data, x, y, width, height, internal_frame);
             }
@@ -172,9 +176,17 @@ public:
     void reset_frame_updated() {
         frame_updated = false;
     }
+    auto get_encoding() {
+        return encoding_type;
+    }
+    auto get_frame_network_byte_count() {
+        return frame_network_byte_count;
+    }
 private:
     std::vector<uint8_t> internal_frame;
     bool frame_updated;
+    encoding encoding_type;
+    uint32_t frame_network_byte_count;
 };
 
 template<typename T>

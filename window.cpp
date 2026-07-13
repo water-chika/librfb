@@ -169,6 +169,12 @@ public:
     void process_rfb_server_message() {
         rfb.process_server_message();
     }
+    auto get_encoding() {
+        return rfb.get_encoding();
+    }
+    auto get_frame_network_byte_count() {
+        return rfb.get_frame_network_byte_count();
+    }
 private:
     using rfb_env =
         rfb::add_rfb<
@@ -622,7 +628,10 @@ public:
             auto cpu_frame_time = parent::get_cpu_frame_time();
             auto cpu_frame_time_ms = cpu_frame_time / 1000000ns;
             float fps = cpu_frame_time > 0ns ? (100s / cpu_frame_time)/100.0 : 0;
-            std::clog << std::format("cpu frame time: {:5}ms, fps: {:6}\r", cpu_frame_time_ms, fps);
+            auto encoding_type = parent::get_encoding();
+            auto frame_network_byte_count = parent::get_frame_network_byte_count();
+            std::clog << std::format("encoding: {}, bytes: {}, cpu frame time: {:5}ms, fps: {:6}\r",
+                    encoding_type, frame_network_byte_count, cpu_frame_time_ms, fps);
         }
         parent::process_events(fds);
     }
