@@ -679,7 +679,7 @@ int main(int argc, const char* argv[]) {
     uint16_t port = 5900;
     uint32_t encoding = 16;
     const char* enabled_logs = "";
-    for (int i = 0, pos_arg=0; i < argc; i++) {
+    for (int i = 1, pos_arg=0; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] == '-') {
             if (strcmp(&argv[i][2], "log") == 0) {
                 enabled_logs = argv[i+1];
