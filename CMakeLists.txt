@@ -14,6 +14,7 @@ target_link_libraries(rfb PUBLIC
     avcodec
     avdevice
     avutil
+    tbb
 )
 
 add_executable(rfb_demo

@@ -678,6 +678,7 @@ public:
 using rfb = add_rfb<
     add_process_framebuffer_update<
     add_decode_h264<
+    add_yuv_to_rgb<
     add_zrle<
     init_rfb<
     add_set_encodings<
@@ -689,7 +690,7 @@ using rfb = add_rfb<
     set_port<
     set_address<
     empty_configurable_class
-    >>>>>>>>>>>>>
+    >>>>>>>>>>>>>>
 ;
 struct config {
     const char* address;

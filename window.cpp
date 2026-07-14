@@ -185,6 +185,7 @@ private:
         rfb::add_rfb<
         rfb::add_process_framebuffer_update<
         rfb::add_decode_h264<
+        rfb::add_yuv_to_rgb<
         rfb::add_zrle<
         rfb::init_rfb<
         rfb::add_set_encodings<
@@ -196,7 +197,7 @@ private:
         rfb::set_port<
         rfb::set_address<
         empty_configurable_class
-        >>>>>>>>>>>>>
+        >>>>>>>>>>>>>>
     ;
     rfb_env rfb;
     int pointer_sended_x;
