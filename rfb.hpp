@@ -52,16 +52,7 @@ public:
     }
     template<typename FormatContext>
     FormatContext::iterator format(rfb::encoding encoding, FormatContext& ctx) const {
-        std::string str;
-        if (encoding == rfb::encoding::raw) {
-            str = "raw";
-        }
-        else if (encoding == rfb::encoding::zrle) {
-            str = "ZRLE";
-        }
-        else {
-            str = "unknow";
-        }
+        auto& str = rfb::encoding_str_map[encoding];
         return std::copy(str.begin(), str.end(), ctx.out());
     }
 };
