@@ -27,7 +27,7 @@ enum class encoding : uint32_t {
     zrle = 16,
     h264 = 50,
 };
-static auto encoding_str_map = std::map<rfb::encoding, const char*>{
+static auto encoding_str_map = std::map<rfb::encoding, std::string_view>{
     {encoding::raw, "raw"},
     {encoding::zrle, "ZRLE"},
     {encoding::h264, "H264"},
