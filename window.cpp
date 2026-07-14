@@ -667,20 +667,43 @@ struct config : public empty_configure {
     const char* address;
     uint16_t port;
     std::vector<uint32_t> supported_encodings;
+    const char* enabled_logs;
 };
 
 int main(int argc, const char* argv[]) {
   try {
     if (argc < 3) {
-        throw std::logic_error("Usage: rfb_window_demo <address> <port> <encoding>");
+        throw std::logic_error("Usage: rfb_window_demo <address> <port> <encoding> --log <enabled_logs>");
     }
-    auto address = argv[1];
-    auto port = strtol(argv[2], NULL, 10);
+    const char* address = "127.0.0.1";
+    uint16_t port = 5900;
     uint32_t encoding = 16;
-    if (argc > 3) {
-        encoding = strtol(argv[3], NULL, 10);
+    const char* enabled_logs = "";
+    for (int i = 0, pos_arg=0; i < argc; i++) {
+        if (argv[i][0] == '-' && argv[i][1] == '-') {
+            if (strcmp(&argv[i][2], "log") == 0) {
+                enabled_logs = argv[i+1];
+                i += 1;
+            }
+        }
+        else {
+            if (pos_arg == 0) {
+                address = argv[i];
+            }
+            else if (pos_arg == 1) {
+                port = strtol(argv[i], NULL, 10);
+            }
+            else if (pos_arg == 2) {
+                encoding = strtol(argv[i], NULL, 10);
+            }
+            pos_arg += 1;
+        }
     }
-    auto conf = config{.address=address, .port=port, .supported_encodings = { rfb::to_big_endian(encoding) }};
+    auto conf = config{
+        .address=address, .port=port,
+        .supported_encodings = { rfb::to_big_endian(encoding) },
+        .enabled_logs = enabled_logs
+    };
     auto app = draw_app{conf};
   } catch (std::exception &e) {
     std::cerr << e.what() << std::endl;
