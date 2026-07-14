@@ -136,16 +136,21 @@ template<class T>
 class add_rfb : public T {
 public:
     using parent = T;
-    add_rfb(const configure auto& conf) : parent{conf},
+    add_rfb(const configure auto& conf) : parent{cpp_helper::increment_configure_log_index_count(conf)},
         rfb{conf}
     {
+    }
+    constexpr uint32_t get_log_index() {
+        return parent::get_log_index() + 1;
+    }
+    void log(const auto& v) {
+        parent::log(get_log_index(), v);
     }
     auto get_rfb(std::span<uint8_t> frame) {
         rfb.get_frame(frame);
     }
     auto process_keysym_event(int keysym, int state) {
-        std::cout << "keysym event processing" << std::endl;
-        std::cout << std::format("{:#x}", keysym) << std::endl;
+        log(std::format("keysym event processing: {}, {}\n", keysym, state));
         rfb.key_event(keysym, state);
     }
     auto& get_rfb() {
@@ -651,21 +656,17 @@ using draw_app =
     add_surface_extension<
     add_empty_extensions<
     use_platform<PLATFORM>::template add_window<
+    cpp_helper::add_logger<
     empty_class
-    >>>>>>>>>>>
+    >>>>>>>>>>>>
 ;
 
 using namespace std::literals;
 
-struct config {
+struct config : public empty_configure {
     const char* address;
     uint16_t port;
     std::vector<uint32_t> supported_encodings;
-};
-
-template<>
-struct cpp_helper::is_configure_structure<config> {
-    static constexpr bool value = true;
 };
 
 int main(int argc, const char* argv[]) {
