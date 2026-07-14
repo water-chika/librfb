@@ -1,5 +1,8 @@
 #pragma once
 
+#include <numeric>
+#include <execution>
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 }
@@ -39,6 +42,48 @@ public:
 private:
     AVCodecContext* context;
 };
+template<typename T>
+class add_yuv_to_rgb : public T {
+public:
+    using parent = T;
+    add_yuv_to_rgb(const configure auto& conf) : parent{conf} {
+    }
+    void yuv_to_rgb(
+            auto& framebuffer, auto fb_width, auto fb_height,
+            auto& frame, auto width, auto height,
+            auto sx, auto sy
+            ) {
+        auto x_indices = std::vector<uint32_t>(width);
+        std::iota(x_indices.begin(), x_indices.end(), 0);
+        auto y_indices = std::vector<uint32_t>(height);
+        std::iota(y_indices.begin(), y_indices.end(), 0);
+        std::for_each(std::execution::par, y_indices.begin(), y_indices.end(),
+                [&x_indices, frame=frame, &framebuffer, fb_width, sx, sy](auto y_) {
+                    std::for_each(std::execution::seq, x_indices.begin(), x_indices.end(),
+                            [y_, frame, &framebuffer, fb_width, sx, sy](auto x_) {
+                                uint8_t Y = frame->data[0][y_*frame->linesize[0] + x_];
+                                uint8_t Cb = frame->data[1][y_/2*frame->linesize[1] + x_/2];
+                                uint8_t Cr = frame->data[2][y_/2*frame->linesize[2] + x_/2];
+                                auto clamp = [](int v) {
+                                    if (v > 255) return 255;
+                                    else if (v < 0) return 0;
+                                    else return v;
+                                };
+                                auto R = clamp(Y + 1.402*(Cr-128));
+                                auto G = clamp(Y - 0.34414*(Cb-128) - 0.71414*(Cr-128));
+                                auto B = clamp(Y + 1.772*(Cb-128));
+                                framebuffer[(sy+y_)*fb_width + (sx+x_)] =
+                                    (R<<(2*8)) |
+                                    (G<<(1*8)) |
+                                    (B<<(0*8)) |
+                                    0;
+                            }
+                            );
+                }
+        );
+    }
+};
+
 template<typename T>
 class add_hw_decode_h264 : public T {
 public:
@@ -115,26 +160,9 @@ public:
                 auto fb_height = parent::get_height();
                 auto framebuffer = reinterpret_cast<uint32_t*>(frame_u8.data());
                 if (frame->format == AV_PIX_FMT_YUV420P) {
-                    for (int x_ = 0; x_ < width; x_++) {
-                        for (int y_ = 0; y_ < height; y_++) {
-                            uint8_t Y = frame->data[0][y_*frame->linesize[0] + x_];
-                            uint8_t Cb = frame->data[1][y_/2*frame->linesize[1] + x_/2];
-                            uint8_t Cr = frame->data[2][y_/2*frame->linesize[2] + x_/2];
-                            auto clamp = [](int v) {
-                                if (v > 255) return 255;
-                                else if (v < 0) return 0;
-                                else return v;
-                            };
-                            auto R = clamp(Y + 1.402*(Cr-128));
-                            auto G = clamp(Y - 0.34414*(Cb-128) - 0.71414*(Cr-128));
-                            auto B = clamp(Y + 1.772*(Cb-128));
-                            framebuffer[(sy+y_)*fb_width + (sx+x_)] =
-                                (R<<(2*8)) |
-                                (G<<(1*8)) |
-                                (B<<(0*8)) |
-                                0;
-                        }
-                    }
+                    parent::yuv_to_rgb(framebuffer, fb_width, fb_height,
+                            frame, width, height,
+                            sx, sy);
                 }
             }
         }
@@ -191,26 +219,9 @@ public:
                 auto fb_height = parent::get_height();
                 auto framebuffer = reinterpret_cast<uint32_t*>(frame_u8.data());
                 if (frame->format == AV_PIX_FMT_YUV420P) {
-                    for (int x_ = 0; x_ < width; x_++) {
-                        for (int y_ = 0; y_ < height; y_++) {
-                            uint8_t Y = frame->data[0][y_*frame->linesize[0] + x_];
-                            uint8_t Cb = frame->data[1][y_/2*frame->linesize[1] + x_/2];
-                            uint8_t Cr = frame->data[2][y_/2*frame->linesize[2] + x_/2];
-                            auto clamp = [](int v) {
-                                if (v > 255) return 255;
-                                else if (v < 0) return 0;
-                                else return v;
-                            };
-                            auto R = clamp(Y + 1.402*(Cr-128));
-                            auto G = clamp(Y - 0.34414*(Cb-128) - 0.71414*(Cr-128));
-                            auto B = clamp(Y + 1.772*(Cb-128));
-                            framebuffer[(sy+y_)*fb_width + (sx+x_)] =
-                                (R<<(2*8)) |
-                                (G<<(1*8)) |
-                                (B<<(0*8)) |
-                                0;
-                        }
-                    }
+                    parent::yuv_to_rgb(framebuffer, fb_width, fb_height,
+                            frame, width, height,
+                            sx, sy);
                 }
             }
         }
