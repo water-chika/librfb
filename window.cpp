@@ -164,11 +164,11 @@ public:
     void send_pointer_event(uint32_t button_mask, int x, int y) {
         rfb.pointer_event(button_mask, x, y);
     }
-    void request_framebuffer_update(int x, int y, int width, int height) {
-        rfb.framebuffer_update_request(x, y, width, height);
+    void request_framebuffer_update(int x, int y, int width, int height, bool increment_update=true) {
+        rfb.framebuffer_update_request(x, y, width, height, increment_update);
     }
     void request_framebuffer_update(int x=0, int y=0) {
-        request_framebuffer_update(x, y, get_fb_width(), get_fb_height());
+        request_framebuffer_update(x, y, get_fb_width(), get_fb_height(), true);
     }
     void process_rfb_server_message() {
         rfb.process_server_message();
@@ -320,9 +320,9 @@ public:
         latency = draw_time - framebuffer_update_request_time; // This ignores render and present latency
         return parent::draw();
     }
-    void request_framebuffer_update(int x, int y, int width, int height) {
+    void request_framebuffer_update(int x, int y, int width, int height, bool increment_update=true) {
         framebuffer_update_request_time = clock::now();
-        return parent::request_framebuffer_update(x, y, width, height);
+        return parent::request_framebuffer_update(x, y, width, height, increment_update);
     }
     void request_framebuffer_update(int x=0, int y=0) {
         framebuffer_update_request_time = clock::now();
@@ -595,7 +595,7 @@ class add_rfb_socket_pollfd : public T {
 public:
     using parent = T;
     add_rfb_socket_pollfd(const configure auto& conf) : parent{conf} {
-        parent::request_framebuffer_update();
+        parent::request_framebuffer_update(0,0, parent::get_fb_width(), parent::get_fb_height(), false);
     }
     static constexpr int FDS_INDEX = parent::FDS_SIZE;
     static constexpr int FDS_SIZE = parent::FDS_SIZE+1;
