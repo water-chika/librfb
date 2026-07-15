@@ -149,10 +149,6 @@ public:
     auto get_rfb(std::span<uint8_t> frame) {
         rfb.get_frame(frame);
     }
-    auto process_keysym_event(int keysym, int state) {
-        log(std::format("keysym event processing: {}, {}\n", keysym, state));
-        rfb.key_event(keysym, state);
-    }
     auto& get_rfb() {
         return rfb;
     }
@@ -161,6 +157,9 @@ public:
     }
     auto get_fb_height() {
         return rfb.get_height();
+    }
+    void send_key_event(int key, int state) {
+        rfb.key_event(key, state);
     }
     void send_pointer_event(uint32_t button_mask, int x, int y) {
         rfb.pointer_event(button_mask, x, y);
@@ -200,11 +199,25 @@ private:
         >>>>>>>>>>>>>>
     ;
     rfb_env rfb;
-    int pointer_sended_x;
-    int pointer_sended_y;
-    int pointer_x;
-    int pointer_y;
-    int pointer_button_mask;
+};
+
+template<typename T>
+class add_rfb_process_keysym : public T {
+public:
+    using parent = T;
+    add_rfb_process_keysym(const configure auto& conf) : parent{conf}
+    {}
+    void update_keysyms() {
+        for (auto [keysym, state] : keysyms) {
+            parent::send_key_event(keysym, state);
+        }
+        keysyms.clear();
+    }
+    auto process_keysym_event(int keysym, int state) {
+        keysyms.emplace_back(keysym, state);
+    }
+private:
+    std::vector<std::pair<int,int>> keysyms;
 };
 
 template<class T>
@@ -474,6 +487,7 @@ using add_swapchain_and_pipeline_layout =
     set_buffer_size_equal_to_fb_size<
     set_vector_size_to_swapchain_image_count<
     add_image_used_to_scale<
+    add_rfb_process_keysym<
     add_rfb_process_pointer<
     add_rfb<
     rfb::set_address<
@@ -486,7 +500,7 @@ using add_swapchain_and_pipeline_layout =
 	add_swapchain<
 	add_swapchain_image_format<
   T
-  >>>>>>>>>>>>>>>>>>>>
+  >>>>>>>>>>>>>>>>>>>>>
 ;
 
 template<class T>
@@ -590,9 +604,10 @@ public:
         assert(fds[FDS_INDEX].fd == rfb.get_socket());
         auto now = std::chrono::steady_clock::now();
         if (fds[FDS_INDEX].revents & POLLIN) {
-            parent::request_framebuffer_update();
-            parent::update_pointer_position();
-            parent::process_rfb_server_message();
+            parent::request_framebuffer_update(); // request next framebuffer, decrease delay, increase fps.
+            parent::update_pointer_position(); // pointer and key events is after frame request to increase fps.
+            parent::update_keysyms();
+            parent::process_rfb_server_message(); // process current framebuffer request.
             if (rfb.is_frame_updated()) {
                 rfb.reset_frame_updated();
                 parent::draw();
@@ -601,6 +616,7 @@ public:
         }
         else if (now - previous_time > 30ms) {
             parent::update_pointer_position();
+            parent::update_keysyms();
             previous_time = now;
         }
         parent::process_events(fds);
