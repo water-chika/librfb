@@ -95,8 +95,9 @@ public:
                         auto row_bytes_count = (tile_width*bits_per_packed_pixels+7)/8;
                         auto packed_row_pixels = std::span{&packed_pixels[y_*row_bytes_count], row_bytes_count};
                         for (int x_ = 0; x_ < tile_width; x_++) {
-                            auto palette_index = (packed_row_pixels[x_*bits_per_packed_pixels/8] >> ((x_*bits_per_packed_pixels)%8)) & palette_index_mask;
-                            frame[(sy+y+y_)*fb_width + (sx+x+x_)] = cpixel_to_pixel(std::span{&palette[palette_index*3], 3});
+                            // big endian
+                            auto palette_index = (packed_row_pixels[x_*bits_per_packed_pixels/8] >> (8-bits_per_packed_pixels - (x_*bits_per_packed_pixels)%8)) & palette_index_mask;
+                            frame[(sy+y+y_)*fb_width + (sx+x+x_)] = cpixel_to_pixel(std::span{&palette[palette_index*bytes_per_cpixel], bytes_per_cpixel});
                         }
                     }
                 }
@@ -158,6 +159,7 @@ public:
                 }
             }
         }
+        assert(data_offset == data.size());
     }
 private:
     z_stream zlib_stream;
