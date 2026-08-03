@@ -591,6 +591,54 @@ add_physical_device_and_device_and_draw =
 ;
 
 template<typename T>
+class add_rfb_reduce_update : public T {
+public:
+    using parent = T;
+    add_rfb_reduce_update(const configure auto& conf) : parent{conf},
+        wayland_frame{true},
+        ignored_update{false}
+    {
+        set_callback();
+    }
+    void request_framebuffer_update(int x, int y, int width, int height, bool increment_update=true) {
+        if (wayland_frame) {
+            parent::request_framebuffer_update(x, y, width, height, increment_update);
+
+            wayland_frame = false;
+        }
+        else {
+            ignored_update = true;
+        }
+    }
+    void request_framebuffer_update(int x=0, int y=0) {
+        request_framebuffer_update(x, y, parent::get_fb_width(), parent::get_fb_height(), true);
+    }
+private:
+    static void static_frame_event(void* p, wl_callback* callback, uint32_t data) {
+        auto t = reinterpret_cast<add_rfb_reduce_update*>(p);
+        t->frame_event();
+    }
+    void set_callback() {
+        auto wayland_surface = parent::get_wayland_surface();
+        auto callback = wl_surface_frame(wayland_surface);
+        static struct wl_callback_listener callback_listener = {
+            .done = static_frame_event,
+        };
+        wl_callback_add_listener(callback, &callback_listener, this);
+    }
+    void frame_event() {
+        if (ignored_update) {
+            parent::request_framebuffer_update();
+            ignored_update = false;
+        }
+        wayland_frame = true;
+        set_callback();
+    }
+    bool wayland_frame;
+    bool ignored_update;
+};
+
+template<typename T>
 class add_rfb_socket_pollfd : public T {
 public:
     using parent = T;
@@ -665,6 +713,7 @@ using draw_app =
     use_platform<PLATFORM>::template add_pollfds_loop<
     add_info_printer<
     add_rfb_socket_pollfd<
+    add_rfb_reduce_update<
     add_rfb_latency_analyser<
     add_physical_device_and_device_and_draw<
     posix::add_empty_pollfd_array<
@@ -675,7 +724,7 @@ using draw_app =
     use_platform<PLATFORM>::template add_window<
     cpp_helper::add_logger<
     empty_class
-    >>>>>>>>>>>>
+    >>>>>>>>>>>>>
 ;
 
 using namespace std::literals;
