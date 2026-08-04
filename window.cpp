@@ -693,6 +693,12 @@ public:
             parent::request_framebuffer_update(); // request next framebuffer, decrease delay, increase fps.
             parent::update_pointer_position(); // pointer and key events is after frame request to increase fps.
             parent::update_keysyms();
+            auto content_opt = parent::get_selection_content();
+            if (content_opt) {
+                auto& content = content_opt.value();
+                write(STDOUT_FILENO, content.data(), content.size());
+                std::cout << std::endl;
+            }
             parent::process_rfb_server_message(); // process current framebuffer request.
             if (rfb.is_frame_updated()) {
                 rfb.reset_frame_updated();
