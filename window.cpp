@@ -202,37 +202,6 @@ private:
 };
 
 template<typename T>
-class add_repeat_keysym : public T {
-public:
-    using parent = T;
-    using clock = std::chrono::steady_clock;
-    add_repeat_keysym(const configure auto& conf) : parent{conf}
-    {}
-    void update_keysyms() {
-        auto now = clock::now();
-        for (auto& [key,t] : pressed_keysyms) {
-            if (now - t > 50ms) {
-                std::cout << "repeat keysym" << std::endl;
-                parent::process_keysym_event(key, WL_KEYBOARD_KEY_STATE_REPEATED);
-                t = now;
-            }
-        }
-        parent::update_keysyms();
-    }
-    auto process_keysym_event(int keysym, int state) {
-        if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-            pressed_keysyms.emplace(keysym, clock::now()+200ms);
-        }
-        else if (state == WL_KEYBOARD_KEY_STATE_RELEASED) {
-            pressed_keysyms.erase(keysym);
-        }
-        parent::process_keysym_event(keysym, state);
-    }
-private:
-    std::unordered_map<int, clock::time_point> pressed_keysyms;
-};
-
-template<typename T>
 class add_rfb_process_keysym : public T {
 public:
     using parent = T;
@@ -524,7 +493,6 @@ using add_swapchain_and_pipeline_layout =
     set_buffer_size_equal_to_fb_size<
     set_vector_size_to_swapchain_image_count<
     add_image_used_to_scale<
-    add_repeat_keysym<
     add_rfb_process_keysym<
     add_rfb_process_pointer<
     add_rfb<
@@ -538,7 +506,7 @@ using add_swapchain_and_pipeline_layout =
 	add_swapchain<
 	add_swapchain_image_format<
   T
-  >>>>>>>>>>>>>>>>>>>>>>
+  >>>>>>>>>>>>>>>>>>>>>
 ;
 
 template<class T>
