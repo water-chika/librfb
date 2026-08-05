@@ -539,6 +539,30 @@ public:
 };
 
 template<typename T>
+class add_client_cut_text : public T {
+public:
+    using parent = T;
+    add_client_cut_text(const configure auto& conf) : parent{conf} {
+    }
+
+    void client_cut_text(auto& str) {
+        uint32_t length = str.size();
+        std::array<uint8_t, 8> client_cut_text = {
+            6, 0, 0, 0,
+            to_big_endian_byte(length, 0), to_big_endian_byte(length, 1),
+            to_big_endian_byte(length, 2), to_big_endian_byte(length, 3),
+        };
+        try {
+            parent::rfb_write(client_cut_text);
+            parent::rfb_write(str);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error{std::format("client cut text send fail: {}", e.what())};
+        }
+    }
+};
+
+template<typename T>
 class init_rfb : public T {
 public:
     using parent = T;
@@ -681,6 +705,7 @@ using rfb = add_rfb<
     add_yuv_to_rgb<
     add_zrle<
     init_rfb<
+    add_client_cut_text<
     add_set_encodings<
     set_default_supported_encodings<
     add_set_format<
@@ -690,7 +715,7 @@ using rfb = add_rfb<
     set_port<
     set_address<
     empty_configurable_class
-    >>>>>>>>>>>>>>
+    >>>>>>>>>>>>>>>
 ;
 struct config {
     const char* address;
