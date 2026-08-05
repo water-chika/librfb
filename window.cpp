@@ -164,6 +164,9 @@ public:
     void send_pointer_event(uint32_t button_mask, int x, int y) {
         rfb.pointer_event(button_mask, x, y);
     }
+    void send_cut_text(auto& str) {
+        rfb.client_cut_text(str);
+    }
     void request_framebuffer_update(int x, int y, int width, int height, bool increment_update=true) {
         rfb.framebuffer_update_request(x, y, width, height, increment_update);
     }
@@ -187,6 +190,7 @@ private:
         rfb::add_yuv_to_rgb<
         rfb::add_zrle<
         rfb::init_rfb<
+        rfb::add_client_cut_text<
         rfb::add_set_encodings<
         rfb::set_supported_encodings_from_configure<
         rfb::add_set_format<
@@ -196,7 +200,7 @@ private:
         rfb::set_port<
         rfb::set_address<
         empty_configurable_class
-        >>>>>>>>>>>>>>
+        >>>>>>>>>>>>>>>
     ;
     rfb_env rfb;
 };
@@ -664,6 +668,7 @@ public:
             auto content_opt = parent::get_selection_content();
             if (content_opt) {
                 auto& content = content_opt.value();
+                parent::send_cut_text(content);
                 write(STDOUT_FILENO, content.data(), content.size());
                 std::cout << std::endl;
             }
