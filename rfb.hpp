@@ -582,6 +582,57 @@ private:
     server_init_message server_info;
 };
 
+template<typename T>
+concept server_cut_text_processable = requires (T t) {
+    t.process_server_cut_text(std::string{});
+};
+
+template<typename T>
+class add_process_server_cut_text_if_not : public T {
+public:
+    using parent = T;
+    add_process_server_cut_text_if_not(const configure auto& conf) : parent{conf}
+    {}
+    void process_server_cut_text(const auto& text) {
+        std::cout << std::string_view{text.data(), text.size()} << std::endl;
+    }
+};
+template<server_cut_text_processable T>
+class add_process_server_cut_text_if_not<T> : public T {
+public:
+    using parent = T;
+    add_process_server_cut_text_if_not(const configure auto& conf) : parent{conf}
+    {}
+};
+
+template<typename T>
+class add_server_cut_text : public add_process_server_cut_text_if_not<T> {
+public:
+    using parent = add_process_server_cut_text_if_not<T>;
+    add_server_cut_text(const configure auto& conf) : parent{conf}
+    {}
+    void process_server_cut_text() {
+        std::array<uint8_t, 4> length_buf{};
+        try{
+        parent::rfb_read(length_buf);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error("server cut text length read fail");
+        }
+
+        uint32_t length = from_big_endian_bytes(length_buf[0], length_buf[1], length_buf[2], length_buf[3]);
+
+        std::vector<char> text(length);
+        try{
+        parent::rfb_read(text);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error("server cut text read fail");
+        }
+        parent::process_server_cut_text(text);
+    }
+};
+
 template <typename T>
 class add_rfb : public T {
 public:
@@ -633,29 +684,6 @@ public:
             throw std::runtime_error{std::format("pointer event send fail: {}", e.what())};
         }
     }
-
-    void process_server_cut_text() {
-        std::array<uint8_t, 4> length_buf{};
-        try{
-        parent::rfb_read(length_buf);
-        }
-        catch (std::exception& e) {
-            throw std::runtime_error("server cut text length read fail");
-        }
-
-        uint32_t length = from_big_endian_bytes(length_buf[0], length_buf[1], length_buf[2], length_buf[3]);
-
-        std::vector<char> text(length);
-        try{
-        parent::rfb_read(text);
-        }
-        catch (std::exception& e) {
-            throw std::runtime_error("server cut text read fail");
-        }
-        text.push_back('\0');
-        std::cout << text.data() << std::endl;
-    }
-
     void process_colour_map_entries() {
         std::array<uint8_t, 2> colour_count_buf{};
         try{
@@ -691,7 +719,7 @@ public:
             process_colour_map_entries();
         }
         else if (framebuffer_update_head[0] == 3) {
-            process_server_cut_text();
+            parent::process_server_cut_text();
         }
         else {
             std::cout << "not implemented message type: " << (int)framebuffer_update_head[0] << std::endl;
@@ -705,6 +733,7 @@ using rfb = add_rfb<
     add_yuv_to_rgb<
     add_zrle<
     init_rfb<
+    add_server_cut_text<
     add_client_cut_text<
     add_set_encodings<
     set_default_supported_encodings<
@@ -715,7 +744,7 @@ using rfb = add_rfb<
     set_port<
     set_address<
     empty_configurable_class
-    >>>>>>>>>>>>>>>
+    >>>>>>>>>>>>>>>>
 ;
 struct config {
     const char* address;
