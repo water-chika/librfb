@@ -214,7 +214,6 @@ public:
     void update_keysyms() {
         for (auto [keysym, state] : keysyms) {
             if (state == WL_KEYBOARD_KEY_STATE_REPEATED) {
-                parent::send_key_event(keysym, WL_KEYBOARD_KEY_STATE_RELEASED);
                 parent::send_key_event(keysym, WL_KEYBOARD_KEY_STATE_PRESSED);
             }
             else {
