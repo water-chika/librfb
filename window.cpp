@@ -132,77 +132,69 @@ public:
   void destroy() {}
 }; // class record_swapchain_command_buffers in use_app<app::cube>
 
-template<class T>
-class add_rfb : public T {
+template<typename T>
+class add_rfb_process_server_cut_text : public T {
 public:
     using parent = T;
-    add_rfb(const configure auto& conf) : parent{cpp_helper::increment_configure_log_index_count(conf)},
-        rfb{conf}
-    {
+    add_rfb_process_server_cut_text(const configure auto& conf) : parent{conf}
+    {}
+    void process_server_cut_text(const auto& text) {
+        parent::set_selection_source_content(text);
     }
-    constexpr uint32_t get_log_index() {
-        return parent::get_log_index() + 1;
-    }
-    void log(const auto& v) {
-        parent::log(get_log_index(), v);
-    }
+};
+
+template<typename T>
+using add_rfb_parent =
+    rfb::add_rfb<
+    rfb::add_process_framebuffer_update<
+    rfb::add_decode_h264<
+    rfb::add_yuv_to_rgb<
+    rfb::add_zrle<
+    rfb::init_rfb<
+    rfb::add_server_cut_text<
+    add_rfb_process_server_cut_text<
+    rfb::add_client_cut_text<
+    rfb::add_set_encodings<
+    rfb::set_supported_encodings_from_configure<
+    rfb::add_set_format<
+    rfb::add_server_init<
+    rfb::add_client_init<
+    rfb::add_connection<
+    rfb::set_port<
+    rfb::set_address<
+    T
+    >>>>>>>>>>>>>>>>>
+;
+template<class T>
+class add_rfb : public add_rfb_parent<T> {
+public:
+    using parent = add_rfb_parent<T>;
+    add_rfb(const configure auto& conf) : parent{conf}
+    {}
     auto get_rfb(std::span<uint8_t> frame) {
-        rfb.get_frame(frame);
-    }
-    auto& get_rfb() {
-        return rfb;
+        parent::get_frame(frame);
     }
     auto get_fb_width() {
-        return rfb.get_width();
+        return parent::get_width();
     }
     auto get_fb_height() {
-        return rfb.get_height();
+        return parent::get_height();
     }
     void send_key_event(int key, int state) {
-        rfb.key_event(key, state);
+        parent::key_event(key, state);
     }
     void send_pointer_event(uint32_t button_mask, int x, int y) {
-        rfb.pointer_event(button_mask, x, y);
+        parent::pointer_event(button_mask, x, y);
     }
     void send_cut_text(auto& str) {
-        rfb.client_cut_text(str);
+        parent::client_cut_text(str);
     }
     void request_framebuffer_update(int x, int y, int width, int height, bool increment_update=true) {
-        rfb.framebuffer_update_request(x, y, width, height, increment_update);
+        parent::framebuffer_update_request(x, y, width, height, increment_update);
     }
     void request_framebuffer_update(int x=0, int y=0) {
         request_framebuffer_update(x, y, get_fb_width(), get_fb_height(), true);
     }
-    void process_rfb_server_message() {
-        rfb.process_server_message();
-    }
-    auto get_encoding() {
-        return rfb.get_encoding();
-    }
-    auto get_frame_network_byte_count() {
-        return rfb.get_frame_network_byte_count();
-    }
-private:
-    using rfb_env =
-        rfb::add_rfb<
-        rfb::add_process_framebuffer_update<
-        rfb::add_decode_h264<
-        rfb::add_yuv_to_rgb<
-        rfb::add_zrle<
-        rfb::init_rfb<
-        rfb::add_client_cut_text<
-        rfb::add_set_encodings<
-        rfb::set_supported_encodings_from_configure<
-        rfb::add_set_format<
-        rfb::add_server_init<
-        rfb::add_client_init<
-        rfb::add_connection<
-        rfb::set_port<
-        rfb::set_address<
-        empty_configurable_class
-        >>>>>>>>>>>>>>>
-    ;
-    rfb_env rfb;
 };
 
 template<typename T>
@@ -657,8 +649,7 @@ public:
     static constexpr int FDS_INDEX = parent::FDS_SIZE;
     static constexpr int FDS_SIZE = parent::FDS_SIZE+1;
     void process_events(auto& fds) {
-        auto& rfb = parent::get_rfb();
-        assert(fds[FDS_INDEX].fd == rfb.get_socket());
+        assert(fds[FDS_INDEX].fd == parent::get_socket());
         auto now = std::chrono::steady_clock::now();
         if (fds[FDS_INDEX].revents & POLLIN) {
             parent::request_framebuffer_update(); // request next framebuffer, decrease delay, increase fps.
@@ -671,9 +662,9 @@ public:
                 write(STDOUT_FILENO, content.data(), content.size());
                 std::cout << std::endl;
             }
-            parent::process_rfb_server_message(); // process current framebuffer request.
-            if (rfb.is_frame_updated()) {
-                rfb.reset_frame_updated();
+            parent::process_server_message(); // process current framebuffer request.
+            if (parent::is_frame_updated()) {
+                parent::reset_frame_updated();
                 parent::draw();
             }
             previous_time = now;
@@ -687,9 +678,8 @@ public:
     }
     std::vector<pollfd> get_fds() {
         auto fds = parent::get_fds();
-        auto& rfb = parent::get_rfb();
         fds.emplace_back(pollfd{
-                .fd = rfb.get_socket(),
+                .fd = parent::get_socket(),
                 .events = POLLIN,
                 });
         return fds;
