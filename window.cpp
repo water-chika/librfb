@@ -749,7 +749,7 @@ int main(int argc, const char* argv[]) {
     }
     const char* address = "127.0.0.1";
     uint16_t port = 5900;
-    std::vector<uint32_t> encodings = {16};
+    std::vector<uint32_t> encodings = {rfb::to_big_endian(16)};
     const char* enabled_logs = "";
     for (int i = 1, pos_arg=0; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] == '-') {
