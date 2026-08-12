@@ -740,22 +740,46 @@ struct config : public empty_configure {
     uint16_t port;
     std::vector<uint32_t> supported_encodings;
     const char* enabled_logs;
+    uint32_t width;
+    uint32_t height;
 };
 
 int main(int argc, const char* argv[]) {
   try {
+    auto usage_string =
+                "Usage: rfb_window_demo <address> <port> <encodings>\n"
+                "--log <enabled_logs>\n"
+                "--width <width>\n"
+                "--height <height>\n"
+                ;
     if (argc < 3) {
-        throw std::logic_error("Usage: rfb_window_demo <address> <port> <encodings> --log <enabled_logs>");
+        throw std::logic_error(
+                usage_string
+                );
     }
     const char* address = "127.0.0.1";
     uint16_t port = 5900;
     std::vector<uint32_t> encodings{};
     const char* enabled_logs = "";
+    uint32_t width = 1920, height = 1080;
     for (int i = 1, pos_arg=0; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] == '-') {
             if (strcmp(&argv[i][2], "log") == 0) {
                 enabled_logs = argv[i+1];
                 i += 1;
+            }
+            else if (strcmp(&argv[i][2], "width") == 0) {
+                width = strtol(argv[i+1], NULL, 10);
+                i += 1;
+            }
+            else if (strcmp(&argv[i][2], "height") == 0) {
+                height = strtol(argv[i+1], NULL, 10);
+                i += 1;
+            }
+            else {
+                throw std::logic_error(
+                        usage_string
+                        );
             }
         }
         else {
@@ -777,6 +801,11 @@ int main(int argc, const char* argv[]) {
                     encodings.emplace_back(rfb::to_big_endian(v));
                 }
             }
+            else {
+                throw std::logic_error(
+                        usage_string
+                        );
+            }
             pos_arg += 1;
         }
     }
@@ -786,7 +815,9 @@ int main(int argc, const char* argv[]) {
     auto conf = config{
         .address=address, .port=port,
         .supported_encodings = std::move(encodings),
-        .enabled_logs = enabled_logs
+        .enabled_logs = enabled_logs,
+        .width = width,
+        .height = height,
     };
     auto app = draw_app{conf};
   } catch (std::exception &e) {
