@@ -200,7 +200,9 @@ public:
     set_bo_alloc_size(const configure auto& conf) : parent{conf}
     {}
     auto get_bo_alloc_size() {
-        return 1920u*1080u*sizeof(uint32_t);
+        auto fb_width = parent::get_fb_width();
+        auto fb_height = parent::get_fb_height();
+        return fb_width*fb_height*sizeof(uint32_t);
     }
 };
 
@@ -214,7 +216,9 @@ public:
     {
         int fd = parent::get_drm_fd();
         int ret = 0;
-        uint32_t width = 1920, height = 1080;
+        auto fb_width = parent::get_fb_width();
+        auto fb_height = parent::get_fb_height();
+        uint32_t width = fb_width, height = fb_height;
         hipExternalMemory_t hip_memory{};
         {
             uint32_t dma_buf_fd{};
@@ -260,8 +264,6 @@ public:
                 throw std::runtime_error{std::format("hipExternalMemoryGetMappedBuffer failed: {}", ret)};
             }
         }
-        auto fb_width = parent::get_fb_width();
-        auto fb_height = parent::get_fb_height();
         hipHostMalloc(&upload_ptr, fb_width*fb_height*sizeof(uint32_t));
         assert(upload_ptr != nullptr);
     }
@@ -269,7 +271,7 @@ public:
         auto fb_width = parent::get_fb_width();
         auto fb_height = parent::get_fb_height();
         parent::get_rfb(std::span{reinterpret_cast<uint8_t*>(upload_ptr), fb_width*fb_height*sizeof(uint32_t)});
-        uint32_t width = 1920, height = 1080;
+        uint32_t width = fb_width, height = fb_height;
         copy_frame<<<dim3(8,8,1), dim3(32,1,1),0>>>(frame_ptr, upload_ptr, width, height, (width+32*8-1)/(32*8), (height+1*8-1)/(1*8));
         int ret = hipDeviceSynchronize();
         if (ret != hipSuccess) {
@@ -503,14 +505,14 @@ using draw_app =
     add_rfb_process_keysym<
     add_rfb_process_pointer<
     add_hip_draw<
-    add_rfb<
-    rfb::set_address<
-    rfb::set_port<
-    posix::add_empty_pollfd_array<
     drm_helper::add_amdgpu_bo<
     set_bo_alloc_size<
     drm_helper::add_amdgpu_device<
     drm_helper::add_drm_fd<
+    add_rfb<
+    rfb::set_address<
+    rfb::set_port<
+    posix::add_empty_pollfd_array<
     wayland_helper::add_wayland_surface<
     cpp_helper::add_logger<
     empty_class
