@@ -481,7 +481,21 @@ using draw_app =
     wayland_helper::add_wayland_pollfds_loop<
     posix::add_poll_events<
     wayland_helper::add_wayland_pollfd<
+    wayland_helper::register_pointer_axis_callback<
+    wayland_helper::register_pointer_button_callback<
+    wayland_helper::register_pointer_motion_callback<
+    wayland_helper::register_key_callback<
+    wayland_helper::register_keyboard_leave_callback<
+    wayland_helper::add_repeat_key<
     posix::add_time_point_callbacks<
+    wayland_helper::register_keyboard_modifiers_callback<
+    wayland_helper::register_keymap_callback<
+    xkb_helper::add_process_key_event<
+    xkb_helper::add_process_keyboard_modifiers<
+    xkb_helper::add_process_keymap<
+    xkb_helper::add_state<
+    xkb_helper::add_keymap<
+    xkb_helper::add_context<
     add_info_printer<
     add_rfb_socket_pollfd<
     add_rfb_reduce_update<
@@ -500,7 +514,7 @@ using draw_app =
     wayland_helper::add_wayland_surface<
     cpp_helper::add_logger<
     empty_class
-    >>>>>>>>>>>>>>>>>>>>>>
+    >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 ;
 
 using namespace std::literals;
