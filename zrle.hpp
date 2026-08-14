@@ -59,7 +59,7 @@ public:
                 int tile_height = height - y >= 64 ? 64 : height - y;
                 auto subencoding = data[data_offset];
                 data_offset++;
-                int bytes_per_cpixel = 3;
+                uint32_t bytes_per_cpixel = 3;
                 if (subencoding == 0) {
                     for (int x_ = 0; x_ < tile_width; x_++) {
                         for (int y_ = 0; y_ < tile_height; y_++) {
@@ -79,13 +79,13 @@ public:
                     }
                 }
                 else if (subencoding > 1 && subencoding <= 16) {
-                    int palette_size = subencoding;
+                    uint32_t palette_size = subencoding;
                     auto palette = std::span{&data[data_offset], palette_size*bytes_per_cpixel};
                     data_offset += palette_size*bytes_per_cpixel;
-                    int bits_per_packed_pixels = 1;
+                    uint32_t bits_per_packed_pixels = 1;
                     if (palette_size > 2) bits_per_packed_pixels = 2;
                     if (palette_size > 4) bits_per_packed_pixels = 4;
-                    int palette_index_mask = 0b1;
+                    uint32_t palette_index_mask = 0b1;
                     if (palette_size > 2) palette_index_mask = 0b11;
                     if (palette_size > 4) palette_index_mask = 0b1111;
                     auto packed_pixels = std::span{&data[data_offset], (tile_width*bits_per_packed_pixels+7)/8*tile_height};

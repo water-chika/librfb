@@ -494,9 +494,10 @@ public:
     {
         // order is a priority hint
         auto supported_encodings = parent::get_supported_encodings();
+        uint16_t count = cpp_helper::checked_cast<uint16_t>(supported_encodings.size());
         auto set_encodings = std::to_array<uint8_t>({
             2, 0, // SetEncoding, padding
-            0, supported_encodings.size(), // Number of encoding
+            to_big_endian_byte(count, 0), to_big_endian_byte(count,1), // Number of encoding
         });
         try{
         parent::rfb_write(set_encodings);
@@ -746,12 +747,12 @@ using rfb = add_rfb<
     empty_configurable_class
     >>>>>>>>>>>>>>>>
 ;
-struct config {
+struct config : cpp_helper::empty_configure {
     const char* address;
     uint16_t port;
 };
 static int rfb_process(auto host, auto port) {
-    rfb rfb{config{host, port}};
+    rfb rfb{config{.address=host, .port=port}};
     while (true) {
         rfb.framebuffer_update_request(0, 0, rfb.get_width(), rfb.get_height());
         rfb.process_server_message();
@@ -760,9 +761,4 @@ static int rfb_process(auto host, auto port) {
 }
 
 } // namespace rfb
-
-template<>
-struct cpp_helper::is_configure_structure<rfb::config> {
-    static constexpr bool value = true;
-};
 
