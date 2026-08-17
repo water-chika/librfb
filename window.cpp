@@ -276,6 +276,9 @@ public:
         wl_buffer_destroy(buffer);
         zwp_linux_buffer_params_v1_destroy(buffer_params);
     }
+    auto get_buffer() {
+        return buffer;
+    }
 private:
     zwp_linux_buffer_params_v1* buffer_params;
     wl_buffer* buffer;
@@ -297,7 +300,6 @@ public:
         auto fb_width = parent::get_fb_width();
         auto fb_height = parent::get_fb_height();
         auto [width,height] = parent::get_surface_resolution();
-        std::cout << std::format("resolution={}x{}", width, height) << std::endl;
         auto hip_memory = parent::get_external_memory();
         auto frame_ptr = reinterpret_cast<uint32_t*>(parent::get_external_memory_buffer());
 
