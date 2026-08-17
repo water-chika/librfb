@@ -194,46 +194,6 @@ private:
 };
 
 template<typename T>
-class register_size_change_callback : public T {
-public:
-    using parent = T;
-    using this_type = register_size_change_callback<T>;
-    register_size_change_callback(const configure auto& conf) : parent{conf} {
-        parent::set_size_changed_callback(size_changed_callback, this);
-    }
-    static void size_changed_callback(int width, int height, void* data) {
-        std::cout << "size changed" << std::endl;
-        auto t = reinterpret_cast<this_type*>(data);
-        t->size_changed(width, height);
-    }
-    void size_changed(int width, int height) {
-        parent::recreate_surface();
-    }
-};
-
-template<typename T>
-class add_recreate_surface_for : public T {
-public:
-    using parent = T;
-    add_recreate_surface_for(const configure auto& conf) : parent{conf} {
-    }
-    void recreate_surface() {
-        parent::destroy();
-        parent::recreate_surface();
-        parent::create();
-    }
-};
-template<typename T>
-class add_dummy_recreate_surface : public T {
-public:
-    using parent = T;
-    add_dummy_recreate_surface(const configure auto& conf) : parent{conf} {
-    }
-    void recreate_surface() {
-    }
-};
-
-template<typename T>
 class set_bo_alloc_size : public T {
 public:
     using parent = T;
@@ -537,19 +497,19 @@ using draw_app =
     add_rfb_process_keysym<
     add_rfb_process_pointer<
     add_hip_draw<
-    register_size_change_callback<
-    add_recreate_surface_for<
+    wayland_helper::register_size_change_callback<
+    wayland_helper::add_recreate_surface_for<
     attach_dma_buf_fd_to_surface<
-    add_recreate_surface_for<
+    wayland_helper::add_recreate_surface_for<
     hip_helper::add_external_memory_buffer<
-    add_recreate_surface_for<
+    wayland_helper::add_recreate_surface_for<
     hip_helper::add_external_memory<
-    add_recreate_surface_for<
+    wayland_helper::add_recreate_surface_for<
     drm_helper::add_dma_buf_fd_with_amdgpu_bo<
-    add_recreate_surface_for<
+    wayland_helper::add_recreate_surface_for<
     drm_helper::add_amdgpu_bo<
     set_bo_alloc_size<
-    add_dummy_recreate_surface<
+    wayland_helper::add_dummy_recreate_surface<
     drm_helper::add_amdgpu_device<
     drm_helper::add_drm_fd<
     add_rfb<
