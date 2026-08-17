@@ -499,15 +499,10 @@ public:
         auto now = clock::now();
         if (now - previous_time > 500ms) {
             previous_time = now;
-            //auto rfb_latency = parent::get_rfb_latency();
-            //auto rfb_latency_ms = rfb_latency / 1000000ns;
-            //auto cpu_frame_time = parent::get_cpu_frame_time();
-            //auto cpu_frame_time_ms = cpu_frame_time / 1000000ns;
-            //float fps = cpu_frame_time > 0ns ? (100s / cpu_frame_time)/100.0 : 0;
             auto encoding_type = parent::get_encoding();
             auto frame_network_byte_count = parent::get_frame_network_byte_count();
-            //std::clog << std::format("encoding: {}, bytes: {}, cpu frame time: {:5}ms, fps: {:6}\r",
-            //        encoding_type, frame_network_byte_count, cpu_frame_time_ms, fps);
+            std::clog << std::format("encoding: {}, bytes: {}\r",
+                    encoding_type, frame_network_byte_count);
         }
         parent::process_events(fds);
     }
