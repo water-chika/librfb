@@ -41,3 +41,18 @@ target_link_libraries(rfb_window_demo PUBLIC
     drm_helper
     rfb
 )
+
+add_executable(test_hip
+    test_hip.cpp
+)
+
+target_compile_features(test_hip PUBLIC cxx_std_20)
+
+target_link_libraries(test_hip PUBLIC
+    posix_cpp
+    xkb_helper
+    wayland_helper
+    hip_helper
+    drm_helper
+    rfb
+)
