@@ -42,6 +42,18 @@ target_link_libraries(rfb_window_demo PUBLIC
     rfb
 )
 
+add_executable(rfb_recorder
+    recorder.cpp
+)
+
+target_compile_features(rfb_recorder PUBLIC cxx_std_20)
+
+target_link_libraries(rfb_recorder PUBLIC
+    rfb
+    avformat
+    swscale
+)
+
 add_executable(test_hip
     test_hip.cpp
 )
