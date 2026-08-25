@@ -12,6 +12,7 @@
 
 #include <memory>
 #include <thread>
+#include <fstream>
 
 using cpp_helper::empty_class;
 using cpp_helper::configure;
@@ -49,14 +50,16 @@ using add_rfb_parent =
     rfb::add_connection<
     rfb::set_port<
     rfb::set_address<
+    rfb::set_password_from_configure<
     T
-    >>>>>>>>>>>>>>>>>
+    >>>>>>>>>>>>>>>>>>
 ;
 template<class T>
 class add_rfb : public add_rfb_parent<T> {
 public:
     using parent = add_rfb_parent<T>;
-    add_rfb(const configure auto& conf) : parent{conf}
+    add_rfb(const configure auto& conf) : parent{conf},
+        view_only{conf.view_only}
     {}
     auto get_rfb(std::span<uint8_t> frame) {
         parent::get_frame(frame);
@@ -68,12 +71,15 @@ public:
         return parent::get_height();
     }
     void send_key_event(int key, int state) {
+        if (view_only) return;
         parent::key_event(key, state);
     }
     void send_pointer_event(uint32_t button_mask, int x, int y) {
+        if (view_only) return;
         parent::pointer_event(button_mask, x, y);
     }
     void send_cut_text(auto& str) {
+        if (view_only) return;
         parent::client_cut_text(str);
     }
     void request_framebuffer_update(int x, int y, int width, int height, bool increment_update=true) {
@@ -82,6 +88,8 @@ public:
     void request_framebuffer_update(int x=0, int y=0) {
         request_framebuffer_update(x, y, get_fb_width(), get_fb_height(), true);
     }
+private:
+    bool view_only;
 };
 
 template<typename T>
@@ -524,6 +532,19 @@ using draw_app =
 
 using namespace std::literals;
 
+std::string read_password_file(const char* path) {
+    std::ifstream in{path};
+    if (!in) {
+        throw std::logic_error(std::format("could not open password file: {}", path));
+    }
+    std::string password;
+    std::getline(in, password);
+    while (!password.empty() && (password.back() == '\r' || password.back() == '\n')) {
+        password.pop_back();
+    }
+    return password;
+}
+
 struct config : public empty_configure {
     const char* address;
     uint16_t port;
@@ -532,6 +553,8 @@ struct config : public empty_configure {
     int32_t width;
     int32_t height;
     const char* drm_device_path;
+    bool view_only;
+    std::string password;
 };
 
 int main(int argc, const char* argv[]) {
@@ -542,6 +565,9 @@ int main(int argc, const char* argv[]) {
                 "--width <width>\n"
                 "--height <height>\n"
                 "--gpu <drm_device_path>\n"
+                "--view-only\n"
+                "--password <password>\n"
+                "--password-file <path>\n"
                 ;
     if (argc < 3) {
         throw std::logic_error(
@@ -554,6 +580,8 @@ int main(int argc, const char* argv[]) {
     const char* enabled_logs = "";
     int32_t width = 1920, height = 1080;
     const char* drm_device_path = "";
+    bool view_only = false;
+    std::string password{};
     for (int i = 1, pos_arg=0; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] == '-') {
             if (strcmp(&argv[i][2], "log") == 0) {
@@ -570,6 +598,17 @@ int main(int argc, const char* argv[]) {
             }
             else if (strcmp(&argv[i][2], "gpu") == 0) {
                 drm_device_path = argv[i+1];
+                i += 1;
+            }
+            else if (strcmp(&argv[i][2], "view-only") == 0) {
+                view_only = true;
+            }
+            else if (strcmp(&argv[i][2], "password") == 0) {
+                password = argv[i+1];
+                i += 1;
+            }
+            else if (strcmp(&argv[i][2], "password-file") == 0) {
+                password = read_password_file(argv[i+1]);
                 i += 1;
             }
             else {
@@ -615,6 +654,8 @@ int main(int argc, const char* argv[]) {
         .width = width,
         .height = height,
         .drm_device_path = drm_device_path,
+        .view_only = view_only,
+        .password = std::move(password),
     };
     auto app = draw_app{conf};
   } catch (std::exception &e) {
