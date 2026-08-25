@@ -48,30 +48,75 @@ public:
     using parent = T;
     add_yuv_to_rgb(const configure auto& conf) : parent{conf} {
     }
+    struct yuv_to_rgb_coefficients {
+        float y_scale;
+        float y_offset;
+        float r_cr;
+        float g_cb;
+        float g_cr;
+        float b_cb;
+    };
+    // H.264 streams are limited range (Y 16-235, C 16-240) and use BT.709 for HD
+    // resolutions, so the matrix has to come from the frame metadata rather than
+    // being hardcoded to full range BT.601.
+    static yuv_to_rgb_coefficients get_coefficients(const AVFrame* frame) {
+        auto colorspace = frame->colorspace;
+        if (colorspace == AVCOL_SPC_UNSPECIFIED) {
+            colorspace = frame->height >= 720 ? AVCOL_SPC_BT709 : AVCOL_SPC_BT470BG;
+        }
+        double kr = 0.299, kb = 0.114;
+        switch (colorspace) {
+        case AVCOL_SPC_BT709:
+            kr = 0.2126; kb = 0.0722; break;
+        case AVCOL_SPC_BT2020_NCL:
+        case AVCOL_SPC_BT2020_CL:
+            kr = 0.2627; kb = 0.0593; break;
+        case AVCOL_SPC_SMPTE240M:
+            kr = 0.212; kb = 0.087; break;
+        default:
+            break;
+        }
+        double kg = 1.0 - kr - kb;
+        bool full_range = frame->color_range == AVCOL_RANGE_JPEG;
+        double y_scale = full_range ? 1.0 : 255.0/219.0;
+        double c_scale = full_range ? 1.0 : 255.0/224.0;
+        return yuv_to_rgb_coefficients{
+            .y_scale = static_cast<float>(y_scale),
+            .y_offset = full_range ? 0.0f : 16.0f,
+            .r_cr = static_cast<float>(2*(1-kr)*c_scale),
+            .g_cb = static_cast<float>(2*(1-kb)*kb/kg*c_scale),
+            .g_cr = static_cast<float>(2*(1-kr)*kr/kg*c_scale),
+            .b_cb = static_cast<float>(2*(1-kb)*c_scale),
+        };
+    }
     void yuv_to_rgb(
             auto& framebuffer, auto fb_width, auto fb_height,
             auto& frame, auto width, auto height,
             auto sx, auto sy
             ) {
+        auto coefficients = get_coefficients(frame);
         auto x_indices = std::vector<uint32_t>(width);
         std::iota(x_indices.begin(), x_indices.end(), 0);
         auto y_indices = std::vector<uint32_t>(height);
         std::iota(y_indices.begin(), y_indices.end(), 0);
         std::for_each(std::execution::par, y_indices.begin(), y_indices.end(),
-                [&x_indices, frame=frame, &framebuffer, fb_width, sx, sy](auto y_) {
+                [&x_indices, frame=frame, &framebuffer, fb_width, sx, sy, coefficients](auto y_) {
                     std::for_each(std::execution::seq, x_indices.begin(), x_indices.end(),
-                            [y_, frame, &framebuffer, fb_width, sx, sy](auto x_) {
+                            [y_, frame, &framebuffer, fb_width, sx, sy, coefficients](auto x_) {
                                 uint8_t Y = frame->data[0][y_*frame->linesize[0] + x_];
                                 uint8_t Cb = frame->data[1][y_/2*frame->linesize[1] + x_/2];
                                 uint8_t Cr = frame->data[2][y_/2*frame->linesize[2] + x_/2];
-                                auto clamp = [](int v) {
-                                    if (v > 255) return 255;
-                                    else if (v < 0) return 0;
-                                    else return v;
+                                auto clamp = [](float v) {
+                                    if (v > 255.0f) return 255;
+                                    else if (v < 0.0f) return 0;
+                                    else return static_cast<int>(v + 0.5f);
                                 };
-                                auto R = clamp(Y + 1.402*(Cr-128));
-                                auto G = clamp(Y - 0.34414*(Cb-128) - 0.71414*(Cr-128));
-                                auto B = clamp(Y + 1.772*(Cb-128));
+                                float y = (Y - coefficients.y_offset) * coefficients.y_scale;
+                                float cb = Cb - 128.0f;
+                                float cr = Cr - 128.0f;
+                                auto R = clamp(y + coefficients.r_cr*cr);
+                                auto G = clamp(y - coefficients.g_cb*cb - coefficients.g_cr*cr);
+                                auto B = clamp(y + coefficients.b_cb*cb);
                                 framebuffer[(sy+y_)*fb_width + (sx+x_)] =
                                     (R<<(2*8)) |
                                     (G<<(1*8)) |

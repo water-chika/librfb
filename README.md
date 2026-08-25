@@ -6,7 +6,7 @@ Library for Remote Frame Buffer protocol.
 
 1. Raw
 2. ZRLE
-3. H264(color space is not right, need fix)
+3. H264
 
 ## TODO
 
