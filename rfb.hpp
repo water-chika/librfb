@@ -4,9 +4,16 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 }
 
+// OpenSSL's low-level DES API is deprecated in 3.x but is the only practical way
+// to get single DES, which the RFB "VNC Authentication" security type mandates
+// (EVP moved single DES into the legacy provider).
+#define OPENSSL_SUPPRESS_DEPRECATED
+#include <openssl/des.h>
+
 #include <array>
 #include <iostream>
 #include <map>
+#include <string>
 
 #include <cpp_helper.hpp>
 #include <socket_helper.hpp>
@@ -357,6 +364,9 @@ template<typename T>
 class add_client_init : public T {
 public:
     using parent = T;
+    static constexpr uint8_t security_type_none = 1;
+    static constexpr uint8_t security_type_vnc_auth = 2;
+
     add_client_init(const configure auto& conf) : parent{conf} {
     }
     std::pair<uint16_t, uint16_t> parse_protocol_version(const std::array<char,12>& message) {
@@ -402,6 +412,9 @@ public:
             catch (std::exception& e) {
                 throw std::runtime_error{std::format("security count read fail: {}", e.what())};
             }
+            if (security_count[0] == 0) {
+                throw std::runtime_error{std::format("connection rejected by server: {}", read_failure_reason())};
+            }
             std::cout << "Server supportted security count: " << static_cast<int>(security_count[0]) << std::endl;
 
             std::vector<uint8_t> security_types(security_count[0]);
@@ -412,17 +425,41 @@ public:
                 throw std::runtime_error{std::format("security types read fail: {}", e.what())};
             }
             bool exist_none = false;
+            bool exist_vnc_auth = false;
             for (int i = 0; i < security_types.size(); i++) {
                 std::cout << static_cast<int>(security_types[i]) << ",";
-                if (i == 1) exist_none = true;
+                if (security_types[i] == security_type_none) exist_none = true;
+                if (security_types[i] == security_type_vnc_auth) exist_vnc_auth = true;
             }
             std::cout << std::endl;
 
+            // A configured password takes priority: servers that offer both
+            // types still expect VncAuth when one was supplied.
+            auto password = get_configured_password();
+            uint8_t chosen_security_type{};
+            if (exist_vnc_auth && !password.empty()) {
+                chosen_security_type = security_type_vnc_auth;
+            }
+            else if (exist_none) {
+                chosen_security_type = security_type_none;
+            }
+            else if (exist_vnc_auth) {
+                throw std::runtime_error{"server requires VNC authentication but no password was configured"};
+            }
+            else {
+                throw std::runtime_error{"no mutually supported security type (only None and VNC Authentication are implemented)"};
+            }
+            std::cout << "security type: " << static_cast<int>(chosen_security_type) << std::endl;
+
             try{
-            parent::rfb_write(std::array<uint8_t, 1>{1});
+            parent::rfb_write(std::array<uint8_t, 1>{chosen_security_type});
             }
             catch (std::exception& e) {
                 throw std::runtime_error{std::format("security write fail: {}", e.what())};
+            }
+
+            if (chosen_security_type == security_type_vnc_auth) {
+                vnc_authenticate(password);
             }
 
             std::array<uint8_t, 4> security_result_buf{};
@@ -435,6 +472,9 @@ public:
 
             uint32_t security_result = from_big_endian_bytes(security_result_buf[0], security_result_buf[1], security_result_buf[2], security_result_buf[3]);
             std::cout << "security handshaking result: " << security_result << std::endl;
+            if (security_result != 0) {
+                throw std::runtime_error{std::format("authentication failed: {}", read_failure_reason())};
+            }
         }
         std::array<uint8_t,1> is_shared = {true};
         try{
@@ -445,6 +485,92 @@ public:
         }
         return 0;
     }
+
+private:
+    // Only present when a set_password_* layer is in the stack; without one the
+    // client simply negotiates the "None" security type as before.
+    std::string get_configured_password() {
+        if constexpr (requires (parent& p) { p.get_password(); }) {
+            return std::string{parent::get_password()};
+        }
+        else {
+            return {};
+        }
+    }
+
+    // RFB 3.8 sends a length-prefixed reason string after a failed handshake.
+    std::string read_failure_reason() {
+        try {
+            std::array<uint8_t, 4> length_buf{};
+            parent::rfb_read(length_buf);
+            uint32_t length = from_big_endian_bytes(length_buf[0], length_buf[1], length_buf[2], length_buf[3]);
+            std::vector<char> reason(length);
+            parent::rfb_read(reason);
+            return std::string{reason.begin(), reason.end()};
+        }
+        catch (std::exception&) {
+            return "<no reason given>";
+        }
+    }
+
+    // VNC Authentication: the server sends a 16 byte challenge, which the client
+    // DES-encrypts in two 8 byte blocks using the password as key. The password
+    // is truncated/zero-padded to 8 bytes and, per the protocol's historical
+    // quirk, each key byte has its bits reversed.
+    void vnc_authenticate(const std::string& password) {
+        std::array<uint8_t, 16> challenge{};
+        try{
+        parent::rfb_read(challenge);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error{std::format("vnc auth challenge read fail: {}", e.what())};
+        }
+
+        std::array<uint8_t, 8> key{};
+        for (size_t i = 0; i < key.size(); i++) {
+            uint8_t c = i < password.size() ? static_cast<uint8_t>(password[i]) : 0;
+            uint8_t reversed = 0;
+            for (int bit = 0; bit < 8; bit++) {
+                reversed |= ((c >> bit) & 1) << (7 - bit);
+            }
+            key[i] = reversed;
+        }
+
+        DES_key_schedule key_schedule{};
+        DES_set_key_unchecked(reinterpret_cast<const_DES_cblock*>(key.data()), &key_schedule);
+
+        std::array<uint8_t, 16> response{};
+        for (int block = 0; block < 2; block++) {
+            DES_ecb_encrypt(
+                    reinterpret_cast<const_DES_cblock*>(challenge.data() + block*8),
+                    reinterpret_cast<DES_cblock*>(response.data() + block*8),
+                    &key_schedule, DES_ENCRYPT);
+        }
+
+        try{
+        parent::rfb_write(response);
+        }
+        catch (std::exception& e) {
+            throw std::runtime_error{std::format("vnc auth response write fail: {}", e.what())};
+        }
+    }
+};
+
+// Supplies the password used by the VNC Authentication security type. Add it to
+// the bottom of the stack when connecting to a password protected server.
+template<typename T>
+class set_password_from_configure : public T {
+public:
+    using parent = T;
+    set_password_from_configure(const configure auto& conf) : parent{conf},
+        password{conf.password}
+    {
+    }
+    auto get_password() {
+        return password;
+    }
+private:
+    std::string password;
 };
 
 template<typename T>

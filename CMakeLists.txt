@@ -14,6 +14,7 @@ target_link_libraries(rfb PUBLIC
     avcodec
     avdevice
     avutil
+    crypto
     tbb
 )
 
@@ -57,7 +58,6 @@ target_link_libraries(rfb_recorder PUBLIC
 add_executable(test_hip
     test_hip.cpp
 )
-
 target_compile_features(test_hip PUBLIC cxx_std_20)
 
 target_link_libraries(test_hip PUBLIC
@@ -67,4 +67,15 @@ target_link_libraries(test_hip PUBLIC
     hip_helper
     drm_helper
     rfb
+)
+
+add_executable(rfb_input
+    input.cpp
+)
+
+target_compile_features(rfb_input PUBLIC cxx_std_20)
+
+target_link_libraries(rfb_input PUBLIC
+    rfb
+    swscale
 )
