@@ -31,6 +31,14 @@ using cpp_helper::empty_configurable_class;
 #include "h264.hpp"
 
 namespace rfb {
+
+// Thrown when the peer closes the connection, as distinct from an I/O error.
+// A clean shutdown is normal (the server exited, the tunnel dropped), so
+// callers generally want to unwind and quit rather than report a failure.
+struct connection_closed : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 enum class encoding : uint32_t {
     raw = 0,
     zrle = 16,
@@ -91,6 +99,9 @@ public:
             try{
             parent::rfb_read(rectangle);
             }
+            catch (connection_closed&) {
+                throw;
+            }
             catch (std::exception& e) {
                 throw std::runtime_error(std::format("framebuffer update rectangle read fail: {}", e.what()));
             }
@@ -115,6 +126,9 @@ public:
                 try{
                 parent::rfb_read(pixels);
                 }
+                catch (connection_closed&) {
+                    throw;
+                }
                 catch (std::exception& e) {
                     throw std::runtime_error(std::format("framebuffer update rectangle pixels read fail: {}",
                                 e.what()));
@@ -133,6 +147,9 @@ public:
                 try{
                 parent::rfb_read(length_buf);
                 }
+                catch (connection_closed&) {
+                    throw;
+                }
                 catch (std::exception& e) {
                     throw std::runtime_error("framebuffer update rectangle zrle length read fail");
                 }
@@ -142,6 +159,9 @@ public:
                 frame_network_byte_count += length;
                 try{
                 parent::rfb_read(zlib_data);
+                }
+                catch (connection_closed&) {
+                    throw;
                 }
                 catch (std::exception& e) {
                     throw std::runtime_error("framebuffer update rectangle zrle zlib data read fail");
@@ -236,6 +256,10 @@ public:
         connection{conf}
     {
     }
+    // A zero-length read means the peer performed an orderly shutdown. The
+    // previous code only treated negative returns as failure, so at EOF this
+    // loop spun forever without ever advancing s, wedging the caller's event
+    // loop and making the window impossible to close.
     void rfb_read(auto& buf) {
         size_t s = 0;
         size_t buf_bytes_count = buf.size()*sizeof(buf[0]);
@@ -244,11 +268,12 @@ public:
                     connection.get_socket(),
                     reinterpret_cast<char*>(buf.data())+s,
                     buf_bytes_count-s);
-            if (len <= 0)
-                throw std::runtime_error{"read fail"};
-            else {
-                s += len;
-            }
+            if (len == 0)
+                throw connection_closed{"server closed the connection"};
+            if (len < 0)
+                throw std::runtime_error{
+                    std::format("read fail: {}", socket_helper::last_error())};
+            s += len;
         }
     }
     void rfb_write(const auto& buf) {
@@ -259,11 +284,12 @@ public:
                     connection.get_socket(),
                     reinterpret_cast<const char*>(buf.data())+s,
                     buf_bytes_count-s);
-            if (len <= 0)
-                throw std::runtime_error{"write fail"};
-            else {
-                s += len;
-            }
+            if (len == 0)
+                throw connection_closed{"server closed the connection"};
+            if (len < 0)
+                throw std::runtime_error{
+                    std::format("write fail: {}", socket_helper::last_error())};
+            s += len;
         }
     }
     auto get_socket() {
@@ -320,6 +346,9 @@ public:
         try{
         parent::rfb_read(server_init_buf);
         }
+        catch (connection_closed&) {
+            throw;
+        }
         catch (std::exception& e) {
             throw std::runtime_error{std::format("server_init_buf read fail: {}", e.what())};
         }
@@ -344,6 +373,9 @@ public:
         name.resize(name_length);
         try{
         parent::rfb_read(name);
+        }
+        catch (connection_closed&) {
+            throw;
         }
         catch (std::exception& e) {
             std::cerr << "name parse fail" << std::endl;
@@ -394,6 +426,9 @@ public:
         try{
         parent::rfb_read(buf);
         }
+        catch (connection_closed&) {
+            throw;
+        }
         catch (std::exception& e) {
             throw std::runtime_error{std::format("client init fail: {}", e.what())};
         }
@@ -408,6 +443,9 @@ public:
         try{
         parent::rfb_write(buf);
         }
+        catch (connection_closed&) {
+            throw;
+        }
         catch (std::exception& e) {
             throw std::runtime_error{std::format("client init write fail: {}", e.what())};
         }
@@ -416,6 +454,9 @@ public:
             std::array<uint8_t,1> security_count{};
             try{
             parent::rfb_read(security_count);
+            }
+            catch (connection_closed&) {
+                throw;
             }
             catch (std::exception& e) {
                 throw std::runtime_error{std::format("security count read fail: {}", e.what())};
@@ -428,6 +469,9 @@ public:
             std::vector<uint8_t> security_types(security_count[0]);
             try{
             parent::rfb_read(security_types);
+            }
+            catch (connection_closed&) {
+                throw;
             }
             catch (std::exception& e) {
                 throw std::runtime_error{std::format("security types read fail: {}", e.what())};
@@ -462,6 +506,9 @@ public:
             try{
             parent::rfb_write(std::array<uint8_t, 1>{chosen_security_type});
             }
+            catch (connection_closed&) {
+                throw;
+            }
             catch (std::exception& e) {
                 throw std::runtime_error{std::format("security write fail: {}", e.what())};
             }
@@ -473,6 +520,9 @@ public:
             std::array<uint8_t, 4> security_result_buf{};
             try{
             parent::rfb_read(security_result_buf);
+            }
+            catch (connection_closed&) {
+                throw;
             }
             catch (std::exception& e) {
                 throw std::runtime_error{std::format("security result read fail: {}", e.what())};
@@ -487,6 +537,9 @@ public:
         std::array<uint8_t,1> is_shared = {true};
         try{
         parent::rfb_write(is_shared);
+        }
+        catch (connection_closed&) {
+            throw;
         }
         catch (std::exception& e) {
             throw std::runtime_error{std::format("send is_shared fail: {}", e.what())};
@@ -530,6 +583,9 @@ private:
         try{
         parent::rfb_read(challenge);
         }
+        catch (connection_closed&) {
+            throw;
+        }
         catch (std::exception& e) {
             throw std::runtime_error{std::format("vnc auth challenge read fail: {}", e.what())};
         }
@@ -557,6 +613,9 @@ private:
 
         try{
         parent::rfb_write(response);
+        }
+        catch (connection_closed&) {
+            throw;
         }
         catch (std::exception& e) {
             throw std::runtime_error{std::format("vnc auth response write fail: {}", e.what())};
@@ -636,11 +695,17 @@ public:
         try{
         parent::rfb_write(set_encodings);
         }
+        catch (connection_closed&) {
+            throw;
+        }
         catch (std::exception& e) {
             throw std::runtime_error{std::format("set encoding send fail: {}", e.what())};
         }
         try{
         parent::rfb_write(supported_encodings);
+        }
+        catch (connection_closed&) {
+            throw;
         }
         catch (std::exception& e) {
             throw std::runtime_error{std::format("supported_encodings send fail: {}", e.what())};
@@ -666,6 +731,9 @@ public:
         try{
         parent::rfb_write(set_format);
         }
+        catch (connection_closed&) {
+            throw;
+        }
         catch (std::exception& e) {
             throw std::runtime_error{std::format("set format send fail: {}", e.what())};
         }
@@ -690,6 +758,9 @@ public:
         try {
             parent::rfb_write(client_cut_text);
             parent::rfb_write(str);
+        }
+        catch (connection_closed&) {
+            throw;
         }
         catch (std::exception& e) {
             throw std::runtime_error{std::format("client cut text send fail: {}", e.what())};
@@ -751,6 +822,9 @@ public:
         try{
         parent::rfb_read(length_buf);
         }
+        catch (connection_closed&) {
+            throw;
+        }
         catch (std::exception& e) {
             throw std::runtime_error("server cut text length read fail");
         }
@@ -760,6 +834,9 @@ public:
         std::vector<char> text(length);
         try{
         parent::rfb_read(text);
+        }
+        catch (connection_closed&) {
+            throw;
         }
         catch (std::exception& e) {
             throw std::runtime_error("server cut text read fail");
@@ -786,6 +863,9 @@ public:
         try{
         parent::rfb_write(framebuffer_update_request);
         }
+        catch (connection_closed&) {
+            throw;
+        }
         catch (std::exception& e) {
             throw std::runtime_error{std::format("framebuffer update request send fail: {}", e.what())};
         }
@@ -801,6 +881,9 @@ public:
         try{
         parent::rfb_write(key_event);
         }
+        catch (connection_closed&) {
+            throw;
+        }
         catch (std::exception& e) {
             throw std::runtime_error{std::format("key event send fail: {}", e.what())};
         }
@@ -815,6 +898,9 @@ public:
         try{
         parent::rfb_write(pointer_event);
         }
+        catch (connection_closed&) {
+            throw;
+        }
         catch (std::exception& e) {
             throw std::runtime_error{std::format("pointer event send fail: {}", e.what())};
         }
@@ -823,6 +909,9 @@ public:
         std::array<uint8_t, 2> colour_count_buf{};
         try{
         parent::rfb_read(colour_count_buf);
+        }
+        catch (connection_closed&) {
+            throw;
         }
         catch (std::exception& e) {
             throw std::runtime_error("colour count read fail");
@@ -833,6 +922,9 @@ public:
         try{
         parent::rfb_read(colour_map_buf);
         }
+        catch (connection_closed&) {
+            throw;
+        }
         catch (std::exception& e) {
             throw std::runtime_error("colour map read fail");
         }
@@ -842,6 +934,9 @@ public:
         std::array<uint8_t, 4> framebuffer_update_head{};
         try{
         parent::rfb_read(framebuffer_update_head);
+        }
+        catch (connection_closed&) {
+            throw;
         }
         catch (std::exception& e) {
             throw std::runtime_error("framebuffer update head read fail");

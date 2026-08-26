@@ -419,6 +419,12 @@ public:
     void process_events(auto& fds) {
         assert(fds[FDS_INDEX].fd == parent::get_socket());
         auto now = std::chrono::steady_clock::now();
+        // The server can drop the connection without anything left to read, in
+        // which case only POLLHUP/POLLERR is set and the POLLIN branch below
+        // would never notice.
+        if (fds[FDS_INDEX].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            throw rfb::connection_closed{"server closed the connection"};
+        }
         if (fds[FDS_INDEX].revents & POLLIN) {
             parent::request_framebuffer_update(); // request next framebuffer, decrease delay, increase fps.
             parent::update_pointer_position(); // pointer and key events is after frame request to increase fps.
@@ -658,8 +664,14 @@ int main(int argc, const char* argv[]) {
         .password = std::move(password),
     };
     auto app = draw_app{conf};
+  } catch (rfb::connection_closed &e) {
+    // Normal termination, not a failure: the server went away, so there is
+    // nothing left to display.
+    std::cerr << e.what() << std::endl;
+    return 0;
   } catch (std::exception &e) {
     std::cerr << e.what() << std::endl;
+    return 1;
   }
   return 0;
 }
