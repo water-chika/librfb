@@ -8,6 +8,45 @@ Library for Remote Frame Buffer protocol.
 2. ZRLE
 3. H264
 
+## rfb_server
+
+`rfb_server` is the server half of the protocol: it exports the local desktop
+and replays the keyboard and pointer events a viewer sends back. It is aimed
+at Windows 11, where it captures through GDI and injects input with
+`SendInput`. On other platforms it serves an animated test pattern instead,
+which is what the Linux build is for.
+
+```
+rfb_server [--port 5900] [--listen 127.0.0.1] [--password <pw>] [--name <text>]
+           [--view-only] [--fps 20] [--all-monitors] [--no-cursor]
+```
+
+- Protocol versions 3.3, 3.7 and 3.8, security types None and VNC
+  Authentication, Raw and ZRLE encodings.
+- Only 8 characters of `--password` are significant: VNC Authentication uses
+  the password as a DES key. It is not transport encryption, so tunnel the
+  connection (`ssh -L 5900:127.0.0.1:5900 host`) and pair it with
+  `--listen 127.0.0.1` when the network is not trusted.
+- Clipboard transfers both ways on Windows.
+- Multiple viewers can connect at once; each gets its own thread, encoder and
+  zlib stream.
+- `rfb_server` deliberately does not link the `rfb` library, so it needs only
+  zlib and OpenSSL — no ffmpeg.
+
+### Windows: it must run in the interactive session
+
+A process started over SSH, or by a service, lands in **session 0**, which has
+no visible desktop: capture comes back empty and injected input goes nowhere.
+`rfb_server` warns when it detects this. Start it inside the logged-in session
+instead, e.g. with Sysinternals PsExec:
+
+```bat
+PsExec64.exe -accepteula -d -i 1 -s C:\path\to\rfb_server.exe --port 5900 --password secret
+```
+
+`-i 1` is the session ID from `query session`. A scheduled task created with
+`/it` works too.
+
 ## rfb window demo
 
 `rfb_window_demo` renders to a Wayland surface using DRM (amdgpu BOs exported as
@@ -21,6 +60,7 @@ dma-buf) shared with ROCm/HIP via external memory. Vulkan is no longer used.
 | `rfb_demo` | yes | yes |
 | `rfb_input` | yes | yes |
 | `rfb_recorder` | yes | yes |
+| `rfb_server` | test pattern | yes |
 | `rfb_window_demo` | yes | no |
 | `test_hip` | yes | no |
 
@@ -47,7 +87,8 @@ TBB is not needed on Windows. `h264.hpp` uses
 `std::for_each(std::execution::par, ...)`, and only libstdc++ delegates its
 parallel algorithms to TBB; the MSVC STL implements them natively.
 
-The `zlib` and `x264` ffmpeg features are not optional:
+The `zlib` and `x264` ffmpeg features are not optional (`rfb_server` needs
+neither — it only links zlib and OpenSSL):
 
 - `zlib` provides the **PNG encoder**, which `rfb_input --capture` needs.
 - `x264` provides the **H.264 encoder**, which `rfb_recorder` needs. It pulls

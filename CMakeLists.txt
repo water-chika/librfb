@@ -97,6 +97,42 @@ target_link_libraries(rfb_input PUBLIC
     ${RFB_SWSCALE_LIBS}
 )
 
+# The server shares only the socket helpers with the client library, so it
+# deliberately does not link rfb: that would drag ffmpeg in for no reason.
+add_executable(rfb_server
+    server.cpp
+    server.hpp
+    server_encode.hpp
+    server_platform.hpp
+    keysym.hpp
+)
+
+target_compile_features(rfb_server PUBLIC cxx_std_20)
+
+target_include_directories(rfb_server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(rfb_server PUBLIC
+    cpp_helper
+    socket_helper
+    ZLIB::ZLIB
+    OpenSSL::Crypto
+)
+
+if(WIN32)
+    # GDI capture and SendInput.
+    target_link_libraries(rfb_server PUBLIC gdi32 user32)
+    target_compile_definitions(rfb_server PUBLIC ${RFB_PLATFORM_DEFINITIONS})
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(rfb_server PUBLIC Threads::Threads)
+endif()
+
+if(MSVC)
+    target_compile_options(rfb_server PUBLIC /utf-8 /Zc:__cplusplus /EHsc)
+endif()
+
 # The window demo and the HIP test render through Wayland + DRM/amdgpu + HIP
 # external memory, which have no Windows equivalent.
 if(UNIX)
