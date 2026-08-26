@@ -8,9 +8,10 @@ Library for Remote Frame Buffer protocol.
 2. ZRLE
 3. H264
 
-## TODO
+## rfb window demo
 
-1. rfb window demo: Replace Vulkan with DRM + (C++ GPU extension, like CUDA or ROCm).
+`rfb_window_demo` renders to a Wayland surface using DRM (amdgpu BOs exported as
+dma-buf) shared with ROCm/HIP via external memory. Vulkan is no longer used.
 
 ## Reference
 
