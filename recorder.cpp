@@ -84,7 +84,11 @@ std::string make_segment_path(const std::string& output_path, bool segmented) {
     auto [stem, ext] = split_stem_ext(output_path);
     auto t = std::time(nullptr);
     std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
     localtime_r(&t, &tm);
+#endif
     char timestamp[32];
     std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &tm);
     return stem + "_" + timestamp + (ext.empty() ? ".mp4" : ext);

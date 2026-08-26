@@ -11,9 +11,11 @@ extern "C" {
 #include <openssl/des.h>
 
 #include <array>
+#include <chrono>
 #include <iostream>
 #include <map>
 #include <string>
+#include <thread>
 
 #include <cpp_helper.hpp>
 #include <socket_helper.hpp>
@@ -235,11 +237,14 @@ public:
     {
     }
     void rfb_read(auto& buf) {
-        int s = 0;
+        size_t s = 0;
         size_t buf_bytes_count = buf.size()*sizeof(buf[0]);
         while (s < buf_bytes_count) {
-            auto len = read(connection.get_socket(), buf.data()+s, buf_bytes_count-s);
-            if (len < 0)
+            auto len = socket_helper::read_socket(
+                    connection.get_socket(),
+                    reinterpret_cast<char*>(buf.data())+s,
+                    buf_bytes_count-s);
+            if (len <= 0)
                 throw std::runtime_error{"read fail"};
             else {
                 s += len;
@@ -247,11 +252,14 @@ public:
         }
     }
     void rfb_write(const auto& buf) {
-        int s = 0;
+        size_t s = 0;
         size_t buf_bytes_count = buf.size()*sizeof(buf[0]);
         while (s < buf_bytes_count) {
-            auto len = write(connection.get_socket(), buf.data()+s, buf_bytes_count-s);
-            if (len < 0)
+            auto len = socket_helper::write_socket(
+                    connection.get_socket(),
+                    reinterpret_cast<const char*>(buf.data())+s,
+                    buf_bytes_count-s);
+            if (len <= 0)
                 throw std::runtime_error{"write fail"};
             else {
                 s += len;
@@ -882,7 +890,7 @@ static int rfb_process(auto host, auto port) {
     while (true) {
         rfb.framebuffer_update_request(0, 0, rfb.get_width(), rfb.get_height());
         rfb.process_server_message();
-        sleep(1);
+        std::this_thread::sleep_for(std::chrono::seconds{1});
     }
 }
 

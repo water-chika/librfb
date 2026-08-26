@@ -16,7 +16,6 @@ extern "C" {
 }
 
 #include <chrono>
-#include <poll.h>
 #include <cstring>
 #include <format>
 #include <fstream>
@@ -189,7 +188,7 @@ void wait_for_frame(auto& client, int width, int height, int timeout_ms, int qui
         pollfd fd{};
         fd.fd = client.get_socket();
         fd.events = POLLIN;
-        int ready = poll(&fd, 1, quiet_ms);
+        int ready = socket_helper::poll_sockets(&fd, 1, quiet_ms);
         if (ready < 0) {
             throw std::runtime_error("poll on rfb socket failed");
         }
