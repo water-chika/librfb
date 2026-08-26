@@ -47,6 +47,46 @@ PsExec64.exe -accepteula -d -i 1 -s C:\path\to\rfb_server.exe --port 5900 --pass
 `-i 1` is the session ID from `query session`. A scheduled task created with
 `/it` works too.
 
+PsExec gives the server its own console in the target session and does **not**
+relay its output back, so to keep a log, redirect inside the target session:
+
+```bat
+PsExec64.exe -accepteula -d -i 1 -s cmd /c "C:\path\to\rfb_server.exe --port 5900 --password secret > C:\path\to\rfb_server.log 2>&1"
+```
+
+### Planned: H264 encoding
+
+The server currently negotiates Raw and ZRLE only; a client offering H264 (50)
+is served ZRLE. Adding it means, in dependency order:
+
+1. **Optional dependency.** Guard the encoder with a CMake option
+   (`RFB_SERVER_H264`, default `OFF`) that pulls in libavcodec/libavutil/
+   libswscale and defines `RFB_SERVER_HAS_H264`. The default Windows build has
+   to stay ffmpeg-free — that is the reason `rfb_server` does not link `rfb`.
+2. **Encoder.** A `server_h264.hpp` with an `h264_encoder` mirroring
+   `zrle_encoder`'s interface: per-session libx264 (`veryfast`,
+   `zerolatency`, no B-frames) plus libswscale converting the internal 32bpp
+   BGRX buffer to YUV420P. `recorder.cpp` already does that conversion.
+3. **Wire format.** After the usual 12-byte rect header with encoding 50, the
+   client reads a big-endian `uint32` length and a big-endian `uint32` flags
+   word, then that many bytes of H264 fed straight to avcodec
+   (`rfb.hpp`). `flags` is currently parsed and ignored; its meaning needs
+   defining, and is the natural place to mark a keyframe.
+4. **Rect geometry.** H264 cannot use the 64x64 dirty rectangles
+   `collect_dirty()` produces, because the encoder needs a stream of fixed
+   size. Send one full-screen rect per update and keep dirty detection only to
+   decide whether to send a frame at all. Force an IDR on the first frame of a
+   session and on any desktop size change.
+5. **Negotiation.** Replace the `m_zrle_supported` flag with an ordered
+   preference list so 50 can win over 16 and 0, and only when the build has the
+   encoder.
+6. **Colour space.** The client's H264 colour space is still wrong (see the
+   hand-written coefficient table in `h264.hpp`), so pin range and matrix on
+   both sides before trusting any output.
+7. **Verification.** Same standard the ZRLE path was held to: decode a known
+   pattern and count mismatching pixels, then compare a capture against a ZRLE
+   capture of the same static screen, expecting only lossy-codec noise.
+
 ## rfb window demo
 
 `rfb_window_demo` renders to a Wayland surface using DRM (amdgpu BOs exported as

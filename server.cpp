@@ -48,6 +48,10 @@ int parse_int(const std::string& text, const char* what) {
 
 int main(int argc, char** argv) {
     using namespace rfb::server;
+    // The log is usually redirected to a file or a pipe, where stdout is
+    // block buffered: without this, nothing shows up until several kilobytes
+    // of log have accumulated, which for a quiet server can be never.
+    std::cout << std::unitbuf;
     try {
         server_options options{};
         options.desktop_name = default_desktop_name();
