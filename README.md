@@ -35,13 +35,17 @@ The CMake files use plain `find_package`, so any provider works; vcpkg is the
 easiest:
 
 ```bat
-vcpkg install zlib:x64-windows openssl:x64-windows tbb:x64-windows ^
+vcpkg install zlib:x64-windows openssl:x64-windows ^
     "ffmpeg[avcodec,avformat,avdevice,swscale,zlib,x264]:x64-windows"
 
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
     -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
 ```
+
+TBB is not needed on Windows. `h264.hpp` uses
+`std::for_each(std::execution::par, ...)`, and only libstdc++ delegates its
+parallel algorithms to TBB; the MSVC STL implements them natively.
 
 The `zlib` and `x264` ffmpeg features are not optional:
 

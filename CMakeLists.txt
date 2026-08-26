@@ -7,12 +7,14 @@ find_package(OpenSSL REQUIRED)
 
 if(WIN32)
     # vcpkg ships a FindFFMPEG module that resolves the whole set of av*
-    # libraries in one go, and TBB only has a config-mode package there.
+    # libraries in one go.
     find_package(FFMPEG REQUIRED)
-    find_package(TBB CONFIG REQUIRED)
     set(RFB_FFMPEG_LIBS ${FFMPEG_LIBRARIES})
     set(RFB_FFMPEG_INCLUDE_DIRS ${FFMPEG_INCLUDE_DIRS})
-    set(RFB_TBB_LIBS TBB::tbb)
+    # No TBB here. h264.hpp uses std::for_each(std::execution::par, ...), and
+    # only libstdc++ farms its parallel algorithms out to TBB; the MSVC STL
+    # implements them natively.
+    set(RFB_TBB_LIBS "")
     # ws2_32 provides Winsock; the rest silences MSVC's CRT/min-max noise.
     set(RFB_PLATFORM_LIBS ws2_32)
     set(RFB_PLATFORM_DEFINITIONS WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
