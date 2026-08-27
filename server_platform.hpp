@@ -10,6 +10,8 @@
 #include <cstring>
 #include <chrono>
 #include <cmath>
+#include <format>
+#include <iostream>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -74,11 +76,82 @@ inline void make_process_dpi_aware() {
     ::SetProcessDPIAware();
 }
 
+// Moves the process onto the interactive window station. A process launched by
+// a service - PsExec -i, PSEXESVC, a scheduled task - inherits the service
+// window station (Service-0x0-3e7$), whose only desktop is not the one the user
+// sees, so OpenInputDesktop there fails with ERROR_ACCESS_DENIED.
+inline bool attach_process_to_interactive_window_station() {
+    // Never closed on purpose: the process keeps using it until it exits, and
+    // closing a window station still in use is undefined.
+    static HWINSTA attached = nullptr;
+    if (attached != nullptr) {
+        return true;
+    }
+    HWINSTA station = ::OpenWindowStationW(
+        L"WinSta0", FALSE,
+        WINSTA_ENUMDESKTOPS | WINSTA_READATTRIBUTES | WINSTA_ACCESSCLIPBOARD |
+            WINSTA_CREATEDESKTOP | WINSTA_WRITEATTRIBUTES |
+            WINSTA_ACCESSGLOBALATOMS | WINSTA_EXITWINDOWS | WINSTA_ENUMERATE |
+            WINSTA_READSCREEN);
+    if (station == nullptr) {
+        return false;
+    }
+    if (!::SetProcessWindowStation(station)) {
+        ::CloseWindowStation(station);
+        return false;
+    }
+    attached = station;
+    return true;
+}
+
+// Points the calling thread at the desktop that currently receives input.
+// A process started outside the interactive shell - by PsExec -i, by a service,
+// or by a scheduled task - starts out on some other desktop of the window
+// station, where GetDC(nullptr) still succeeds but every BitBlt from it fails.
+// The input desktop also changes when the session locks or a UAC prompt takes
+// over, so this is re-run whenever a capture fails.
+inline bool attach_thread_to_input_desktop(HDESK& current) {
+    // Only what GDI capture needs. Asking for DESKTOP_JOURNALRECORD /
+    // DESKTOP_JOURNALPLAYBACK / DESKTOP_SWITCHDESKTOP as well makes
+    // OpenInputDesktop fail with ERROR_ACCESS_DENIED for a plain user token.
+    constexpr DWORD desktop_access = DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS |
+                                     DESKTOP_CREATEWINDOW | DESKTOP_ENUMERATE;
+
+    HDESK desktop = ::OpenInputDesktop(0, FALSE, desktop_access);
+    if (desktop == nullptr && ::GetLastError() == ERROR_ACCESS_DENIED &&
+        attach_process_to_interactive_window_station()) {
+        desktop = ::OpenInputDesktop(0, FALSE, desktop_access);
+    }
+    if (desktop == nullptr) {
+        return false;
+    }
+    if (!::SetThreadDesktop(desktop)) {
+        ::CloseDesktop(desktop);
+        return false;
+    }
+    // The old handle can only be closed once no thread is using it any more,
+    // which SetThreadDesktop above has just guaranteed.
+    if (current != nullptr) {
+        ::CloseDesktop(current);
+    }
+    current = desktop;
+    return true;
+}
+
 class screen_capture {
 public:
     explicit screen_capture(const capture_options& options)
         : m_options{options} {
         make_process_dpi_aware();
+        // Best effort: this fails when the process runs in a session with no
+        // desktop at all, in which case capture() reports the failure instead.
+        bool attached = attach_thread_to_input_desktop(m_desktop);
+        std::cerr << std::format(
+            "capture context: window station '{}', desktop '{}', input desktop "
+            "attach {}\n",
+            current_window_station_name(), current_desktop_name(),
+            attached ? "ok"
+                     : std::format("failed (error {})", ::GetLastError()));
         m_screen_dc = ::GetDC(nullptr);
         if (m_screen_dc == nullptr) {
             throw std::runtime_error{"GetDC(nullptr) fail"};
@@ -89,15 +162,9 @@ public:
     screen_capture(const screen_capture&) = delete;
     screen_capture& operator=(const screen_capture&) = delete;
     ~screen_capture() {
-        if (m_memory_dc != nullptr) {
-            ::SelectObject(m_memory_dc, m_old_bitmap);
-            ::DeleteDC(m_memory_dc);
-        }
-        if (m_bitmap != nullptr) {
-            ::DeleteObject(m_bitmap);
-        }
-        if (m_screen_dc != nullptr) {
-            ::ReleaseDC(nullptr, m_screen_dc);
+        release_gdi();
+        if (m_desktop != nullptr) {
+            ::CloseDesktop(m_desktop);
         }
     }
 
@@ -114,9 +181,36 @@ public:
     bool capture(frame_buffer& frame) {
         // CAPTUREBLT includes layered windows, which is most of the modern
         // Windows 11 shell.
-        if (!::BitBlt(m_memory_dc, 0, 0, m_width, m_height, m_screen_dc,
-                      m_origin_x, m_origin_y, SRCCOPY | CAPTUREBLT)) {
-            return false;
+        if (!blit()) {
+            DWORD blit_error = ::GetLastError();
+            // Either the input desktop changed under us (lock screen, UAC) or
+            // this process was never on it to begin with. Re-attach and retry
+            // once; the DCs belong to the old desktop, so they go too.
+            if (!attach_thread_to_input_desktop(m_desktop)) {
+                m_diagnostic = std::format(
+                    "BitBlt failed (error {}) and OpenInputDesktop/"
+                    "SetThreadDesktop failed (error {})",
+                    blit_error, ::GetLastError());
+                return false;
+            }
+            release_gdi();
+            m_screen_dc = ::GetDC(nullptr);
+            if (m_screen_dc == nullptr) {
+                m_diagnostic = std::format(
+                    "GetDC(nullptr) failed after re-attaching to the input "
+                    "desktop (error {})",
+                    ::GetLastError());
+                return false;
+            }
+            query_geometry();
+            create_dib();
+            if (!blit()) {
+                m_diagnostic = std::format(
+                    "BitBlt failed (error {}) even after re-attaching to "
+                    "input desktop '{}'",
+                    ::GetLastError(), current_desktop_name());
+                return false;
+            }
         }
         if (m_options.draw_cursor) {
             draw_cursor();
@@ -127,10 +221,57 @@ public:
         // The DIB is bottom-up-free (negative height), so its rows already
         // match the framebuffer order.
         std::memcpy(frame.pixels.data(), m_bits, frame.pixels.size());
+        m_diagnostic.clear();
         return true;
     }
 
+    // Why the last capture() failed, for logging. Empty after a good capture.
+    const std::string& diagnostic() const { return m_diagnostic; }
+
 private:
+    static std::string user_object_name(HANDLE object) {
+        if (object == nullptr) {
+            return "<none>";
+        }
+        char name[256]{};
+        DWORD needed = 0;
+        if (!::GetUserObjectInformationA(object, UOI_NAME, name, sizeof(name),
+                                         &needed)) {
+            return "<unknown>";
+        }
+        return std::string{name};
+    }
+
+    static std::string current_window_station_name() {
+        return user_object_name(::GetProcessWindowStation());
+    }
+
+    static std::string current_desktop_name() {
+        return user_object_name(::GetThreadDesktop(::GetCurrentThreadId()));
+    }
+
+    bool blit() {
+        return ::BitBlt(m_memory_dc, 0, 0, m_width, m_height, m_screen_dc,
+                        m_origin_x, m_origin_y, SRCCOPY | CAPTUREBLT) != FALSE;
+    }
+
+    void release_gdi() {
+        if (m_memory_dc != nullptr) {
+            ::SelectObject(m_memory_dc, m_old_bitmap);
+            ::DeleteDC(m_memory_dc);
+            m_memory_dc = nullptr;
+        }
+        if (m_bitmap != nullptr) {
+            ::DeleteObject(m_bitmap);
+            m_bitmap = nullptr;
+        }
+        if (m_screen_dc != nullptr) {
+            ::ReleaseDC(nullptr, m_screen_dc);
+            m_screen_dc = nullptr;
+        }
+        m_bits = nullptr;
+    }
+
     void query_geometry() {
         if (m_options.all_monitors) {
             m_origin_x = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -190,6 +331,8 @@ private:
     }
 
     capture_options m_options;
+    std::string m_diagnostic{};
+    HDESK m_desktop{};
     HDC m_screen_dc{};
     HDC m_memory_dc{};
     HBITMAP m_bitmap{};
@@ -456,6 +599,209 @@ private:
     DWORD m_last_sequence{};
 };
 
+// Boot-time supervisor.
+//
+// A desktop can only be captured from a process inside that desktop's session,
+// but anything that starts at boot - a service, or a scheduled task with an
+// "At startup" trigger - runs in session 0, which has no desktop. Logon items
+// are in the right session but only start after somebody logs in.
+//
+// This bridges the two: it runs in session 0 as LocalSystem, and launches the
+// real server into whatever session is currently attached to the console,
+// which exists from boot onwards (showing the logon screen until someone signs
+// in). The worker is restarted if it exits or if the console session changes,
+// e.g. on Fast User Switching.
+class console_session_launcher {
+public:
+    console_session_launcher(std::wstring executable, std::wstring command_line)
+        : m_executable{std::move(executable)},
+          m_command_line{std::move(command_line)} {}
+
+    // Never returns under normal operation.
+    int run() {
+        for (;;) {
+            DWORD session = ::WTSGetActiveConsoleSessionId();
+            if (session == 0xFFFFFFFF) {
+                // No console session at all: the machine is mid-transition.
+                std::cout << "no active console session, waiting\n";
+                ::Sleep(retry_delay_ms);
+                continue;
+            }
+            if (!launch_worker(session)) {
+                ::Sleep(retry_delay_ms);
+                continue;
+            }
+            supervise(session);
+        }
+    }
+
+private:
+    static constexpr DWORD retry_delay_ms = 2000;
+    static constexpr DWORD poll_interval_ms = 1000;
+
+    bool launch_worker(DWORD session) {
+        HANDLE own_token = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(),
+                                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+                                &own_token)) {
+            std::cout << std::format("OpenProcessToken failed (error {})\n",
+                                     ::GetLastError());
+            return false;
+        }
+        HANDLE session_token = nullptr;
+        BOOL duplicated = ::DuplicateTokenEx(own_token, MAXIMUM_ALLOWED, nullptr,
+                                             SecurityImpersonation, TokenPrimary,
+                                             &session_token);
+        ::CloseHandle(own_token);
+        if (!duplicated) {
+            std::cout << std::format("DuplicateTokenEx failed (error {})\n",
+                                     ::GetLastError());
+            return false;
+        }
+        // Moving the token into the console session is what makes the child
+        // land on a real desktop instead of session 0. It needs the
+        // SE_TCB_NAME privilege, which LocalSystem has and nobody else does.
+        if (!::SetTokenInformation(session_token, TokenSessionId, &session,
+                                   sizeof(session))) {
+            std::cout << std::format(
+                "SetTokenInformation(TokenSessionId={}) failed (error {}); the "
+                "launcher must run as LocalSystem\n",
+                session, ::GetLastError());
+            ::CloseHandle(session_token);
+            return false;
+        }
+
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        // Named explicitly so the child starts on the interactive desktop even
+        // though the launcher itself has none.
+        std::wstring desktop = L"WinSta0\\Default";
+        startup.lpDesktop = desktop.data();
+        startup.dwFlags = STARTF_USESHOWWINDOW;
+        startup.wShowWindow = SW_HIDE;
+
+        PROCESS_INFORMATION process{};
+        std::wstring command_line = m_command_line;
+        BOOL created = ::CreateProcessAsUserW(
+            session_token, m_executable.c_str(), command_line.data(), nullptr,
+            nullptr, FALSE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            nullptr, nullptr, &startup, &process);
+        DWORD create_error = ::GetLastError();
+        ::CloseHandle(session_token);
+        if (!created) {
+            std::cout << std::format(
+                "CreateProcessAsUser into session {} failed (error {})\n",
+                session, create_error);
+            return false;
+        }
+        ::CloseHandle(process.hThread);
+        m_worker = process.hProcess;
+        std::cout << std::format("started worker pid {} in session {}\n",
+                                 process.dwProcessId, session);
+        return true;
+    }
+
+    // Waits for the worker to exit, or for the console session to move
+    // somewhere else, in which case the worker is on a dead desktop and has to
+    // be replaced.
+    void supervise(DWORD session) {
+        for (;;) {
+            DWORD waited = ::WaitForSingleObject(m_worker, poll_interval_ms);
+            if (waited == WAIT_OBJECT_0) {
+                DWORD code = 0;
+                ::GetExitCodeProcess(m_worker, &code);
+                ::CloseHandle(m_worker);
+                m_worker = nullptr;
+                std::cout << std::format("worker exited with code {}, restarting\n",
+                                         code);
+                ::Sleep(retry_delay_ms);
+                return;
+            }
+            if (::WTSGetActiveConsoleSessionId() != session) {
+                std::cout << "console session changed, restarting worker\n";
+                ::TerminateProcess(m_worker, 0);
+                ::WaitForSingleObject(m_worker, 5000);
+                ::CloseHandle(m_worker);
+                m_worker = nullptr;
+                return;
+            }
+        }
+    }
+
+    std::wstring m_executable;
+    std::wstring m_command_line;
+    HANDLE m_worker{};
+};
+
+// Full path of the running executable, so the launcher can re-run itself.
+inline std::wstring own_executable_path() {
+    std::wstring path(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD written = ::GetModuleFileNameW(nullptr, path.data(),
+                                             static_cast<DWORD>(path.size()));
+        if (written == 0) {
+            throw std::runtime_error{"GetModuleFileName fail"};
+        }
+        if (written < path.size()) {
+            path.resize(written);
+            return path;
+        }
+        path.resize(path.size() * 2);
+    }
+}
+
+inline std::wstring widen(const std::string& text) {
+    if (text.empty()) return {};
+    int size = ::MultiByteToWideChar(CP_UTF8, 0, text.data(),
+                                     static_cast<int>(text.size()), nullptr, 0);
+    std::wstring wide(static_cast<size_t>(size), L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, text.data(),
+                          static_cast<int>(text.size()), wide.data(), size);
+    return wide;
+}
+
+// Builds a command line for CreateProcess out of already-parsed arguments.
+// Quoting follows the rules CommandLineToArgvW undoes.
+inline std::wstring quote_argument(const std::wstring& argument) {
+    if (!argument.empty() &&
+        argument.find_first_of(L" \t\"") == std::wstring::npos) {
+        return argument;
+    }
+    std::wstring quoted = L"\"";
+    for (size_t i = 0; i < argument.size(); i++) {
+        size_t backslashes = 0;
+        while (i < argument.size() && argument[i] == L'\\') {
+            backslashes++;
+            i++;
+        }
+        if (i == argument.size()) {
+            quoted.append(backslashes * 2, L'\\');
+            break;
+        }
+        if (argument[i] == L'"') {
+            quoted.append(backslashes * 2 + 1, L'\\');
+        }
+        else {
+            quoted.append(backslashes, L'\\');
+        }
+        quoted.push_back(argument[i]);
+    }
+    quoted.push_back(L'"');
+    return quoted;
+}
+
+// Runs the console-session launcher for a worker started with worker_args.
+inline int run_console_launcher(const std::vector<std::string>& worker_args) {
+    auto executable = own_executable_path();
+    std::wstring command_line = quote_argument(executable);
+    for (const auto& argument : worker_args) {
+        command_line.push_back(L' ');
+        command_line.append(quote_argument(widen(argument)));
+    }
+    console_session_launcher launcher{executable, command_line};
+    return launcher.run();
+}
+
 #else // !_WIN32
 
 // There is no portable desktop capture outside Windows, so the fallback draws
@@ -496,7 +842,11 @@ public:
         return true;
     }
 
+    const std::string& diagnostic() const { return m_diagnostic; }
+
 private:
+    std::string m_diagnostic{};
+
     void draw_cursor(frame_buffer& frame, int phase) {
         int cx = 40 + (phase * 3) % (m_width - 80);
         int cy = m_height / 2 + static_cast<int>(80 * std::sin(phase * 0.05));
@@ -532,6 +882,14 @@ public:
 private:
     std::string m_text;
 };
+
+// Sessions and desktops in the Windows sense do not exist here, so there is
+// nothing to bridge: an init system starts the server directly.
+inline int run_console_launcher(const std::vector<std::string>&) {
+    throw std::runtime_error{
+        "--console-launcher is a Windows-only mechanism; on this platform run "
+        "the server directly from your init system"};
+}
 
 #endif // _WIN32
 

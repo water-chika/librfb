@@ -20,6 +20,12 @@ void print_usage() {
         "  --fps <n>           maximum capture rate (default 20)\n"
         "  --all-monitors      capture the whole virtual desktop\n"
         "  --no-cursor         do not draw the mouse cursor into the image\n"
+        "  --console-launcher  (Windows) do not serve anything directly;\n"
+        "                      instead launch the server into the session that\n"
+        "                      is attached to the console, and keep it there.\n"
+        "                      Run this as LocalSystem from a boot-time task:\n"
+        "                      it is the only way to have a desktop server\n"
+        "                      running before anyone logs in\n"
         "  --help              show this message\n";
 }
 
@@ -55,6 +61,11 @@ int main(int argc, char** argv) {
     try {
         server_options options{};
         options.desktop_name = default_desktop_name();
+
+        // Collected so the launcher can hand the very same options to the
+        // worker it starts in the console session.
+        bool console_launcher = false;
+        std::vector<std::string> worker_args{};
 
         for (int i = 1; i < argc; i++) {
             std::string argument{argv[i]};
@@ -98,10 +109,25 @@ int main(int argc, char** argv) {
             else if (argument == "--no-cursor") {
                 options.capture.draw_cursor = false;
             }
+            else if (argument == "--console-launcher") {
+                console_launcher = true;
+            }
             else {
                 throw std::runtime_error{
                     std::format("unknown option: {}", argument)};
             }
+        }
+
+        if (console_launcher) {
+            // The worker gets every option except the one that made this
+            // process a launcher, so both sides always agree on the port,
+            // password and capture settings.
+            for (int i = 1; i < argc; i++) {
+                if (std::string{argv[i]} != "--console-launcher") {
+                    worker_args.emplace_back(argv[i]);
+                }
+            }
+            return run_console_launcher(worker_args);
         }
 
         if (options.password.empty()) {

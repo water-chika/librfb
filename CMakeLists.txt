@@ -97,6 +97,17 @@ target_link_libraries(rfb_input PUBLIC
     ${RFB_SWSCALE_LIBS}
 )
 
+add_executable(rfb_clipboard
+    clipboard.cpp
+)
+
+target_compile_features(rfb_clipboard PUBLIC cxx_std_20)
+
+target_link_libraries(rfb_clipboard PUBLIC
+    rfb
+    ${RFB_SWSCALE_LIBS}
+)
+
 # The server shares only the socket helpers with the client library, so it
 # deliberately does not link rfb: that would drag ffmpeg in for no reason.
 add_executable(rfb_server

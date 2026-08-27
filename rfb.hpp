@@ -92,7 +92,7 @@ public:
 
     auto process_framebuffer_update(auto& framebuffer_update_head) {
         uint16_t rectangles_count = from_big_endian_bytes(framebuffer_update_head[2], framebuffer_update_head[3]);
-        //std::cout << "rectangles count: " << rectangles_count << std::endl;
+        //std::cerr << "rectangles count: " << rectangles_count << std::endl;
         std::vector<uint8_t> last_update{};
         for (uint16_t i = 0; i < rectangles_count; i++) {
             std::array<uint8_t, 12> rectangle{};
@@ -114,11 +114,11 @@ public:
             encoding_type = static_cast<encoding>(from_big_endian_bytes(rectangle[8], rectangle[9], rectangle[10], rectangle[11]));
             frame_network_byte_count = 0;
             if (false) {
-                std::cout << "x: " << x << std::endl;
-                std::cout << "y: " << y << std::endl;
-                std::cout << "width: " << width << std::endl;
-                std::cout << "height: " << height << std::endl;
-                std::cout << "encoding_type: " << encoding_type << std::endl;
+                std::cerr << "x: " << x << std::endl;
+                std::cerr << "y: " << y << std::endl;
+                std::cerr << "width: " << width << std::endl;
+                std::cerr << "height: " << height << std::endl;
+                std::cerr << "encoding_type: " << encoding_type << std::endl;
             }
             if (encoding_type == encoding::raw) {
                 auto pixels = std::vector<uint8_t>(width*height*4);
@@ -154,7 +154,7 @@ public:
                     throw std::runtime_error("framebuffer update rectangle zrle length read fail");
                 }
                 auto length = from_big_endian_bytes(length_buf[0], length_buf[1], length_buf[2], length_buf[3]);
-                //std::cout << "zlib length: " << length << std::endl;
+                //std::cerr << "zlib length: " << length << std::endl;
                 auto zlib_data = std::vector<uint8_t>(length);
                 frame_network_byte_count += length;
                 try{
@@ -369,7 +369,7 @@ public:
         server_pixel_format.padding2 = server_init_buf[19];
 
         name_length = from_big_endian_bytes(server_init_buf[20], server_init_buf[21], server_init_buf[22], server_init_buf[23]);
-        std::cout << "name length: " << name_length << std::endl;
+        std::cerr << "name length: " << name_length << std::endl;
         name.resize(name_length);
         try{
         parent::rfb_read(name);
@@ -380,15 +380,15 @@ public:
         catch (std::exception& e) {
             std::cerr << "name parse fail" << std::endl;
         }
-        std::cout << "fb resolution: " << fb_width << "x" << fb_height << std::endl;
-        std::cout << "bpp: " << (int)server_pixel_format.bits_per_pixel << std::endl;
-        std::cout << "depth: " << (int)server_pixel_format.depth << std::endl;
-        std::cout << "big endian: " << (int)server_pixel_format.big_endian_flag << std::endl;
-        std::cout << "true colour: " << (int)server_pixel_format.true_colour_flag << std::endl;
-        std::cout << "color max: " << server_pixel_format.red_max << ", " << server_pixel_format.green_max << ", " << server_pixel_format.blue_max << std::endl;
-        std::cout << "color shift: " << (int)server_pixel_format.red_shift << ", " << (int)server_pixel_format.green_shift << ", " << (int)server_pixel_format.blue_shift << std::endl;
+        std::cerr << "fb resolution: " << fb_width << "x" << fb_height << std::endl;
+        std::cerr << "bpp: " << (int)server_pixel_format.bits_per_pixel << std::endl;
+        std::cerr << "depth: " << (int)server_pixel_format.depth << std::endl;
+        std::cerr << "big endian: " << (int)server_pixel_format.big_endian_flag << std::endl;
+        std::cerr << "true colour: " << (int)server_pixel_format.true_colour_flag << std::endl;
+        std::cerr << "color max: " << server_pixel_format.red_max << ", " << server_pixel_format.green_max << ", " << server_pixel_format.blue_max << std::endl;
+        std::cerr << "color shift: " << (int)server_pixel_format.red_shift << ", " << (int)server_pixel_format.green_shift << ", " << (int)server_pixel_format.blue_shift << std::endl;
         name.push_back('\0');
-        std::cout << "server name: " << name.data() << std::endl;
+        std::cerr << "server name: " << name.data() << std::endl;
         
         server_init_message m{
             .fb_width = fb_width, .fb_height = fb_height,
@@ -432,9 +432,9 @@ public:
         catch (std::exception& e) {
             throw std::runtime_error{std::format("client init fail: {}", e.what())};
         }
-        std::cout << "get response: "; std::cout.write(buf.data(), buf.size());
+        std::cerr << "get response: "; std::cerr.write(buf.data(), buf.size());
         auto [major, minor] = parse_protocol_version(buf);
-        std::cout << "RFB version: " << major << "." << minor << std::endl;
+        std::cerr << "RFB version: " << major << "." << minor << std::endl;
         if (major != 3 || minor != 8) {
             std::cerr << "version only support 3.8" << std::endl;
             return -1;
@@ -464,7 +464,7 @@ public:
             if (security_count[0] == 0) {
                 throw std::runtime_error{std::format("connection rejected by server: {}", read_failure_reason())};
             }
-            std::cout << "Server supportted security count: " << static_cast<int>(security_count[0]) << std::endl;
+            std::cerr << "Server supportted security count: " << static_cast<int>(security_count[0]) << std::endl;
 
             std::vector<uint8_t> security_types(security_count[0]);
             try{
@@ -479,11 +479,11 @@ public:
             bool exist_none = false;
             bool exist_vnc_auth = false;
             for (int i = 0; i < security_types.size(); i++) {
-                std::cout << static_cast<int>(security_types[i]) << ",";
+                std::cerr << static_cast<int>(security_types[i]) << ",";
                 if (security_types[i] == security_type_none) exist_none = true;
                 if (security_types[i] == security_type_vnc_auth) exist_vnc_auth = true;
             }
-            std::cout << std::endl;
+            std::cerr << std::endl;
 
             // A configured password takes priority: servers that offer both
             // types still expect VncAuth when one was supplied.
@@ -501,7 +501,7 @@ public:
             else {
                 throw std::runtime_error{"no mutually supported security type (only None and VNC Authentication are implemented)"};
             }
-            std::cout << "security type: " << static_cast<int>(chosen_security_type) << std::endl;
+            std::cerr << "security type: " << static_cast<int>(chosen_security_type) << std::endl;
 
             try{
             parent::rfb_write(std::array<uint8_t, 1>{chosen_security_type});
@@ -529,7 +529,7 @@ public:
             }
 
             uint32_t security_result = from_big_endian_bytes(security_result_buf[0], security_result_buf[1], security_result_buf[2], security_result_buf[3]);
-            std::cout << "security handshaking result: " << security_result << std::endl;
+            std::cerr << "security handshaking result: " << security_result << std::endl;
             if (security_result != 0) {
                 throw std::runtime_error{std::format("authentication failed: {}", read_failure_reason())};
             }
@@ -793,6 +793,11 @@ concept server_cut_text_processable = requires (T t) {
     t.process_server_cut_text(std::string{});
 };
 
+// Default handling for a ServerCutText message: drop it. The remote clipboard
+// is data the user did not ask for, so a tool that does not opt in by defining
+// its own process_server_cut_text must not have it appear on stdout, where it
+// corrupts the tool's real output (and quietly exposes clipboard contents).
+// rfb_clipboard is the tool that does opt in.
 template<typename T>
 class add_process_server_cut_text_if_not : public T {
 public:
@@ -800,7 +805,7 @@ public:
     add_process_server_cut_text_if_not(const configure auto& conf) : parent{conf}
     {}
     void process_server_cut_text(const auto& text) {
-        std::cout << std::string_view{text.data(), text.size()} << std::endl;
+        (void)text;
     }
 };
 template<server_cut_text_processable T>
@@ -941,7 +946,7 @@ public:
         catch (std::exception& e) {
             throw std::runtime_error("framebuffer update head read fail");
         }
-        //std::cout << "server message: " << (int)framebuffer_update_head[0] << std::endl;
+        //std::cerr << "server message: " << (int)framebuffer_update_head[0] << std::endl;
         if (framebuffer_update_head[0] == 0) {
             parent::process_framebuffer_update(framebuffer_update_head);
         }
@@ -952,7 +957,7 @@ public:
             parent::process_server_cut_text();
         }
         else {
-            std::cout << "not implemented message type: " << (int)framebuffer_update_head[0] << std::endl;
+            std::cerr << "not implemented message type: " << (int)framebuffer_update_head[0] << std::endl;
         }
     }
 }; // class rfb

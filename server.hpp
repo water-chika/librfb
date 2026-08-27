@@ -91,7 +91,9 @@ public:
             // waits forever.
             else if (m_failures++ % 100 == 0) {
                 std::cerr << std::format(
-                    "screen capture failed ({} times){}\n", m_failures,
+                    "screen capture failed ({} times): {}{}\n", m_failures,
+                    m_capture.diagnostic().empty() ? "no diagnostic"
+                                                   : m_capture.diagnostic(),
                     m_current == nullptr
                         ? "; no frame has ever been captured, so viewers will "
                           "see nothing"
