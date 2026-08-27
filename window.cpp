@@ -520,11 +520,20 @@ public:
             // Fixed widths: the line is rewritten in place with a carriage
             // return, so a shorter line would leave the tail of the previous
             // one on screen.
+            auto mean = latency.count > 0
+                ? std::format("{:6.1f}", latency.mean_ms)
+                : std::string{"    --"};
+            auto worst = latency.count > 0
+                ? std::format("{:6.1f}", latency.worst_ms)
+                : std::string{"    --"};
+            // Raw at three megabytes a frame can go a whole window without
+            // completing one, and printing 0.0 there would read as instant
+            // rather than as nothing to report.
             std::clog << std::format(
-                    "encoding: {}, bytes: {:8}, latency: {:6.1f} ms"
-                    " (worst {:6.1f}, {:3} frames)\r",
+                    "encoding: {}, bytes: {:8}, latency: {} ms"
+                    " (worst {}, {:3} frames)\r",
                     encoding_type, frame_network_byte_count,
-                    latency.mean_ms, latency.worst_ms, latency.count);
+                    mean, worst, latency.count);
         }
         parent::process_events(fds);
     }
