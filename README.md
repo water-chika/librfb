@@ -20,6 +20,7 @@ which is what the Linux build is for.
 rfb_server [--port 5900] [--listen 127.0.0.1] [--password <pw>] [--name <text>]
            [--view-only] [--fps 20] [--quality 18] [--no-adapt-quality]
            [--bandwidth <kbit>] [--all-monitors] [--no-cursor]
+rfb_server --console-launcher [server options]   # Windows autostart helper
 ```
 
 - Protocol versions 3.3, 3.7 and 3.8, security types None and VNC
@@ -56,6 +57,60 @@ relay its output back, so to keep a log, redirect inside the target session:
 ```bat
 PsExec64.exe -accepteula -d -i 1 -s cmd /c "C:\path\to\rfb_server.exe --port 5900 --password secret > C:\path\to\rfb_server.log 2>&1"
 ```
+
+### Starting it automatically
+
+`install_rfb_server_autostart.ps1` installs the server as an autostart entry so
+it survives a reboot. It offers two mechanisms, because the session rule above
+leaves no single obvious one:
+
+```powershell
+# At boot, before anyone logs in (the default).
+powershell -ExecutionPolicy Bypass -File install_rfb_server_autostart.ps1 `
+    -Port 5901 -Listen 127.0.0.1 -Name water-coffee-rfb -StartNow
+
+# Only while this user is signed in.
+powershell -ExecutionPolicy Bypass -File install_rfb_server_autostart.ps1 -AtLogon
+
+# Remove either of them, and stop a running server.
+powershell -ExecutionPolicy Bypass -File install_rfb_server_autostart.ps1 -Uninstall
+```
+
+`rfb_server.exe` is auto-detected by walking up from the script directory
+through the usual build output paths; pass `-ServerPath` if it lives elsewhere.
+The server options are passed through as parameters rather than as a command
+line: `-Port`, `-Listen`, `-Password`, `-Name`, `-Fps`, `-AllMonitors`,
+`-NoCursor`, `-ViewOnly`. `-StartNow` also starts the server immediately
+instead of waiting for the next boot or logon.
+
+| | `-AtBoot` (default) | `-AtLogon` |
+|---|---|---|
+| Mechanism | Scheduled task, `/SC ONSTART`, `/RU SYSTEM`, `/RL HIGHEST` | `%LOCALAPPDATA%\librfb\rfb_server_start.cmd` run hidden by `rfb_server.vbs` in the Startup folder |
+| Serves | From boot, including the logon screen, across logon and logoff | Only while that user is signed in |
+| Needs | An elevated shell to create a SYSTEM task | Nothing special |
+| Log | `%ProgramData%\librfb\rfb_server.log` | `%LOCALAPPDATA%\librfb\rfb_server.log` |
+| Task name | `-TaskName`, default `rfb_server` | n/a |
+
+**How `-AtBoot` reaches the desktop.** Its action is not the server but
+`rfb_server --console-launcher <server options>`, a supervisor that stays in
+session 0 and pushes the real server into whichever session is attached to the
+console. It duplicates its own LocalSystem token, retargets it with
+`SetTokenInformation(TokenSessionId)` — which needs `SE_TCB_NAME`, a privilege
+LocalSystem has and ordinary administrators do not, hence `/RU SYSTEM` — and
+starts the worker on `WinSta0\Default`. A console session exists from boot
+onwards showing the logon screen, so the desktop is served before anyone signs
+in. The supervisor then polls, restarting the worker if it exits or if the
+console session changes, which is what carries the server across logon, logoff
+and Fast User Switching. `--console-launcher` is Windows-only and refuses to
+run elsewhere.
+
+A scheduled task created with `schtasks /IT` would be the direct way to reach
+the interactive session, and it is what the two mechanisms above exist to avoid:
+it fails with result 1 on some machines. Note also that a task created by plain
+`schtasks /create /sc ONCE` has a one-shot trigger in the past and an
+`InteractiveToken` principal, so it never comes back after a reboot — it only
+ever starts from `schtasks /run`. The default `schtasks` settings additionally
+refuse to start the task on battery and stop it when an idle period ends.
 
 ### H264 encoding
 
