@@ -76,6 +76,29 @@ inline void make_process_dpi_aware() {
     ::SetProcessDPIAware();
 }
 
+// Name of a window station or desktop handle, for logging and for noticing
+// that the input desktop has changed.
+inline std::string user_object_name(HANDLE object) {
+    if (object == nullptr) {
+        return "<none>";
+    }
+    char name[256]{};
+    DWORD needed = 0;
+    if (!::GetUserObjectInformationA(object, UOI_NAME, name, sizeof(name),
+                                     &needed)) {
+        return "<unknown>";
+    }
+    return std::string{name};
+}
+
+inline std::string current_window_station_name() {
+    return user_object_name(::GetProcessWindowStation());
+}
+
+inline std::string current_desktop_name() {
+    return user_object_name(::GetThreadDesktop(::GetCurrentThreadId()));
+}
+
 // Moves the process onto the interactive window station. A process launched by
 // a service - PsExec -i, PSEXESVC, a scheduled task - inherits the service
 // window station (Service-0x0-3e7$), whose only desktop is not the one the user
@@ -110,17 +133,32 @@ inline bool attach_process_to_interactive_window_station() {
 // station, where GetDC(nullptr) still succeeds but every BitBlt from it fails.
 // The input desktop also changes when the session locks or a UAC prompt takes
 // over, so this is re-run whenever a capture fails.
-inline bool attach_thread_to_input_desktop(HDESK& current) {
-    // Only what GDI capture needs. Asking for DESKTOP_JOURNALRECORD /
-    // DESKTOP_JOURNALPLAYBACK / DESKTOP_SWITCHDESKTOP as well makes
-    // OpenInputDesktop fail with ERROR_ACCESS_DENIED for a plain user token.
-    constexpr DWORD desktop_access = DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS |
-                                     DESKTOP_CREATEWINDOW | DESKTOP_ENUMERATE;
 
-    HDESK desktop = ::OpenInputDesktop(0, FALSE, desktop_access);
+// What a thread that only reads pixels needs on its desktop.
+inline constexpr DWORD desktop_access_capture =
+    DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_CREATEWINDOW |
+    DESKTOP_ENUMERATE;
+
+// What a thread that injects input needs. SendInput requires
+// DESKTOP_JOURNALPLAYBACK on the thread's desktop and fails with
+// ERROR_ACCESS_DENIED without it - silently, since it reports failure only in
+// its return value. It is also the right most likely to be refused: a plain
+// user token cannot get it on the secure desktop, which is why it is not asked
+// for unconditionally and why the caller falls back to the capture-only mask.
+inline constexpr DWORD desktop_access_input =
+    desktop_access_capture | DESKTOP_JOURNALPLAYBACK | DESKTOP_JOURNALRECORD;
+
+inline bool attach_thread_to_input_desktop(
+    HDESK& current, DWORD access = desktop_access_capture) {
+    HDESK desktop = ::OpenInputDesktop(0, FALSE, access);
     if (desktop == nullptr && ::GetLastError() == ERROR_ACCESS_DENIED &&
         attach_process_to_interactive_window_station()) {
-        desktop = ::OpenInputDesktop(0, FALSE, desktop_access);
+        desktop = ::OpenInputDesktop(0, FALSE, access);
+    }
+    // Injection rights were refused, so settle for the rights capture needs:
+    // showing the desktop read-only beats failing outright.
+    if (desktop == nullptr && access != desktop_access_capture) {
+        desktop = ::OpenInputDesktop(0, FALSE, desktop_access_capture);
     }
     if (desktop == nullptr) {
         return false;
@@ -138,6 +176,48 @@ inline bool attach_thread_to_input_desktop(HDESK& current) {
     return true;
 }
 
+// Name of the desktop that is currently receiving input, or empty when that
+// cannot be determined (a plain user token cannot open the secure desktop).
+inline std::string input_desktop_name() {
+    HDESK desktop = ::OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    if (desktop == nullptr && ::GetLastError() == ERROR_ACCESS_DENIED &&
+        attach_process_to_interactive_window_station()) {
+        desktop = ::OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    }
+    if (desktop == nullptr) {
+        return {};
+    }
+    auto name = user_object_name(desktop);
+    ::CloseDesktop(desktop);
+    return name;
+}
+
+// Keeps the calling thread on whichever desktop is currently receiving input.
+//
+// The input desktop changes at logon and logoff, when the session locks, and
+// for every UAC prompt. Nothing reports that to a thread already attached
+// elsewhere, and the failure is silent rather than loud: GDI capture from the
+// stale desktop keeps succeeding and simply returns the wrong screen - at the
+// logon prompt it hands back WinSta0\Default's bare wallpaper - while
+// SendInput delivers to a desktop nobody is looking at. Waiting for a capture
+// to fail therefore never triggers, so the input desktop is polled by name and
+// the thread follows it.
+//
+// Returns true when the thread was actually moved, which invalidates every DC
+// the caller holds: a DC belongs to the desktop it was created on.
+inline bool follow_input_desktop(HDESK& current, std::string& attached_name,
+                                 DWORD access = desktop_access_capture) {
+    auto name = input_desktop_name();
+    if (name.empty() || name == attached_name) {
+        return false;
+    }
+    if (!attach_thread_to_input_desktop(current, access)) {
+        return false;
+    }
+    attached_name = current_desktop_name();
+    return true;
+}
+
 class screen_capture {
 public:
     explicit screen_capture(const capture_options& options)
@@ -146,10 +226,11 @@ public:
         // Best effort: this fails when the process runs in a session with no
         // desktop at all, in which case capture() reports the failure instead.
         bool attached = attach_thread_to_input_desktop(m_desktop);
+        m_desktop_name = current_desktop_name();
         std::cerr << std::format(
             "capture context: window station '{}', desktop '{}', input desktop "
             "attach {}\n",
-            current_window_station_name(), current_desktop_name(),
+            current_window_station_name(), m_desktop_name,
             attached ? "ok"
                      : std::format("failed (error {})", ::GetLastError()));
         m_screen_dc = ::GetDC(nullptr);
@@ -179,6 +260,16 @@ public:
     // could not be read this time round, e.g. because the secure desktop
     // (UAC prompt, lock screen) is in front, which is not fatal.
     bool capture(frame_buffer& frame) {
+        // The input desktop can change without anything here failing, so it is
+        // checked before the blit rather than after one goes wrong. Following
+        // it invalidates the DCs, which belong to the old desktop.
+        if (follow_input_desktop(m_desktop, m_desktop_name)) {
+            std::cerr << std::format("capture: following input desktop '{}'\n",
+                                     m_desktop_name);
+            if (!rebuild_gdi()) {
+                return false;
+            }
+        }
         // CAPTUREBLT includes layered windows, which is most of the modern
         // Windows 11 shell.
         if (!blit()) {
@@ -193,17 +284,10 @@ public:
                     blit_error, ::GetLastError());
                 return false;
             }
-            release_gdi();
-            m_screen_dc = ::GetDC(nullptr);
-            if (m_screen_dc == nullptr) {
-                m_diagnostic = std::format(
-                    "GetDC(nullptr) failed after re-attaching to the input "
-                    "desktop (error {})",
-                    ::GetLastError());
+            m_desktop_name = current_desktop_name();
+            if (!rebuild_gdi()) {
                 return false;
             }
-            query_geometry();
-            create_dib();
             if (!blit()) {
                 m_diagnostic = std::format(
                     "BitBlt failed (error {}) even after re-attaching to "
@@ -229,25 +313,22 @@ public:
     const std::string& diagnostic() const { return m_diagnostic; }
 
 private:
-    static std::string user_object_name(HANDLE object) {
-        if (object == nullptr) {
-            return "<none>";
+    // Drops the DCs and takes new ones on whatever desktop the thread is now
+    // attached to. The screen geometry is re-read as well: the logon desktop
+    // and the user's desktop need not be the same size.
+    bool rebuild_gdi() {
+        release_gdi();
+        m_screen_dc = ::GetDC(nullptr);
+        if (m_screen_dc == nullptr) {
+            m_diagnostic = std::format(
+                "GetDC(nullptr) failed after re-attaching to the input "
+                "desktop (error {})",
+                ::GetLastError());
+            return false;
         }
-        char name[256]{};
-        DWORD needed = 0;
-        if (!::GetUserObjectInformationA(object, UOI_NAME, name, sizeof(name),
-                                         &needed)) {
-            return "<unknown>";
-        }
-        return std::string{name};
-    }
-
-    static std::string current_window_station_name() {
-        return user_object_name(::GetProcessWindowStation());
-    }
-
-    static std::string current_desktop_name() {
-        return user_object_name(::GetThreadDesktop(::GetCurrentThreadId()));
+        query_geometry();
+        create_dib();
+        return true;
     }
 
     bool blit() {
@@ -333,6 +414,7 @@ private:
     capture_options m_options;
     std::string m_diagnostic{};
     HDESK m_desktop{};
+    std::string m_desktop_name{};
     HDC m_screen_dc{};
     HDC m_memory_dc{};
     HBITMAP m_bitmap{};
@@ -350,8 +432,16 @@ class input_injector {
 public:
     input_injector(int origin_x, int origin_y)
         : m_origin_x{origin_x}, m_origin_y{origin_y} {}
+    input_injector(const input_injector&) = delete;
+    input_injector& operator=(const input_injector&) = delete;
+    ~input_injector() {
+        if (m_desktop != nullptr) {
+            ::CloseDesktop(m_desktop);
+        }
+    }
 
     void pointer_event(uint8_t button_mask, int x, int y) {
+        follow_desktop();
         move_pointer(x, y);
 
         static constexpr struct {
@@ -384,6 +474,7 @@ public:
     }
 
     void key_event(uint32_t keysym, bool down) {
+        follow_desktop();
         if (is_control_keysym(keysym)) m_control_down = down;
         if (is_alt_keysym(keysym)) m_alt_down = down;
 
@@ -425,6 +516,43 @@ public:
     }
 
 private:
+    // SendInput delivers to the desktop the calling thread is attached to, and
+    // this thread starts on whichever desktop the process was launched with.
+    // Without following the input desktop, every event injected while the
+    // logon screen, the lock screen or a UAC prompt is up goes to a desktop
+    // nobody is looking at, and the session appears to ignore all input.
+    void follow_desktop() {
+        if (follow_input_desktop(m_desktop, m_desktop_name,
+                                 desktop_access_input)) {
+            std::cerr << std::format("input: following input desktop '{}'\n",
+                                     m_desktop_name);
+            m_send_failures = 0;
+        }
+    }
+
+    // SendInput silently does nothing when the calling thread is not on the
+    // desktop receiving input, and reports ERROR_ACCESS_DENIED when UIPI
+    // blocks the injection - a server that is not elevated cannot drive an
+    // elevated window, and one that is not LocalSystem cannot touch the secure
+    // desktop at all. Neither shows up anywhere unless the result is checked,
+    // which is why an ignored return value made "the session ignores my mouse"
+    // impossible to tell apart from a dead connection.
+    void submit(const INPUT& input) {
+        if (::SendInput(1, const_cast<INPUT*>(&input), sizeof(INPUT)) != 0) {
+            m_send_failures = 0;
+            return;
+        }
+        DWORD error = ::GetLastError();
+        // One line per run of failures: a viewer dragging the pointer would
+        // otherwise fill the log with thousands of identical messages.
+        if (m_send_failures == 0) {
+            std::cerr << std::format(
+                "input: SendInput failed (error {}) on desktop '{}'\n", error,
+                current_desktop_name());
+        }
+        m_send_failures++;
+    }
+
     void move_pointer(int x, int y) {
         m_last_x = x;
         m_last_y = y;
@@ -450,7 +578,7 @@ private:
         input.mi.dy = normalized_y;
         input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
                            MOUSEEVENTF_VIRTUALDESK;
-        ::SendInput(1, &input, sizeof(input));
+        submit(input);
     }
 
     void send_mouse(DWORD flags, int data) {
@@ -458,7 +586,7 @@ private:
         input.type = INPUT_MOUSE;
         input.mi.dwFlags = flags;
         input.mi.mouseData = static_cast<DWORD>(data);
-        ::SendInput(1, &input, sizeof(input));
+        submit(input);
     }
 
     void send_key_vk(WORD vk, bool down) {
@@ -470,7 +598,7 @@ private:
         if (is_extended_key(vk)) {
             input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
         }
-        ::SendInput(1, &input, sizeof(input));
+        submit(input);
         if (down) {
             m_held_keys.insert(vk);
         }
@@ -495,7 +623,7 @@ private:
         input.type = INPUT_KEYBOARD;
         input.ki.wScan = unit;
         input.ki.dwFlags = KEYEVENTF_UNICODE | (down ? 0 : KEYEVENTF_KEYUP);
-        ::SendInput(1, &input, sizeof(input));
+        submit(input);
     }
 
     static bool is_extended_key(WORD vk) {
@@ -511,6 +639,9 @@ private:
         }
     }
 
+    HDESK m_desktop{};
+    std::string m_desktop_name{};
+    unsigned m_send_failures{};
     int m_origin_x{};
     int m_origin_y{};
     uint8_t m_button_mask{};
@@ -680,11 +811,36 @@ private:
         startup.dwFlags = STARTF_USESHOWWINDOW;
         startup.wShowWindow = SW_HIDE;
 
+        // Hand the launcher's own stdout and stderr to the worker. Everything
+        // that matters for diagnosing a boot-time server - which desktop it
+        // attached to, capture failures, the encoder it picked - is written by
+        // the worker, and without this it goes nowhere at all: the log the task
+        // redirects into only ever holds the launcher's own few lines.
+        BOOL inherit_handles = FALSE;
+        HANDLE out = ::GetStdHandle(STD_OUTPUT_HANDLE);
+        HANDLE err = ::GetStdHandle(STD_ERROR_HANDLE);
+        if (out != nullptr && out != INVALID_HANDLE_VALUE) {
+            ::SetHandleInformation(out, HANDLE_FLAG_INHERIT,
+                                   HANDLE_FLAG_INHERIT);
+            if (err == nullptr || err == INVALID_HANDLE_VALUE) {
+                err = out;
+            }
+            else {
+                ::SetHandleInformation(err, HANDLE_FLAG_INHERIT,
+                                       HANDLE_FLAG_INHERIT);
+            }
+            startup.dwFlags |= STARTF_USESTDHANDLES;
+            startup.hStdInput = nullptr;
+            startup.hStdOutput = out;
+            startup.hStdError = err;
+            inherit_handles = TRUE;
+        }
+
         PROCESS_INFORMATION process{};
         std::wstring command_line = m_command_line;
         BOOL created = ::CreateProcessAsUserW(
             session_token, m_executable.c_str(), command_line.data(), nullptr,
-            nullptr, FALSE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            nullptr, inherit_handles, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
             nullptr, nullptr, &startup, &process);
         DWORD create_error = ::GetLastError();
         ::CloseHandle(session_token);

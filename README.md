@@ -104,6 +104,18 @@ console session changes, which is what carries the server across logon, logoff
 and Fast User Switching. `--console-launcher` is Windows-only and refuses to
 run elsewhere.
 
+Windows delivers input to the desktop of the *calling thread*, and a device
+context belongs to the desktop it was created on, so both capture and injection
+have to follow the desktop that is currently receiving input — which changes at
+the logon screen, on lock, and whenever a UAC prompt raises the secure desktop.
+That desktop is polled by name rather than detected from a failure, because a
+`BitBlt` from a stale desktop keeps *succeeding* and quietly returns the wrong
+screen. Injection additionally needs `DESKTOP_JOURNALPLAYBACK` on that desktop;
+without it `SendInput` fails with `ERROR_ACCESS_DENIED` and the session looks
+like it is ignoring the client. That right is refused to anything but
+LocalSystem on the secure desktop, so a server that cannot get it falls back to
+capture-only rights and serves the screen read-only.
+
 A scheduled task created with `schtasks /IT` would be the direct way to reach
 the interactive session, and it is what the two mechanisms above exist to avoid:
 it fails with result 1 on some machines. Note also that a task created by plain
