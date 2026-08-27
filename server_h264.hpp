@@ -160,13 +160,14 @@ public:
     // never larger, so the extra column or row is simply never displayed.
     int width() const { return m_width; }
     int height() const { return m_height; }
+    const std::string& encoder_name() const { return m_encoder_name; }
 
 private:
     // Every encoder spells "constant quality" differently, and getting this
     // wrong is what makes a screen stream look like a bad video call: with no
     // rate control configured at all, both libx264 and h264_amf fall back to a
     // fixed bitrate far too low for a 4K desktop, so text smears.
-    void apply_quality(const AVCodec* codec) {
+    void apply_encoder_options(const AVCodec* codec) {
         const std::string_view name{codec->name};
         const std::string quality = std::to_string(m_quality);
         // A bitrate target and constant quality are mutually exclusive; the
@@ -175,15 +176,36 @@ private:
         m_context->rc_max_rate = 0;
         m_context->rc_buffer_size = 0;
         if (name == "libx264") {
+            // Every encoder names its speed/latency knobs differently, so
+            // these are set per encoder rather than blindly: h264_amf rejects
+            // libx264's preset values outright.
+            av_opt_set(m_context->priv_data, "preset", "veryfast", 0);
+            av_opt_set(m_context->priv_data, "tune", "zerolatency", 0);
             // x264's CRF is in QP units, so the same number means much the
             // same thing here as it does for the hardware encoders.
             av_opt_set(m_context->priv_data, "crf", quality.c_str(), 0);
+            return;
+        }
+        if (name == "libopenh264") {
+            // openh264 has no CRF; its quality follows the bitrate, so a
+            // generous one is set instead and the QP scale is mapped onto it.
+            av_opt_set(m_context->priv_data, "rc_mode", "quality", 0);
+            av_opt_set(m_context->priv_data, "allow_skip_frames", "1", 0);
+            // Roughly 40 Mbit at the best level down to 2 Mbit at the worst,
+            // scaled by pixel count against 1080p.
+            double pixels = static_cast<double>(m_encoded_width) *
+                m_encoded_height / (1920.0 * 1080.0);
+            double scale = static_cast<double>(39 - m_quality) / 27.0;
+            m_context->bit_rate = static_cast<int64_t>(
+                (2000000.0 + 38000000.0 * std::clamp(scale, 0.0, 1.0)) *
+                std::max(0.1, pixels));
             return;
         }
         if (name.ends_with("_amf")) {
             // AMF defaults to a latency-tuned VBR; constant QP is what keeps
             // static text sharp instead of letting it settle over seconds.
             av_opt_set(m_context->priv_data, "usage", "ultralowlatency", 0);
+            // AMF's speed knob is called "quality", not "preset".
             av_opt_set(m_context->priv_data, "quality", "quality", 0);
             av_opt_set(m_context->priv_data, "rc", "cqp", 0);
             av_opt_set(m_context->priv_data, "qp_i", quality.c_str(), 0);
@@ -206,18 +228,51 @@ private:
         m_context->global_quality = FF_QP2LAMBDA * m_quality;
     }
 
+    // Tries every H264 encoder the build has, in preference order, and keeps
+    // the first that actually opens. A hardware encoder is only usable on the
+    // matching hardware -- h264_amf is present on any machine with the AMD
+    // runtime installed but fails to open on a VM with no AMD GPU -- and that
+    // is only discoverable by opening it, so a build with both a hardware and
+    // a software encoder must not commit to one by name alone.
     void open(int width, int height) {
-        // libx264 by name first: the tuning below is its, and a screen sharing
-        // stream wants the one encoder that can be told to emit a packet per
-        // frame with no reordering at all.
-        const AVCodec* codec = avcodec_find_encoder_by_name("libx264");
-        if (codec == nullptr) {
-            codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+        std::vector<const AVCodec*> candidates{};
+        auto add = [&candidates](const AVCodec* codec) {
+            if (codec != nullptr &&
+                std::find(candidates.begin(), candidates.end(), codec) ==
+                    candidates.end()) {
+                candidates.push_back(codec);
+            }
+        };
+        // Hardware first: it costs the host almost nothing. libx264 is the
+        // best of the software encoders, libopenh264 the fallback, and
+        // whatever avcodec considers the default H264 encoder comes last.
+        for (const char* name : {"h264_amf", "h264_qsv", "h264_nvenc",
+                                 "libx264", "libopenh264"}) {
+            add(avcodec_find_encoder_by_name(name));
         }
-        if (codec == nullptr) {
+        add(avcodec_find_encoder(AV_CODEC_ID_H264));
+        if (candidates.empty()) {
             throw std::runtime_error{
                 "h264 encoder not found in this ffmpeg build"};
         }
+        std::string errors{};
+        for (const AVCodec* codec : candidates) {
+            try {
+                open_with(codec, width, height);
+                return;
+            }
+            catch (const std::exception& e) {
+                if (!errors.empty()) {
+                    errors += ", ";
+                }
+                errors += std::string{codec->name} + ": " + e.what();
+                close();
+            }
+        }
+        throw std::runtime_error{"no usable h264 encoder (" + errors + ")"};
+    }
+
+    void open_with(const AVCodec* codec, int width, int height) {
         m_width = width;
         m_height = height;
         // YUV420P subsamples chroma by two, so odd dimensions have to be
@@ -251,12 +306,11 @@ private:
         m_context->color_range = AVCOL_RANGE_MPEG;
         m_context->color_primaries = AVCOL_PRI_BT709;
         m_context->color_trc = AVCOL_TRC_BT709;
-        av_opt_set(m_context->priv_data, "preset", "veryfast", 0);
-        av_opt_set(m_context->priv_data, "tune", "zerolatency", 0);
-        apply_quality(codec);
+        apply_encoder_options(codec);
         if (avcodec_open2(m_context, codec, nullptr) < 0) {
-            throw std::runtime_error{"h264 encoder open fail"};
+            throw std::runtime_error{"open fail"};
         }
+        m_encoder_name = codec->name;
 
         m_frame = av_frame_alloc();
         if (m_frame == nullptr) {
@@ -358,6 +412,7 @@ private:
         }
         m_width = 0;
         m_height = 0;
+        m_encoder_name.clear();
     }
 
     AVCodecContext* m_context{};
@@ -373,6 +428,7 @@ private:
     int m_encoded_height{};
     bool m_stream_reset{true};
     int m_quality{18};
+    std::string m_encoder_name{};
 };
 
 #else
@@ -384,6 +440,10 @@ inline constexpr bool h264_encoder_available = false;
 class h264_encoder {
 public:
     void set_quality(int) {}
+    const std::string& encoder_name() const {
+        static const std::string none{};
+        return none;
+    }
     bool encode(const frame_buffer&, bool, std::vector<uint8_t>&, uint32_t&,
                 bool&) {
         return false;

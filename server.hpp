@@ -633,8 +633,23 @@ private:
             return; // Nothing new was captured, keep the request pending.
         }
         if (m_encoding == encoding_h264) {
-            send_h264_update(*frame, generation, full);
-            return;
+            try {
+                send_h264_update(*frame, generation, full);
+                return;
+            }
+            catch (const std::exception& e) {
+                // Whether an H264 encoder can be opened is only known once
+                // there is a frame to encode, which is long after encodings
+                // were negotiated. Rectangles carry their own encoding, so
+                // the session can simply continue in ZRLE rather than
+                // dropping a viewer that asked for something this machine
+                // turns out not to have.
+                std::cerr << std::format("[{}] h264 unavailable ({}),"
+                                         " falling back to ZRLE\n",
+                                         m_peer, e.what());
+                set_encoding(encoding_zrle);
+                full = true;
+            }
         }
 
         std::vector<rectangle> rects{};
@@ -681,8 +696,7 @@ private:
     // dirty detection only decides whether a frame is worth encoding at all.
     void send_h264_update(const frame_buffer& frame, uint64_t generation,
                           bool full) {
-        if (!full) {
-            std::vector<rectangle> dirty{};
+        if (!full) {            std::vector<rectangle> dirty{};
             collect_dirty(frame, rectangle{0, 0, frame.width, frame.height},
                           dirty);
             if (dirty.empty()) {
@@ -704,6 +718,11 @@ private:
         // one: claiming otherwise would leave a client decoding nothing.
         if ((flags & h264_flag_keyframe) != 0) {
             m_force_keyframe = false;
+        }
+        if (m_h264_reported != m_h264.encoder_name()) {
+            m_h264_reported = m_h264.encoder_name();
+            std::cout << std::format("[{}] h264 encoder: {}\n", m_peer,
+                                     m_h264_reported);
         }
 
         std::vector<uint8_t> message{};
@@ -825,6 +844,7 @@ private:
     pixel_writer m_writer{};
     zrle_encoder m_zrle{};
     h264_encoder m_h264{};
+    std::string m_h264_reported{};
     frame_buffer m_previous{};
     rectangle m_requested{};
     bool m_update_pending{false};
