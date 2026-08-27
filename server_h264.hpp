@@ -75,16 +75,26 @@ public:
     // An encoder with output delay answers with an older picture instead, and
     // the caller must not then record this frame as one the client has seen.
 
-    // Constant-quality level in H.264 QP units. Takes effect the next time the
-    // encoder is opened, which a change here forces.
+    // Constant-quality level in H.264 QP units. Applied to the open encoder
+    // where that is possible, and otherwise by reopening it, which a change
+    // here forces.
     void set_quality(int quality) {
         quality = std::clamp(quality, 0, 51);
         if (quality == m_quality) {
             return;
         }
         m_quality = quality;
-        close();
+        if (m_context != nullptr && !apply_quality_live()) {
+            close();
+        }
     }
+
+    int quality() const { return m_quality; }
+
+    // Whether the last set_quality() could be applied without reopening. A
+    // reopen costs an IDR, so a caller adapting quality continuously wants to
+    // know how expensive its changes are.
+    bool quality_is_live() const { return m_quality_live; }
 
     bool encode(const frame_buffer& source, bool force_keyframe,
                 std::vector<uint8_t>& payload, uint32_t& flags,
@@ -164,6 +174,20 @@ public:
     const std::string& encoder_name() const { return m_encoder_name; }
 
 private:
+    // Retunes an already open encoder, so that a server adapting quality to
+    // the link does not pay for an IDR every time it moves the QP. ffmpeg's
+    // libx264 wrapper re-reads its "crf" option on every frame and calls
+    // x264_encoder_reconfig() when it changed, which changes rate control
+    // mid-stream without breaking prediction. Encoders with no such path
+    // return false and are reopened instead.
+    bool apply_quality_live() {
+        if (m_context == nullptr || !m_quality_live) {
+            return false;
+        }
+        const std::string quality = std::to_string(m_quality);
+        return av_opt_set(m_context->priv_data, "crf", quality.c_str(), 0) >= 0;
+    }
+
     // Every encoder spells "constant quality" differently, and getting this
     // wrong is what makes a screen stream look like a bad video call: with no
     // rate control configured at all, both libx264 and h264_amf fall back to a
@@ -312,6 +336,9 @@ private:
             throw std::runtime_error{"open fail"};
         }
         m_encoder_name = codec->name;
+        // Only libx264's wrapper re-reads its rate control options per frame;
+        // for everything else a quality change means a reopen.
+        m_quality_live = m_encoder_name == "libx264";
 
         m_frame = av_frame_alloc();
         if (m_frame == nullptr) {
@@ -519,6 +546,7 @@ private:
         }
         m_width = 0;
         m_height = 0;
+        m_quality_live = false;
         m_encoder_name.clear();
     }
 
@@ -543,6 +571,7 @@ private:
     int m_encoded_height{};
     bool m_stream_reset{true};
     int m_quality{18};
+    bool m_quality_live{false};
     std::string m_encoder_name{};
 };
 
@@ -555,6 +584,8 @@ inline constexpr bool h264_encoder_available = false;
 class h264_encoder {
 public:
     void set_quality(int) {}
+    int quality() const { return 0; }
+    bool quality_is_live() const { return false; }
     const std::string& encoder_name() const {
         static const std::string none{};
         return none;

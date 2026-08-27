@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <format>
@@ -47,6 +48,15 @@ struct server_options {
     // Screen content is mostly flat colour and text, so it wants a far lower
     // QP than camera video does before the text stops shimmering.
     int h264_quality{18};
+    // Lets the server raise the QP above h264_quality when updates take
+    // longer to write than the capture interval, i.e. when the link cannot
+    // carry the stream. Only ever applies when the client did not ask for a
+    // quality level itself.
+    bool adapt_quality{true};
+    // Artificial cap on how fast a session may write to its socket, in kbit/s.
+    // Zero means no limit. Purely a test knob: it makes a fast loopback
+    // connection behave like a slow link.
+    int bandwidth_kbit{0};
     capture_options capture{};
 };
 
@@ -156,6 +166,60 @@ struct rectangle {
     int x{}, y{}, width{}, height{};
 };
 
+// Caps how fast a session writes to its socket, so that a slow link can be
+// reproduced on a loopback connection. A token bucket: tokens accrue at the
+// configured rate, a write spends one per byte, and overdrawing sleeps off
+// the debt. Disabled -- and then free -- when no limit was asked for.
+class rate_limiter {
+public:
+    rate_limiter() = default;
+
+    explicit rate_limiter(int kbit_per_second) {
+        if (kbit_per_second <= 0) {
+            return;
+        }
+        m_bytes_per_second = kbit_per_second * 1000.0 / 8.0;
+        // One 20ms burst, so that short protocol messages still go out in one
+        // piece instead of being paced a packet at a time. Floored at a
+        // typical MSS so even a very low limit makes progress.
+        m_burst = std::max(1460.0, m_bytes_per_second / 50.0);
+        m_tokens = m_burst;
+        m_refilled_at = std::chrono::steady_clock::now();
+    }
+
+    bool enabled() const { return m_bytes_per_second > 0.0; }
+
+    // The most that should be handed to the socket at once: writing more than
+    // a burst in one call would hand the kernel a backlog this class can no
+    // longer pace.
+    size_t chunk() const { return static_cast<size_t>(m_burst); }
+
+    void consume(size_t count) {
+        if (!enabled()) {
+            return;
+        }
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - m_refilled_at).count();
+        m_tokens = std::min(m_burst, m_tokens + elapsed * m_bytes_per_second);
+        m_refilled_at = now;
+        m_tokens -= static_cast<double>(count);
+        if (m_tokens >= 0.0) {
+            return;
+        }
+        // The debt is left on the account rather than cleared here: the sleep
+        // pays for it in elapsed time, which the next refill picks up.
+        auto debt = std::chrono::duration<double>(-m_tokens / m_bytes_per_second);
+        std::this_thread::sleep_for(
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(debt));
+    }
+
+private:
+    double m_bytes_per_second{0.0};
+    double m_burst{0.0};
+    double m_tokens{0.0};
+    std::chrono::steady_clock::time_point m_refilled_at{};
+};
+
 // The encodings the server can produce, in RFB's numbering.
 inline constexpr uint32_t encoding_raw = 0;
 inline constexpr uint32_t encoding_zrle = 16;
@@ -187,7 +251,10 @@ public:
           m_options{options},
           m_input{screen.origin_x(), screen.origin_y()} {
         socket_helper::set_no_delay(m_socket.get());
-        m_h264.set_quality(m_options.h264_quality);
+        m_limit = rate_limiter{m_options.bandwidth_kbit};
+        m_base_qp = std::clamp(m_options.h264_quality, 0, 51);
+        m_quality_qp = m_base_qp;
+        m_h264.set_quality(m_quality_qp);
     }
 
     void run() {
@@ -230,13 +297,20 @@ private:
         const auto* in = static_cast<const uint8_t*>(buffer);
         size_t done = 0;
         while (done < count) {
+            size_t want = count - done;
+            if (m_limit.enabled()) {
+                want = std::min(want, m_limit.chunk());
+            }
             auto length = socket_helper::write_socket(m_socket.get(), in + done,
-                                                      count - done);
+                                                      want);
             if (length <= 0) {
                 throw client_gone{
                     std::format("write fail: {}", socket_helper::last_error())};
             }
             done += static_cast<size_t>(length);
+            // Paid for after the fact, on what actually went out: a partial
+            // write must not be charged for bytes still queued here.
+            m_limit.consume(static_cast<size_t>(length));
         }
     }
 
@@ -541,7 +615,12 @@ private:
             }
         }
         if (quality_level >= 0) {
-            m_h264.set_quality(quality_to_qp(quality_level));
+            // An explicit request wins outright: the client is stating what it
+            // wants to look at, so the server stops second-guessing it.
+            m_client_set_quality = true;
+            m_base_qp = quality_to_qp(quality_level);
+            m_quality_qp = m_base_qp;
+            m_h264.set_quality(m_quality_qp);
         }
         set_encoding(chosen);
         std::cout << std::format("[{}] encodings: {} offered, using {}\n", m_peer,
@@ -550,6 +629,12 @@ private:
             std::cout << std::format("[{}] quality level {} (qp {})\n", m_peer,
                                      quality_level,
                                      quality_to_qp(quality_level));
+        }
+        else if (adapting_quality()) {
+            std::cout << std::format(
+                "[{}] no quality level asked for, adapting between qp {} and "
+                "{}\n",
+                m_peer, m_base_qp, adaptive_worst_qp);
         }
     }
 
@@ -561,6 +646,80 @@ private:
         constexpr int worst_qp = 39;
         level = std::clamp(level, 0, 9);
         return worst_qp - (worst_qp - best_qp) * level / 9;
+    }
+
+    // As coarse as the adaptive controller is allowed to get. Past this the
+    // picture is too blocky to read, and a link that still cannot keep up is
+    // beyond what picture quality alone can fix.
+    static constexpr int adaptive_worst_qp = 45;
+
+    bool adapting_quality() const {
+        return m_options.adapt_quality && !m_client_set_quality &&
+               h264_encoder_available;
+    }
+
+    // A client that never asked for a quality level has left the trade-off to
+    // the server, so the server spends it on latency. The signal is how long
+    // the update took to write: with a blocking socket that is the time the
+    // link needed to swallow the payload, and anything beyond one capture
+    // interval means updates are queueing and the viewer is falling behind.
+    //
+    // Deliberately not the encode time, which is also part of the latency but
+    // barely moves with the QP -- degrading the picture to fix a slow CPU
+    // would cost quality and buy nothing.
+    //
+    // H264 bitrate is roughly geometric in the QP, near enough half the bits
+    // per six steps, so the correction is computed in that unit: being 4x over
+    // budget asks for +12, capped to keep one bad update from blanking the
+    // picture. Recovery is one step at a time and on a longer timer, because
+    // overshooting downwards immediately re-floods the link.
+    void adapt_quality(std::chrono::steady_clock::duration write_time) {
+        if (!adapting_quality()) {
+            return;
+        }
+        double seconds = std::chrono::duration<double>(write_time).count();
+        double budget = 1.0 / std::max(1, m_options.max_fps);
+        int target = m_quality_qp;
+        if (seconds > budget) {
+            m_updates_in_budget = 0;
+            int steps = static_cast<int>(
+                std::lround(6.0 * std::log2(seconds / budget)));
+            target = m_quality_qp + std::clamp(steps, 1, 12);
+        }
+        else if (seconds * 4.0 < budget) {
+            // Easing off needs a run of comfortable updates, not one: a
+            // single quick update is as likely to mean the screen barely
+            // changed as it is to mean the link has room, and acting on it
+            // produces a permanent one-step oscillation around the true
+            // setting.
+            if (++m_updates_in_budget < 4) {
+                return;
+            }
+            m_updates_in_budget = 0;
+            target = m_quality_qp - 1;
+        }
+        target = std::clamp(target, m_base_qp, adaptive_worst_qp);
+        if (target == m_quality_qp) {
+            return;
+        }
+        // Reopening the encoder costs an IDR, which is itself a burst of
+        // bytes on a link that is already struggling, so changes are rationed.
+        // Recovery waits four times as long as degradation: latency is the
+        // thing being defended, and quality can afford to come back slowly.
+        auto now = std::chrono::steady_clock::now();
+        auto cooldown = target > m_quality_qp ? std::chrono::milliseconds{250}
+                                              : std::chrono::milliseconds{1000};
+        if (m_quality_changed_at != std::chrono::steady_clock::time_point{} &&
+            now - m_quality_changed_at < cooldown) {
+            return;
+        }
+        std::cout << std::format(
+            "[{}] adaptive quality: qp {} -> {} (update took {:.0f} ms, "
+            "budget {:.0f} ms)\n",
+            m_peer, m_quality_qp, target, seconds * 1000.0, budget * 1000.0);
+        m_quality_qp = target;
+        m_quality_changed_at = now;
+        m_h264.set_quality(m_quality_qp);
     }
 
     static const char* encoding_name(uint32_t encoding) {
@@ -773,7 +932,9 @@ private:
         push_u32(message, static_cast<uint32_t>(payload.size()));
         push_u32(message, flags);
         message.insert(message.end(), payload.begin(), payload.end());
+        auto write_started = std::chrono::steady_clock::now();
         write_bytes(message);
+        adapt_quality(std::chrono::steady_clock::now() - write_started);
 
         if (!up_to_date) {
             // The encoder answered with an older picture, so this frame is
@@ -902,6 +1063,15 @@ private:
     bool m_force_keyframe{true};
     uint64_t m_sent_generation{0};
     int m_minor{8};
+    rate_limiter m_limit{};
+    // The QP the client asked for, or the one the command line configured:
+    // the adaptive controller never produces a better picture than this, only
+    // a cheaper one.
+    int m_base_qp{18};
+    int m_quality_qp{18};
+    bool m_client_set_quality{false};
+    int m_updates_in_budget{0};
+    std::chrono::steady_clock::time_point m_quality_changed_at{};
 };
 
 // Accepts connections and runs one session per client on its own thread.
@@ -927,6 +1097,10 @@ public:
             m_options.port,
             m_options.password.empty() ? "no authentication" : "VNC authentication",
             m_options.view_only ? "view only" : "input enabled");
+        if (m_options.bandwidth_kbit > 0) {
+            std::cout << std::format("each client is capped at {} kbit/s\n",
+                                     m_options.bandwidth_kbit);
+        }
 
         while (true) {
             std::string peer{};

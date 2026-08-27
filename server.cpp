@@ -20,6 +20,13 @@ void print_usage() {
         "  --fps <n>           maximum capture rate (default 20)\n"
         "  --quality <n>       H264 quality as a QP, 0 best .. 51 worst"
         " (default 18)\n"
+        "  --no-adapt-quality  keep that quality even when updates cannot be\n"
+        "                      written in time. By default a client that asks\n"
+        "                      for no quality level of its own gets a coarser\n"
+        "                      picture instead of a laggy one\n"
+        "  --bandwidth <kbit>  cap what each client is written at, in kbit/s,\n"
+        "                      to imitate a slow link (default: no cap). A\n"
+        "                      test knob, not a fair-sharing policy\n"
         "  --all-monitors      capture the whole virtual desktop\n"
         "  --no-cursor         do not draw the mouse cursor into the image\n"
         "  --console-launcher  (Windows) do not serve anything directly;\n"
@@ -111,6 +118,17 @@ int main(int argc, char** argv) {
                 if (options.h264_quality < 0 || options.h264_quality > 51) {
                     throw std::runtime_error{
                         "--quality must be between 0 and 51"};
+                }
+            }
+            else if (argument == "--no-adapt-quality") {
+                options.adapt_quality = false;
+            }
+            else if (argument == "--bandwidth") {
+                options.bandwidth_kbit =
+                    parse_int(require_value(argc, argv, i), "--bandwidth");
+                if (options.bandwidth_kbit < 0) {
+                    throw std::runtime_error{
+                        "--bandwidth must not be negative"};
                 }
             }
             else if (argument == "--all-monitors") {

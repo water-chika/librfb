@@ -18,7 +18,8 @@ which is what the Linux build is for.
 
 ```
 rfb_server [--port 5900] [--listen 127.0.0.1] [--password <pw>] [--name <text>]
-           [--view-only] [--fps 20] [--all-monitors] [--no-cursor]
+           [--view-only] [--fps 20] [--quality 18] [--no-adapt-quality]
+           [--bandwidth <kbit>] [--all-monitors] [--no-cursor]
 ```
 
 - Protocol versions 3.3, 3.7 and 3.8, security types None and VNC
@@ -96,6 +97,50 @@ is a bit field; every bit not listed is reserved and sent as zero:
 | `0x2` | stream reset | A new H264 sequence, with its own SPS/PPS and possibly new dimensions. Flush the decoder first. |
 
 Older clients that parse the flags word and ignore it keep working.
+
+**Adaptive quality.** A client can rank the quality level pseudo-encodings
+(-32 for level 0 up to -23 for level 9) in its `SetEncodings` list, which pins
+the QP and is taken as final. A client that ranks none of them has left the
+trade-off to the server, and the server spends it on latency: it raises the QP
+above `--quality` whenever an update takes longer to write than one capture
+interval. With a blocking socket that write time *is* the time the link needed
+to swallow the payload, so exceeding the interval means updates are queueing
+and the viewer is falling behind. Encode time is deliberately excluded — it is
+real latency, but it barely moves with the QP, so degrading the picture to fix
+a slow CPU would buy nothing.
+
+H264 bitrate is roughly geometric in the QP, near enough half the bits per six
+steps, so the correction is computed in that unit and capped at +12 per update.
+Recovery is one step at a time, on a four times longer timer, and only after a
+run of four comfortable updates: a single quick update is as likely to mean the
+screen barely changed as it is to mean the link has room, and acting on it
+produces a permanent one-step oscillation. The QP never goes below `--quality`
+and never above 45. `--no-adapt-quality` turns the whole thing off.
+
+Whether a change costs a keyframe depends on the encoder: libx264 is retuned in
+place (ffmpeg's wrapper re-reads its `crf` option per frame and calls
+`x264_encoder_reconfig`), while everything else is reopened, which forces an
+IDR. Changes are rationed for that reason — no more than one per 250 ms.
+
+**Simulating a slow link.** `--bandwidth <kbit>` caps what each session may
+write to its socket, through a token bucket with a 20 ms burst. It is a test
+knob for exercising the above on a loopback connection, not a fair-sharing
+policy: every client gets its own budget of that size.
+
+Measured on a 1920x1080 Windows desktop (water-coffee, `h264_amf`) showing
+continuous animation, capped at 500 kbit/s with `--fps 20`, recording for 25
+seconds with `rfb_recorder`:
+
+| | frames delivered | update latency |
+|---|---|---|
+| adaptive (default) | 27-28 per 5 s segment | 158 ms, from 510 ms at qp 18 |
+| `--no-adapt-quality` | 1 per 7.6 s segment | over 600 ms |
+
+The QP walked 18 -> 30 -> 42 -> 45 in three steps and stayed there; at a fixed
+qp 18 the same stream is effectively frozen. On a 1024x768 Linux test pattern
+at 500 kbit/s the effect is milder but the same shape: 240 frames against 95
+over 20 seconds. Uncapped, the QP never leaves 18 — the controller only ever
+degrades a link that is demonstrably too slow.
 
 **Colour space.** Pinned to BT.709, limited range, and signalled in the VUI,
 where `h264.hpp` reads it back from `frame->colorspace`/`frame->color_range`.
