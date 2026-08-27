@@ -93,7 +93,20 @@ add_executable(rfb_input
 
 target_compile_features(rfb_input PUBLIC cxx_std_20)
 
+# rfb_input sends input events and never touches pixels, so it does not link
+# swscale directly. (It still gets it transitively through rfb, which needs it
+# for H264 decoding.)
 target_link_libraries(rfb_input PUBLIC
+    rfb
+)
+
+add_executable(rfb_capture
+    capture.cpp
+)
+
+target_compile_features(rfb_capture PUBLIC cxx_std_20)
+
+target_link_libraries(rfb_capture PUBLIC
     rfb
     ${RFB_SWSCALE_LIBS}
 )

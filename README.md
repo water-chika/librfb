@@ -128,6 +128,8 @@ dma-buf) shared with ROCm/HIP via external memory. Vulkan is no longer used.
 | `rfb` (library) | yes | yes |
 | `rfb_demo` | yes | yes |
 | `rfb_input` | yes | yes |
+| `rfb_capture` | yes | yes |
+| `rfb_clipboard` | yes | yes |
 | `rfb_recorder` | yes | yes |
 | `rfb_server` | test pattern | yes |
 | `rfb_window_demo` | yes | no |
@@ -155,14 +157,14 @@ cmake --build build --config Release
 Add `-DRFB_SERVER_H264=ON` to the configure line to build `rfb_server` with
 H264; it reuses the same vcpkg ffmpeg the client tools need.
 
-TBB is not needed on Windows. `h264.hpp` uses
-`std::for_each(std::execution::par, ...)`, and only libstdc++ delegates its
-parallel algorithms to TBB; the MSVC STL implements them natively.
+TBB is not needed on Windows. `h264.hpp` splits each frame into horizontal
+bands and converts them on plain `std::thread`s, so it relies on nothing beyond
+the standard threading support both toolchains already provide.
 
 The `zlib` and `x264` ffmpeg features are not optional (`rfb_server` needs
 neither — it only links zlib and OpenSSL):
 
-- `zlib` provides the **PNG encoder**, which `rfb_input --capture` needs.
+- `zlib` provides the **PNG encoder**, which `rfb_capture` needs.
 - `x264` provides the **H.264 encoder**, which `rfb_recorder` needs. It pulls
   in ffmpeg's `gpl` feature, matching a typical Linux ffmpeg
   (`--enable-gpl --enable-libx264`). Use `openh264` instead to avoid GPL.

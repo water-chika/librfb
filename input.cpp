@@ -1,19 +1,15 @@
-// rfb_input: sends keyboard and pointer events to an RFB/VNC server, and
-// captures its framebuffer to a PNG file.
+// rfb_input: sends keyboard and pointer events to an RFB/VNC server.
 //
 // Unlike driving a VNC *viewer* window with local input injection tools
 // (ydotool/wtype), everything here is spoken directly in the RFB protocol:
 // KeyEvent carries an X keysym and PointerEvent carries absolute framebuffer
 // coordinates, so the local keyboard layout, window focus and the user's real
 // cursor are never involved. It runs headlessly - no window is opened.
+//
+// Reading the screen back is rfb_capture's job. Sending input needs no pixels,
+// so this tool never sends a FramebufferUpdateRequest and decodes nothing.
 
 #include "rfb.hpp"
-
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavutil/opt.h>
-#include <libswscale/swscale.h>
-}
 
 #include <chrono>
 #include <cstring>
@@ -169,118 +165,6 @@ uint8_t button_mask_for(long button) {
     return static_cast<uint8_t>(1u << (button - 1));
 }
 
-// Pumps server messages until a framebuffer update has been decoded, so the
-// captured image reflects the current screen rather than a blank buffer.
-//
-// A full-screen update is normally split across several FramebufferUpdate
-// messages, and each one only covers part of the screen, so capturing after the
-// first message yields a mostly empty image. Instead keep reading until the
-// server goes quiet for quiet_ms, which means the screen has been fully sent.
-// poll() is used because the underlying reads block indefinitely, which would
-// otherwise make the timeout unenforceable.
-void wait_for_frame(auto& client, int width, int height, int timeout_ms, int quiet_ms = 400) {
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    client.reset_frame_updated();
-    client.framebuffer_update_request(0, 0, width, height, false);
-
-    bool got_update = false;
-    while (std::chrono::steady_clock::now() < deadline) {
-        pollfd fd{};
-        fd.fd = client.get_socket();
-        fd.events = POLLIN;
-        int ready = socket_helper::poll_sockets(&fd, 1, quiet_ms);
-        if (ready < 0) {
-            throw std::runtime_error("poll on rfb socket failed");
-        }
-        if (ready == 0) {
-            // Server went quiet: everything it wanted to send has arrived.
-            if (got_update) {
-                return;
-            }
-            continue;
-        }
-        client.process_server_message();
-        if (client.is_frame_updated()) {
-            got_update = true;
-        }
-    }
-    if (!got_update) {
-        throw std::runtime_error("timed out waiting for a framebuffer update");
-    }
-}
-
-// Encodes the decoded BGRA framebuffer to a PNG file using libavcodec's PNG
-// encoder, so no extra image library is needed.
-void write_png(const char* path, const uint8_t* bgra, int width, int height) {
-    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
-    if (!codec) {
-        throw std::runtime_error("png encoder not found in this ffmpeg build");
-    }
-    AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
-    if (!codec_ctx) {
-        throw std::runtime_error("could not allocate png codec context");
-    }
-    AVFrame* frame = nullptr;
-    AVPacket* pkt = nullptr;
-    SwsContext* sws_ctx = nullptr;
-    auto cleanup = [&]() {
-        if (sws_ctx) sws_freeContext(sws_ctx);
-        if (pkt) av_packet_free(&pkt);
-        if (frame) av_frame_free(&frame);
-        if (codec_ctx) avcodec_free_context(&codec_ctx);
-    };
-    try {
-        codec_ctx->width = width;
-        codec_ctx->height = height;
-        codec_ctx->pix_fmt = AV_PIX_FMT_RGB24;
-        codec_ctx->time_base = AVRational{1, 1};
-        if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
-            throw std::runtime_error("could not open png encoder");
-        }
-        frame = av_frame_alloc();
-        frame->format = AV_PIX_FMT_RGB24;
-        frame->width = width;
-        frame->height = height;
-        if (av_frame_get_buffer(frame, 32) < 0) {
-            throw std::runtime_error("could not allocate png frame buffer");
-        }
-        sws_ctx = sws_getContext(
-                width, height, AV_PIX_FMT_BGRA,
-                width, height, AV_PIX_FMT_RGB24,
-                SWS_POINT, nullptr, nullptr, nullptr);
-        if (!sws_ctx) {
-            throw std::runtime_error("could not create BGRA->RGB24 scale context");
-        }
-        const uint8_t* src_slices[1] = {bgra};
-        int src_stride[1] = {width * 4};
-        sws_scale(sws_ctx, src_slices, src_stride, 0, height, frame->data, frame->linesize);
-
-        pkt = av_packet_alloc();
-        if (avcodec_send_frame(codec_ctx, frame) < 0) {
-            throw std::runtime_error("error sending frame to png encoder");
-        }
-        if (avcodec_send_frame(codec_ctx, nullptr) < 0) {
-            throw std::runtime_error("error flushing png encoder");
-        }
-        if (avcodec_receive_packet(codec_ctx, pkt) < 0) {
-            throw std::runtime_error("error receiving png packet");
-        }
-        std::ofstream out(path, std::ios::binary);
-        if (!out) {
-            throw std::runtime_error(std::format("could not open output file: {}", path));
-        }
-        out.write(reinterpret_cast<const char*>(pkt->data), pkt->size);
-        if (!out) {
-            throw std::runtime_error(std::format("could not write output file: {}", path));
-        }
-    }
-    catch (...) {
-        cleanup();
-        throw;
-    }
-    cleanup();
-}
-
 std::string read_password_file(const char* path) {
     std::ifstream in(path);
     if (!in) {
@@ -294,10 +178,10 @@ std::string read_password_file(const char* path) {
     return password;
 }
 
-// One queued input/capture step. Steps are executed in the order given on the
+// One queued input step. Steps are executed in the order given on the
 // command line, so a whole interaction can be scripted in a single connection.
 struct action {
-    enum class kind { move, click, press, release, drag, key, text, capture, wait } type;
+    enum class kind { move, click, press, release, drag, key, text, wait } type;
     long x{}, y{}, x2{}, y2{};
     long button{1};
     std::string value;
@@ -316,7 +200,6 @@ int main(int argc, const char* argv[]) {
         "  --encodings <list>       comma separated RFB encodings, by name or ID,\n"
         "                           e.g. zrle,raw or 16,0 (default: zrle,raw)\n"
         "  --key-delay <ms>         delay between keystrokes of --type (default: 12)\n"
-        "  --timeout <ms>           framebuffer capture timeout (default: 10000)\n"
         "\n"
         "Actions (executed in the order given):\n"
         "  --move <x> <y>           move the pointer\n"
@@ -329,13 +212,13 @@ int main(int argc, const char* argv[]) {
         "  --key <combo>            tap a key, e.g. 'enter', 'a', 'ctrl+alt+delete',\n"
         "                           'super', or a raw keysym like 0xff0d\n"
         "  --type <text>            type a literal ASCII string\n"
-        "  --capture <path.png>     save the current framebuffer as a PNG\n"
         "  --wait <ms>              sleep before the next action\n"
+        "\n"
+        "Reading the screen back is rfb_capture's job.\n"
         "\n"
         "Example:\n"
         "  rfb_input 127.0.0.1 5900 --password mvtest \\\n"
-        "      --key super --wait 800 --type notepad --key enter \\\n"
-        "      --wait 2000 --capture /tmp/screen.png\n"
+        "      --key super --wait 800 --type notepad --key enter\n"
         ;
     if (argc < 3) {
         throw std::logic_error(usage_string);
@@ -346,7 +229,6 @@ int main(int argc, const char* argv[]) {
     std::vector<uint32_t> encodings{};
     std::string password{};
     int key_delay_ms = 12;
-    int timeout_ms = 10000;
     std::vector<action> actions{};
     long current_button = 1;
 
@@ -370,10 +252,6 @@ int main(int argc, const char* argv[]) {
             else if (option == "key-delay") {
                 require_args(i, 1, "--key-delay");
                 key_delay_ms = strtol(argv[++i], nullptr, 10);
-            }
-            else if (option == "timeout") {
-                require_args(i, 1, "--timeout");
-                timeout_ms = strtol(argv[++i], nullptr, 10);
             }
             else if (option == "button") {
                 require_args(i, 1, "--button");
@@ -416,12 +294,11 @@ int main(int argc, const char* argv[]) {
                 a.button = current_button;
                 actions.push_back(a);
             }
-            else if (option == "key" || option == "type" || option == "capture") {
+            else if (option == "key" || option == "type") {
                 require_args(i, 1, argv[i]);
                 action a{};
                 a.type = option == "key" ? action::kind::key
-                    : option == "type" ? action::kind::text
-                    : action::kind::capture;
+                    : action::kind::text;
                 a.value = argv[++i];
                 if (a.type == action::kind::key) {
                     // Fail before connecting if a key name is bogus.
@@ -479,16 +356,6 @@ int main(int argc, const char* argv[]) {
     int width = client.get_width();
     int height = client.get_height();
     std::cerr << std::format("connected: {}x{}", width, height) << std::endl;
-
-    // The first update a server sends after connecting often covers only part
-    // of the screen, so drain one throwaway cycle to get a complete framebuffer
-    // before any action (in particular a --capture) runs.
-    try {
-        wait_for_frame(client, width, height, timeout_ms);
-    }
-    catch (std::exception& e) {
-        std::cerr << "warning: initial framebuffer sync failed: " << e.what() << std::endl;
-    }
 
     // Pointer position is tracked so that button press/release pairs and drags
     // report a consistent location even when only a button changes.
@@ -554,13 +421,6 @@ int main(int argc, const char* argv[]) {
         case action::kind::text:
             send_text(client, a.value, key_delay_ms);
             break;
-        case action::kind::capture: {
-            wait_for_frame(client, width, height, timeout_ms);
-            auto frame_data = client.get_frame();
-            write_png(a.value.c_str(), frame_data.data(), width, height);
-            std::cerr << "captured: " << a.value << std::endl;
-            break;
-        }
         case action::kind::wait:
             std::this_thread::sleep_for(std::chrono::milliseconds(a.x));
             break;
