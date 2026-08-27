@@ -22,7 +22,8 @@ rfb_server [--port 5900] [--listen 127.0.0.1] [--password <pw>] [--name <text>]
 ```
 
 - Protocol versions 3.3, 3.7 and 3.8, security types None and VNC
-  Authentication, Raw and ZRLE encodings.
+  Authentication, Raw and ZRLE encodings, plus H264 in builds configured with
+  `-DRFB_SERVER_H264=ON`.
 - Only 8 characters of `--password` are significant: VNC Authentication uses
   the password as a DES key. It is not transport encryption, so tunnel the
   connection (`ssh -L 5900:127.0.0.1:5900 host`) and pair it with
@@ -30,8 +31,9 @@ rfb_server [--port 5900] [--listen 127.0.0.1] [--password <pw>] [--name <text>]
 - Clipboard transfers both ways on Windows.
 - Multiple viewers can connect at once; each gets its own thread, encoder and
   zlib stream.
-- `rfb_server` deliberately does not link the `rfb` library, so it needs only
-  zlib and OpenSSL — no ffmpeg.
+- `rfb_server` deliberately does not link the `rfb` library, so by default it
+  needs only zlib and OpenSSL — no ffmpeg. Turning on `RFB_SERVER_H264` is the
+  one thing that changes that.
 
 ### Windows: it must run in the interactive session
 
@@ -54,38 +56,65 @@ relay its output back, so to keep a log, redirect inside the target session:
 PsExec64.exe -accepteula -d -i 1 -s cmd /c "C:\path\to\rfb_server.exe --port 5900 --password secret > C:\path\to\rfb_server.log 2>&1"
 ```
 
-### Planned: H264 encoding
+### H264 encoding
 
-The server currently negotiates Raw and ZRLE only; a client offering H264 (50)
-is served ZRLE. Adding it means, in dependency order:
+`rfb_server` can serve encoding 50, but only when the build was configured with
+`-DRFB_SERVER_H264=ON`. That is what defines `RFB_SERVER_HAS_H264` and links
+libavcodec/libavutil/libswscale; the default build stays ffmpeg-free, which is
+the whole reason `rfb_server` does not link the `rfb` library. When the encoder
+is not built in, a client offering 50 is served ZRLE as before.
 
-1. **Optional dependency.** Guard the encoder with a CMake option
-   (`RFB_SERVER_H264`, default `OFF`) that pulls in libavcodec/libavutil/
-   libswscale and defines `RFB_SERVER_HAS_H264`. The default Windows build has
-   to stay ffmpeg-free — that is the reason `rfb_server` does not link `rfb`.
-2. **Encoder.** A `server_h264.hpp` with an `h264_encoder` mirroring
-   `zrle_encoder`'s interface: per-session libx264 (`veryfast`,
-   `zerolatency`, no B-frames) plus libswscale converting the internal 32bpp
-   BGRX buffer to YUV420P. `recorder.cpp` already does that conversion.
-3. **Wire format.** After the usual 12-byte rect header with encoding 50, the
-   client reads a big-endian `uint32` length and a big-endian `uint32` flags
-   word, then that many bytes of H264 fed straight to avcodec
-   (`rfb.hpp`). `flags` is currently parsed and ignored; its meaning needs
-   defining, and is the natural place to mark a keyframe.
-4. **Rect geometry.** H264 cannot use the 64x64 dirty rectangles
-   `collect_dirty()` produces, because the encoder needs a stream of fixed
-   size. Send one full-screen rect per update and keep dirty detection only to
-   decide whether to send a frame at all. Force an IDR on the first frame of a
-   session and on any desktop size change.
-5. **Negotiation.** Replace the `m_zrle_supported` flag with an ordered
-   preference list so 50 can win over 16 and 0, and only when the build has the
-   encoder.
-6. **Colour space.** The client's H264 colour space is still wrong (see the
-   hand-written coefficient table in `h264.hpp`), so pin range and matrix on
-   both sides before trusting any output.
-7. **Verification.** Same standard the ZRLE path was held to: decode a known
-   pattern and count mismatching pixels, then compare a capture against a ZRLE
-   capture of the same static screen, expecting only lossy-codec noise.
+The encoder lives in `server_h264.hpp`, one per session: libx264 at `veryfast`
+and `zerolatency` with no B-frames, fed by libswscale converting the internal
+32bpp BGRX capture to YUV420P.
+
+**Negotiation.** The order in `SetEncodings` is a priority hint, so the first
+entry the server can produce wins — 50, 16 and 0 are all ranked by the client.
+Switching encoding discards the server's copy of the client's screen and forces
+an IDR.
+
+**Rect geometry.** H264 needs a stream of one constant size, so it cannot use
+the 64x64 dirty rectangles `collect_dirty()` produces. Every update is a single
+full-screen rectangle, and dirty detection only decides whether a frame is worth
+encoding at all. Odd screen sizes are padded up to even dimensions for YUV420P
+(the last column and row are duplicated); the rectangle the client is told about
+stays the real size, so the padding is never displayed.
+
+**Wire format.** After the usual 12-byte rect header carrying encoding 50:
+
+    u32 length         bytes of H264 that follow
+    u32 flags          see below
+    u8  data[length]   Annex B byte stream, fed straight to avcodec
+
+The payload is one access unit: everything the encoder produced for a single
+capture, so a viewer can hand it to `avcodec_send_packet()` unmodified. `flags`
+is a bit field; every bit not listed is reserved and sent as zero:
+
+| Bit | Name | Meaning |
+|---|---|---|
+| `0x1` | keyframe | The payload starts with an IDR, so a viewer can start decoding here. |
+| `0x2` | stream reset | A new H264 sequence, with its own SPS/PPS and possibly new dimensions. Flush the decoder first. |
+
+Older clients that parse the flags word and ignore it keep working.
+
+**Colour space.** Pinned to BT.709, limited range, and signalled in the VUI,
+where `h264.hpp` reads it back from `frame->colorspace`/`frame->color_range`.
+Limited range rather than full: a full range stream makes avcodec hand the
+viewer the deprecated `YUVJ420P` pixel format, which viewers routinely fail to
+recognise. The client accepts it anyway.
+
+Note that the client's decoder needs `FF_THREAD_SLICE`: with avcodec's default
+frame threading, finished pictures are held back by roughly the thread count, so
+a session that opens with a single keyframe displays nothing at all.
+
+**Verification.** Two viewers on one server, one asking for ZRLE and one for
+H264, with `--fps 1` so both are served the identical capture. Over eight
+rounds (one keyframe and seven inter frames) the decoded images differ by a mean
+of 1.2 to 1.7 out of 255 per channel, with 1 to 3.5% of channels off by more
+than 8 — lossy-codec noise on the band edges of the test pattern, and nothing
+resembling a colour space error. Encoding an odd-sized (1023x767) gradient
+directly and comparing the decoded luma against the BT.709 limited-range
+expectation gives a mean error of 0.76 and a worst case of 12.
 
 ## rfb window demo
 
@@ -122,6 +151,9 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
     -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
 ```
+
+Add `-DRFB_SERVER_H264=ON` to the configure line to build `rfb_server` with
+H264; it reuses the same vcpkg ffmpeg the client tools need.
 
 TBB is not needed on Windows. `h264.hpp` uses
 `std::for_each(std::execution::par, ...)`, and only libstdc++ delegates its

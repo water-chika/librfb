@@ -5,7 +5,8 @@
 // this is the mirror image of it, and shares only the socket helpers.
 //
 // Protocol versions 3.3, 3.7 and 3.8 are accepted, with the None and VNC
-// Authentication security types, and Raw and ZRLE encodings.
+// Authentication security types, and Raw, ZRLE and (when built with
+// -DRFB_SERVER_H264=ON) H264 encodings.
 
 #define OPENSSL_SUPPRESS_DEPRECATED
 #include <openssl/des.h>
@@ -27,6 +28,7 @@
 #include <socket_helper.hpp>
 
 #include "server_encode.hpp"
+#include "server_h264.hpp"
 #include "server_platform.hpp"
 
 namespace rfb::server {
@@ -128,6 +130,11 @@ private:
 struct rectangle {
     int x{}, y{}, width{}, height{};
 };
+
+// The encodings the server can produce, in RFB's numbering.
+inline constexpr uint32_t encoding_raw = 0;
+inline constexpr uint32_t encoding_zrle = 16;
+inline constexpr uint32_t encoding_h264 = 50;
 
 // Thrown when the viewer goes away, which is an ordinary end of session
 // rather than a failure.
@@ -447,13 +454,46 @@ private:
         if (!body.empty()) {
             read_exact(body.data(), body.size());
         }
-        m_zrle_supported = false;
+        // The order the client sends is a priority hint, so the first entry
+        // the server can produce wins. Raw needs no announcing, but a client
+        // that lists it explicitly gets to rank it against the others.
+        auto chosen = encoding_raw;
         for (uint16_t i = 0; i < count; i++) {
             auto encoding = read_u32(&body[static_cast<size_t>(i) * 4]);
-            if (encoding == 16) m_zrle_supported = true;
+            if (encoding == encoding_h264 && h264_encoder_available) {
+                chosen = encoding_h264;
+                break;
+            }
+            if (encoding == encoding_zrle) {
+                chosen = encoding_zrle;
+                break;
+            }
+            if (encoding == encoding_raw) {
+                break;
+            }
         }
+        set_encoding(chosen);
         std::cout << std::format("[{}] encodings: {} offered, using {}\n", m_peer,
-                                 count, m_zrle_supported ? "ZRLE" : "Raw");
+                                 count, encoding_name(m_encoding));
+    }
+
+    static const char* encoding_name(uint32_t encoding) {
+        switch (encoding) {
+        case encoding_zrle: return "ZRLE";
+        case encoding_h264: return "H264";
+        default: return "Raw";
+        }
+    }
+
+    void set_encoding(uint32_t encoding) {
+        if (encoding == m_encoding) {
+            return;
+        }
+        m_encoding = encoding;
+        // Switching encoders invalidates whatever the client has: ZRLE and
+        // H264 both carry state the other one never fed.
+        m_previous.pixels.clear();
+        m_force_keyframe = true;
     }
 
     void framebuffer_update_request() {
@@ -546,6 +586,10 @@ private:
         if (!full && generation == m_sent_generation) {
             return; // Nothing new was captured, keep the request pending.
         }
+        if (m_encoding == encoding_h264) {
+            send_h264_update(*frame, generation, full);
+            return;
+        }
 
         std::vector<rectangle> rects{};
         if (full) {
@@ -568,13 +612,13 @@ private:
             push_u16(message, static_cast<uint16_t>(rect.y));
             push_u16(message, static_cast<uint16_t>(rect.width));
             push_u16(message, static_cast<uint16_t>(rect.height));
-            if (m_zrle_supported) {
-                push_u32(message, 16);
+            if (m_encoding == encoding_zrle) {
+                push_u32(message, encoding_zrle);
                 m_zrle.append_rect(message, m_writer, *frame, rect.x, rect.y,
                                    rect.width, rect.height);
             }
             else {
-                push_u32(message, 0);
+                push_u32(message, encoding_raw);
                 m_writer.append_raw(message, *frame, rect.x, rect.y, rect.width,
                                     rect.height);
             }
@@ -582,6 +626,61 @@ private:
         write_bytes(message);
 
         remember(*frame);
+        m_sent_generation = generation;
+        m_update_pending = false;
+    }
+
+    // H264 cannot use the 64x64 dirty rectangles: the encoder needs a stream
+    // of one constant size, so every update is one full screen rectangle and
+    // dirty detection only decides whether a frame is worth encoding at all.
+    void send_h264_update(const frame_buffer& frame, uint64_t generation,
+                          bool full) {
+        if (!full) {
+            std::vector<rectangle> dirty{};
+            collect_dirty(frame, rectangle{0, 0, frame.width, frame.height},
+                          dirty);
+            if (dirty.empty()) {
+                m_sent_generation = generation;
+                return;
+            }
+        }
+
+        std::vector<uint8_t> payload{};
+        uint32_t flags = 0;
+        bool up_to_date = false;
+        // A client that has just switched encoding, or whose screen changed
+        // size, has nothing to predict from, so start with an IDR.
+        if (!m_h264.encode(frame, m_force_keyframe || full, payload, flags,
+                           up_to_date)) {
+            return; // Nothing came out; keep the request pending.
+        }
+        // Only an IDR that actually reached the wire retires the request for
+        // one: claiming otherwise would leave a client decoding nothing.
+        if ((flags & h264_flag_keyframe) != 0) {
+            m_force_keyframe = false;
+        }
+
+        std::vector<uint8_t> message{};
+        message.push_back(0); // FramebufferUpdate
+        message.push_back(0); // padding
+        push_u16(message, 1);
+        push_u16(message, 0);
+        push_u16(message, 0);
+        push_u16(message, static_cast<uint16_t>(frame.width));
+        push_u16(message, static_cast<uint16_t>(frame.height));
+        push_u32(message, encoding_h264);
+        push_u32(message, static_cast<uint32_t>(payload.size()));
+        push_u32(message, flags);
+        message.insert(message.end(), payload.begin(), payload.end());
+        write_bytes(message);
+
+        if (!up_to_date) {
+            // The encoder answered with an older picture, so this frame is
+            // still owed to the client: leave the request pending and do not
+            // pretend the client has seen these pixels.
+            return;
+        }
+        remember(frame);
         m_sent_generation = generation;
         m_update_pending = false;
     }
@@ -679,11 +778,13 @@ private:
     clipboard m_clipboard{};
     pixel_writer m_writer{};
     zrle_encoder m_zrle{};
+    h264_encoder m_h264{};
     frame_buffer m_previous{};
     rectangle m_requested{};
     bool m_update_pending{false};
     bool m_incremental{false};
-    bool m_zrle_supported{false};
+    uint32_t m_encoding{encoding_raw};
+    bool m_force_keyframe{true};
     uint64_t m_sent_generation{0};
     int m_minor{8};
 };

@@ -103,6 +103,7 @@ add_executable(rfb_server
     server.cpp
     server.hpp
     server_encode.hpp
+    server_h264.hpp
     server_platform.hpp
     keysym.hpp
 )
@@ -119,6 +120,21 @@ target_link_libraries(rfb_server PUBLIC
     ZLIB::ZLIB
     OpenSSL::Crypto
 )
+
+# H264 is the one thing that would drag ffmpeg into the server, so it is opt
+# in: the default Windows build has to stay ffmpeg-free.
+option(RFB_SERVER_H264 "Build rfb_server with H264 (encoding 50) support" OFF)
+
+if(RFB_SERVER_H264)
+    if(WIN32)
+        set(RFB_SERVER_H264_LIBS ${FFMPEG_LIBRARIES})
+        target_include_directories(rfb_server PRIVATE ${FFMPEG_INCLUDE_DIRS})
+    else()
+        set(RFB_SERVER_H264_LIBS avcodec avutil swscale)
+    endif()
+    target_link_libraries(rfb_server PUBLIC ${RFB_SERVER_H264_LIBS})
+    target_compile_definitions(rfb_server PUBLIC RFB_SERVER_HAS_H264)
+endif()
 
 if(WIN32)
     # GDI capture and SendInput.

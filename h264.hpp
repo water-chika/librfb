@@ -151,6 +151,8 @@ public:
             }
         }
         context->get_format = get_hw_format;
+        context->thread_type = FF_THREAD_SLICE;
+        context->flags |= AV_CODEC_FLAG_LOW_DELAY;
         if (hw_decoder_init(context, config->device_type) < 0) {
             throw std::runtime_error{"hw decoder init fail"};
         }
@@ -204,7 +206,12 @@ public:
                 auto fb_width = parent::get_width();
                 auto fb_height = parent::get_height();
                 auto framebuffer = reinterpret_cast<uint32_t*>(frame_u8.data());
-                if (frame->format == AV_PIX_FMT_YUV420P) {
+                // YUVJ420P is the deprecated full range spelling of the same
+                // planar layout; ffmpeg still produces it for streams whose
+                // VUI says full range, and it decodes identically here
+                // because the range comes from frame->color_range.
+                if (frame->format == AV_PIX_FMT_YUV420P ||
+                    frame->format == AV_PIX_FMT_YUVJ420P) {
                     parent::yuv_to_rgb(framebuffer, fb_width, fb_height,
                             frame, width, height,
                             sx, sy);
@@ -228,6 +235,12 @@ public:
     add_decode_h264(const configure auto& conf) : parent{conf} {
         codec = avcodec_find_decoder(AV_CODEC_ID_H264);
         context = avcodec_alloc_context3(codec);
+        // Frame level threading holds finished pictures back by roughly the
+        // thread count, which for a live stream means the display lags behind
+        // and a session that starts with a single keyframe shows nothing at
+        // all. Slice threading keeps the parallelism without the delay.
+        context->thread_type = FF_THREAD_SLICE;
+        context->flags |= AV_CODEC_FLAG_LOW_DELAY;
         if (avcodec_open2(context, codec, NULL) < 0) {
             throw std::runtime_error{"codec open fail"};
         }
@@ -263,7 +276,12 @@ public:
                 auto fb_width = parent::get_width();
                 auto fb_height = parent::get_height();
                 auto framebuffer = reinterpret_cast<uint32_t*>(frame_u8.data());
-                if (frame->format == AV_PIX_FMT_YUV420P) {
+                // YUVJ420P is the deprecated full range spelling of the same
+                // planar layout; ffmpeg still produces it for streams whose
+                // VUI says full range, and it decodes identically here
+                // because the range comes from frame->color_range.
+                if (frame->format == AV_PIX_FMT_YUV420P ||
+                    frame->format == AV_PIX_FMT_YUVJ420P) {
                     parent::yuv_to_rgb(framebuffer, fb_width, fb_height,
                             frame, width, height,
                             sx, sy);
