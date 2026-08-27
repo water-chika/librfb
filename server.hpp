@@ -923,18 +923,34 @@ private:
     // dirty detection only decides whether a frame is worth encoding at all.
     void send_h264_update(const frame_buffer& frame, uint64_t generation,
                           bool full) {
-        if (!full && !frame_changed(frame)) {
-            m_sent_generation = generation;
-            return;
-        }
-
         std::vector<uint8_t> payload{};
         uint32_t flags = 0;
         bool up_to_date = false;
-        // A client that has just switched encoding, or whose screen changed
-        // size, has nothing to predict from, so start with an IDR.
-        if (!m_h264.encode(frame, m_force_keyframe || full, payload, flags,
-                           up_to_date)) {
+        bool have_payload = false;
+
+        if (full || frame_changed(frame)) {
+            // A client that has just switched encoding, or whose screen
+            // changed size, has nothing to predict from, so start with an IDR.
+            have_payload = m_h264.encode(frame, m_force_keyframe || full,
+                                         payload, flags, up_to_date);
+            // The frame is inside the encoder now, whether or not a packet
+            // came back for it. Handing it in a second time is what used to
+            // happen when the encoder answered late, and it is ruinous: the
+            // screen still counts as changed, so every poll resubmitted the
+            // same picture and the encoder's output fell steadily further
+            // behind the desktop. Recording it as submitted here paces the
+            // encoder at the capture rate instead.
+            remember(frame);
+            m_sent_generation = generation;
+        }
+        else {
+            m_sent_generation = generation;
+            // Nothing new to encode, but the encoder may still be sitting on
+            // the previous picture. Collecting it now is what lets a screen
+            // that has stopped changing settle on its final frame.
+            have_payload = m_h264.drain(payload, flags, up_to_date);
+        }
+        if (!have_payload) {
             return; // Nothing came out; keep the request pending.
         }
         // Only an IDR that actually reached the wire retires the request for
@@ -966,13 +982,11 @@ private:
                       (flags & h264_flag_keyframe) != 0);
 
         if (!up_to_date) {
-            // The encoder answered with an older picture, so this frame is
-            // still owed to the client: leave the request pending and do not
-            // pretend the client has seen these pixels.
+            // The packets describe an older picture, so the newest screen is
+            // still owed to the client and the request stays pending. The next
+            // drain, one capture interval away, hands over the rest.
             return;
         }
-        remember(frame);
-        m_sent_generation = generation;
         m_update_pending = false;
     }
 

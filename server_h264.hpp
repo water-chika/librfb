@@ -166,6 +166,50 @@ public:
         return true;
     }
 
+    // Takes packets an encoder with output delay is still holding, without
+    // handing it another picture.
+    //
+    // Without this the only way to get a held picture out is to submit a new
+    // frame, so a caller that wants the client up to date has to resubmit the
+    // screen it just sent. That refills the encoder's queue as fast as the
+    // session loop spins, and since the queue is drained at one picture per
+    // submission the output ends up a fixed number of *submissions* behind -
+    // which, when submissions run far faster than the screen is captured,
+    // means the client is shown a picture that is many capture intervals old.
+    bool drain(std::vector<uint8_t>& payload, uint32_t& flags,
+               bool& up_to_date) {
+        up_to_date = false;
+        payload.clear();
+        flags = 0;
+        if (m_context == nullptr) {
+            return false;
+        }
+        while (true) {
+            int ret = avcodec_receive_packet(m_context, m_packet);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                break;
+            }
+            if (ret < 0) {
+                throw std::runtime_error{"h264 receive packet fail"};
+            }
+            if ((m_packet->flags & AV_PKT_FLAG_KEY) != 0) {
+                flags |= h264_flag_keyframe;
+            }
+            up_to_date = m_packet->pts == m_last_pts;
+            payload.insert(payload.end(), m_packet->data,
+                           m_packet->data + m_packet->size);
+            av_packet_unref(m_packet);
+        }
+        if (payload.empty()) {
+            return false;
+        }
+        if (m_stream_reset) {
+            flags |= h264_flag_stream_reset;
+            m_stream_reset = false;
+        }
+        return true;
+    }
+
     // The encoded picture is rounded up to even dimensions for YUV420P; the
     // rectangle the client is told about stays the real screen size, which is
     // never larger, so the extra column or row is simply never displayed.
@@ -592,6 +636,9 @@ public:
     }
     bool encode(const frame_buffer&, bool, std::vector<uint8_t>&, uint32_t&,
                 bool&) {
+        return false;
+    }
+    bool drain(std::vector<uint8_t>&, uint32_t&, bool&) {
         return false;
     }
 };

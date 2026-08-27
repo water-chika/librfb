@@ -98,6 +98,26 @@ is a bit field; every bit not listed is reserved and sent as zero:
 
 Older clients that parse the flags word and ignore it keep working.
 
+**Encoder pacing.** An encoder with output delay (`h264_amf` is one) answers a
+submitted frame with an *older* picture, which the encoder reports by stamping
+each packet with the pts of the frame it describes. The frame is nevertheless
+inside the encoder, so it must be recorded as submitted straight away, and the
+picture still owed to the client is collected later by draining the encoder
+without feeding it anything new.
+
+Getting this wrong is expensive and hard to see. Treating a late answer as
+"this frame was not sent" leaves the screen looking changed, so the very next
+poll resubmits the same picture; the queue is refilled as fast as the session
+loop spins, and because it drains one picture per submission, the client ends
+up watching a screen several capture intervals old. Measured on water-coffee at
+`--fps 20` under a pointer-move workload, the session sent **89 updates/s
+totalling 93 bytes/s** — almost every one a skip frame, while the real pixels
+sat in the queue. Pointer movement lagged badly, yet transport latency looked
+excellent precisely because the packets carrying nothing arrived promptly. ZRLE
+was unaffected: it has no encoder pipeline, so its pixels are final on arrival.
+With the frame recorded as submitted, the same workload sends **16.5 updates/s
+carrying 246 KB/s at 26 ms mean latency**.
+
 **Adaptive quality.** A client can rank the quality level pseudo-encodings
 (-32 for level 0 up to -23 for level 9) in its `SetEncodings` list, which pins
 the QP and is taken as final. A client that ranks none of them has left the
