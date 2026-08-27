@@ -111,16 +111,32 @@ a slow CPU would buy nothing.
 
 H264 bitrate is roughly geometric in the QP, near enough half the bits per six
 steps, so the correction is computed in that unit and capped at +12 per update.
-Recovery is one step at a time, on a four times longer timer, and only after a
-run of four comfortable updates: a single quick update is as likely to mean the
-screen barely changed as it is to mean the link has room, and acting on it
-produces a permanent one-step oscillation. The QP never goes below `--quality`
-and never above 45. `--no-adapt-quality` turns the whole thing off.
+It takes half as much again as the budget before anything moves: a single
+update landing marginally late is normal on any real link — one big window
+repaint will do it — and reacting to that alone means reacting constantly.
+The QP never goes below `--quality` and never above 45. `--no-adapt-quality`
+turns the whole thing off.
 
-Whether a change costs a keyframe depends on the encoder: libx264 is retuned in
-place (ffmpeg's wrapper re-reads its `crf` option per frame and calls
-`x264_encoder_reconfig`), while everything else is reopened, which forces an
-IDR. Changes are rationed for that reason — no more than one per 250 ms.
+**Keyframes are excluded from the measurement**, and not merely because an IDR
+is several times the size of the updates around it. On an encoder that cannot
+be retuned in place a quality change *is* a keyframe, so counting one closes a
+loop in which every correction provokes the next: measured against a real
+1080p desktop over an SSH tunnel, `h264_amf` walked the QP up and down twelve
+times without ever settling, IDR-ing on each step, which the viewer sees as
+lag. With keyframes excluded the same session makes two changes in 45 seconds.
+
+Easing off needs a run of four comfortable updates, because a single quick one
+is as likely to mean the screen barely changed as it is to mean the link has
+room. The step size is then chosen by what it costs rather than by what was
+measured — a write that returned immediately says only that the socket was not
+blocked, not how much headroom there is. libx264 is retuned in place (ffmpeg's
+wrapper re-reads its `crf` option per frame and calls `x264_encoder_reconfig`),
+so there it creeps back one step at a time and lets the next slow update stop
+the creep. Everything else is reopened, at the cost of an IDR, so one jump
+straight back to the asked-for quality is cheaper than the same distance
+walked, and being wrong costs a single correction upwards. Changes are rationed
+either way: no more than one per 250 ms, or per second for a reopening
+encoder.
 
 **Simulating a slow link.** `--bandwidth <kbit>` caps what each session may
 write to its socket, through a token bucket with a 20 ms burst. It is a test
@@ -136,11 +152,12 @@ seconds with `rfb_recorder`:
 | adaptive (default) | 27-28 per 5 s segment | 158 ms, from 510 ms at qp 18 |
 | `--no-adapt-quality` | 1 per 7.6 s segment | over 600 ms |
 
-The QP walked 18 -> 30 -> 42 -> 45 in three steps and stayed there; at a fixed
-qp 18 the same stream is effectively frozen. On a 1024x768 Linux test pattern
-at 500 kbit/s the effect is milder but the same shape: 240 frames against 95
-over 20 seconds. Uncapped, the QP never leaves 18 — the controller only ever
-degrades a link that is demonstrably too slow.
+The QP walked 18 -> 27 -> 35 -> 42 -> 45 and stayed there; at a fixed qp 18 the
+same stream is effectively frozen. On a 1024x768 Linux test pattern at
+500 kbit/s the effect is milder but the same shape: 234 frames against 93 over
+20 seconds. Uncapped, the QP stays at 18 apart from the occasional single
+excursion and return — the controller only ever degrades a link that is
+demonstrably too slow.
 
 **Colour space.** Pinned to BT.709, limited range, and signalled in the VUI,
 where `h264.hpp` reads it back from `frame->colorspace`/`frame->color_range`.

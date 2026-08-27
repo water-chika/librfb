@@ -673,14 +673,28 @@ private:
     // budget asks for +12, capped to keep one bad update from blanking the
     // picture. Recovery is one step at a time and on a longer timer, because
     // overshooting downwards immediately re-floods the link.
-    void adapt_quality(std::chrono::steady_clock::duration write_time) {
+    void adapt_quality(std::chrono::steady_clock::duration write_time,
+                       bool keyframe) {
         if (!adapting_quality()) {
+            return;
+        }
+        // A keyframe is several times the size of the updates around it, so
+        // its write time says nothing about what the stream costs to sustain.
+        // Skipping it is not merely an accuracy point: on an encoder that
+        // cannot be retuned in place, a quality change *is* a keyframe, so
+        // acting on one closes a loop in which every correction provokes the
+        // next and the QP never settles.
+        if (keyframe) {
             return;
         }
         double seconds = std::chrono::duration<double>(write_time).count();
         double budget = 1.0 / std::max(1, m_options.max_fps);
         int target = m_quality_qp;
-        if (seconds > budget) {
+        // Half as much again as the budget before anything moves. A single
+        // update that lands marginally late is normal on any real link -- one
+        // big window repaint will do it -- and reacting to that alone means
+        // reacting constantly.
+        if (seconds > budget * 1.5) {
             m_updates_in_budget = 0;
             int steps = static_cast<int>(
                 std::lround(6.0 * std::log2(seconds / budget)));
@@ -696,19 +710,33 @@ private:
                 return;
             }
             m_updates_in_budget = 0;
-            target = m_quality_qp - 1;
+            // A write that returned immediately says only that the socket
+            // was not blocked; it gives no measure of how much headroom
+            // there is. So the step size is chosen by what it costs rather
+            // than by what was measured: free on an encoder that retunes in
+            // place, so creep back one step at a time and let the next slow
+            // update stop the creep; a whole keyframe otherwise, in which
+            // case one jump back to the asked-for quality is cheaper than
+            // the same distance walked, and being wrong costs a single
+            // correction upwards.
+            target = m_h264.quality_is_live() ? m_quality_qp - 1 : m_base_qp;
         }
         target = std::clamp(target, m_base_qp, adaptive_worst_qp);
         if (target == m_quality_qp) {
             return;
         }
         // Reopening the encoder costs an IDR, which is itself a burst of
-        // bytes on a link that is already struggling, so changes are rationed.
-        // Recovery waits four times as long as degradation: latency is the
-        // thing being defended, and quality can afford to come back slowly.
+        // bytes on a link that is already struggling, so changes are rationed
+        // -- four times as strictly for an encoder that has to be reopened as
+        // for one that can be retuned in place. Recovery waits longer than
+        // degradation either way: latency is the thing being defended, and
+        // quality can afford to come back slowly.
         auto now = std::chrono::steady_clock::now();
         auto cooldown = target > m_quality_qp ? std::chrono::milliseconds{250}
                                               : std::chrono::milliseconds{1000};
+        if (!m_h264.quality_is_live()) {
+            cooldown *= 4;
+        }
         if (m_quality_changed_at != std::chrono::steady_clock::time_point{} &&
             now - m_quality_changed_at < cooldown) {
             return;
@@ -934,7 +962,8 @@ private:
         message.insert(message.end(), payload.begin(), payload.end());
         auto write_started = std::chrono::steady_clock::now();
         write_bytes(message);
-        adapt_quality(std::chrono::steady_clock::now() - write_started);
+        adapt_quality(std::chrono::steady_clock::now() - write_started,
+                      (flags & h264_flag_keyframe) != 0);
 
         if (!up_to_date) {
             // The encoder answered with an older picture, so this frame is
