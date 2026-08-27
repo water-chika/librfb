@@ -1,10 +1,14 @@
 #pragma once
 
-#include <numeric>
-#include <execution>
+#include <algorithm>
+#include <cstring>
+#include <stdexcept>
+#include <thread>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
 }
 
 namespace rfb {
@@ -42,91 +46,211 @@ public:
 private:
     AVCodecContext* context;
 };
+// Converts the decoded YUV420P picture into the BGRA framebuffer.
+//
+// This used to be a hand written per pixel loop doing float arithmetic; on a
+// 4K frame that cost several milliseconds of pure latency on every update.
+// libswscale does the same job with SIMD, and being told the frame's real
+// colorspace and range it also gets BT.601 vs BT.709 and limited vs full range
+// right without the matrix having to be derived here.
+//
+// The conversion is cut into horizontal bands run in parallel. Each band also
+// converts a few of its neighbours' rows and discards them, because the chroma
+// upsample filter reads beyond the 2x2 group and a band converted in isolation
+// would otherwise show a seam at its edges.
 template<typename T>
 class add_yuv_to_rgb : public T {
 public:
     using parent = T;
     add_yuv_to_rgb(const configure auto& conf) : parent{conf} {
     }
-    struct yuv_to_rgb_coefficients {
-        float y_scale;
-        float y_offset;
-        float r_cr;
-        float g_cb;
-        float g_cr;
-        float b_cb;
-    };
-    // H.264 streams are limited range (Y 16-235, C 16-240) and use BT.709 for HD
-    // resolutions, so the matrix has to come from the frame metadata rather than
-    // being hardcoded to full range BT.601.
-    static yuv_to_rgb_coefficients get_coefficients(const AVFrame* frame) {
-        auto colorspace = frame->colorspace;
-        if (colorspace == AVCOL_SPC_UNSPECIFIED) {
-            colorspace = frame->height >= 720 ? AVCOL_SPC_BT709 : AVCOL_SPC_BT470BG;
-        }
-        double kr = 0.299, kb = 0.114;
-        switch (colorspace) {
-        case AVCOL_SPC_BT709:
-            kr = 0.2126; kb = 0.0722; break;
-        case AVCOL_SPC_BT2020_NCL:
-        case AVCOL_SPC_BT2020_CL:
-            kr = 0.2627; kb = 0.0593; break;
-        case AVCOL_SPC_SMPTE240M:
-            kr = 0.212; kb = 0.087; break;
-        default:
-            break;
-        }
-        double kg = 1.0 - kr - kb;
-        bool full_range = frame->color_range == AVCOL_RANGE_JPEG;
-        double y_scale = full_range ? 1.0 : 255.0/219.0;
-        double c_scale = full_range ? 1.0 : 255.0/224.0;
-        return yuv_to_rgb_coefficients{
-            .y_scale = static_cast<float>(y_scale),
-            .y_offset = full_range ? 0.0f : 16.0f,
-            .r_cr = static_cast<float>(2*(1-kr)*c_scale),
-            .g_cb = static_cast<float>(2*(1-kb)*kb/kg*c_scale),
-            .g_cr = static_cast<float>(2*(1-kr)*kr/kg*c_scale),
-            .b_cb = static_cast<float>(2*(1-kb)*c_scale),
-        };
+    ~add_yuv_to_rgb() {
+        release();
     }
     void yuv_to_rgb(
             auto& framebuffer, auto fb_width, auto fb_height,
             auto& frame, auto width, auto height,
             auto sx, auto sy
             ) {
-        auto coefficients = get_coefficients(frame);
-        auto x_indices = std::vector<uint32_t>(width);
-        std::iota(x_indices.begin(), x_indices.end(), 0);
-        auto y_indices = std::vector<uint32_t>(height);
-        std::iota(y_indices.begin(), y_indices.end(), 0);
-        std::for_each(std::execution::par, y_indices.begin(), y_indices.end(),
-                [&x_indices, frame=frame, &framebuffer, fb_width, sx, sy, coefficients](auto y_) {
-                    std::for_each(std::execution::seq, x_indices.begin(), x_indices.end(),
-                            [y_, frame, &framebuffer, fb_width, sx, sy, coefficients](auto x_) {
-                                uint8_t Y = frame->data[0][y_*frame->linesize[0] + x_];
-                                uint8_t Cb = frame->data[1][y_/2*frame->linesize[1] + x_/2];
-                                uint8_t Cr = frame->data[2][y_/2*frame->linesize[2] + x_/2];
-                                auto clamp = [](float v) {
-                                    if (v > 255.0f) return 255;
-                                    else if (v < 0.0f) return 0;
-                                    else return static_cast<int>(v + 0.5f);
-                                };
-                                float y = (Y - coefficients.y_offset) * coefficients.y_scale;
-                                float cb = Cb - 128.0f;
-                                float cr = Cr - 128.0f;
-                                auto R = clamp(y + coefficients.r_cr*cr);
-                                auto G = clamp(y - coefficients.g_cb*cb - coefficients.g_cr*cr);
-                                auto B = clamp(y + coefficients.b_cb*cb);
-                                framebuffer[(sy+y_)*fb_width + (sx+x_)] =
-                                    (R<<(2*8)) |
-                                    (G<<(1*8)) |
-                                    (B<<(0*8)) |
-                                    0;
-                            }
-                            );
+        int w = static_cast<int>(width);
+        int h = static_cast<int>(height);
+        if (w <= 0 || h <= 0) {
+            return;
+        }
+        prepare(frame, w, h);
+
+        auto* out = reinterpret_cast<uint8_t*>(framebuffer);
+        int out_stride = static_cast<int>(fb_width) * 4;
+        auto convert_band = [&](band& entry) {
+            const uint8_t* planes[4] = {
+                frame->data[0] +
+                    static_cast<size_t>(entry.y - entry.above) * frame->linesize[0],
+                frame->data[1] +
+                    static_cast<size_t>((entry.y - entry.above) / 2) * frame->linesize[1],
+                frame->data[2] +
+                    static_cast<size_t>((entry.y - entry.above) / 2) * frame->linesize[2],
+                nullptr};
+            // The band writes straight into the framebuffer at its own offset,
+            // so only the overlap rows need somewhere else to go: they are
+            // written above the destination and then overwritten by the band
+            // that owns them, which is why each band converts into scratch.
+            uint8_t* dst[4] = {entry.scratch.data(), nullptr, nullptr, nullptr};
+            int dst_stride[4] = {m_scratch_stride, 0, 0, 0};
+            sws_scale(entry.scaler, planes, frame->linesize, 0,
+                      entry.above + entry.height + entry.below, dst, dst_stride);
+            for (int row = 0; row < entry.height; row++) {
+                std::memcpy(
+                    out + static_cast<size_t>(sy + entry.y + row) * out_stride +
+                        static_cast<size_t>(sx) * 4,
+                    entry.scratch.data() +
+                        static_cast<size_t>(entry.above + row) * m_scratch_stride,
+                    static_cast<size_t>(m_width) * 4);
+            }
+        };
+        if (m_bands.size() == 1) {
+            convert_band(m_bands.front());
+            return;
+        }
+        std::vector<std::thread> workers{};
+        workers.reserve(m_bands.size() - 1);
+        // Joins whatever was started even when a later thread cannot be
+        // created: letting ~vector<thread> destroy a joinable thread calls
+        // std::terminate, whereas a propagating exception is recoverable.
+        struct joiner {
+            std::vector<std::thread>& threads;
+            ~joiner() {
+                for (std::thread& worker : threads) {
+                    if (worker.joinable()) {
+                        worker.join();
+                    }
                 }
-        );
+            }
+        } join_all{workers};
+        for (size_t i = 0; i + 1 < m_bands.size(); i++) {
+            workers.emplace_back(convert_band, std::ref(m_bands[i]));
+        }
+        convert_band(m_bands.back());
     }
+private:
+    static constexpr int overlap_rows = 8;
+
+    struct band {
+        SwsContext* scaler{};
+        std::vector<uint8_t> scratch{};
+        int y{};
+        int height{};
+        int above{};
+        int below{};
+    };
+
+    void release() {
+        for (band& entry : m_bands) {
+            if (entry.scaler != nullptr) {
+                sws_freeContext(entry.scaler);
+            }
+        }
+        m_bands.clear();
+    }
+
+    // Rebuilds the band set when the picture, its pixel format or its
+    // colorimetry changes; otherwise the contexts are reused frame to frame.
+    void prepare(const AVFrame* frame, int width, int height) {
+        auto format = static_cast<AVPixelFormat>(frame->format);
+        if (!m_bands.empty() && width == m_width && height == m_height &&
+            format == m_format && frame->colorspace == m_colorspace &&
+            frame->color_range == m_range) {
+            return;
+        }
+        release();
+        m_scratch_stride = 0;
+        int scratch_stride = width * 4;
+
+        // Unspecified is common in the wild; H264 at HD sizes means BT.709.
+        auto colorspace = frame->colorspace;
+        if (colorspace == AVCOL_SPC_UNSPECIFIED) {
+            colorspace = height >= 720 ? AVCOL_SPC_BT709 : AVCOL_SPC_BT470BG;
+        }
+        int table = SWS_CS_ITU601;
+        switch (colorspace) {
+        case AVCOL_SPC_BT709: table = SWS_CS_ITU709; break;
+        case AVCOL_SPC_BT2020_NCL:
+        case AVCOL_SPC_BT2020_CL: table = SWS_CS_BT2020; break;
+        case AVCOL_SPC_SMPTE240M: table = SWS_CS_SMPTE240M; break;
+        default: break;
+        }
+        // YUVJ420P is the deprecated full range spelling; either way the range
+        // is what color_range says, defaulting to the limited range every H264
+        // screen stream uses.
+        int src_range = (frame->color_range == AVCOL_RANGE_JPEG ||
+                         format == AV_PIX_FMT_YUVJ420P)
+                            ? 1
+                            : 0;
+
+        unsigned cores = std::thread::hardware_concurrency();
+        int count = static_cast<int>(std::clamp<unsigned>(cores, 1u, 8u));
+        constexpr int min_rows = 64;
+        count = std::clamp(count, 1, std::max(1, height / min_rows));
+        int rows = ((height + count - 1) / count + 1) & ~1;
+
+        const int* coefficients = sws_getCoefficients(table);
+        // Built to the side and committed only once whole. Recording the cache
+        // key up front would, if an allocation below threw, leave a key
+        // claiming to describe the entire picture next to a band list covering
+        // only its top -- and every later frame would then silently convert
+        // just that slice, leaving the rest of the framebuffer stale forever.
+        std::vector<band> bands{};
+        bands.reserve(static_cast<size_t>(count) + 1);
+        try {
+            for (int y = 0; y < height; y += rows) {
+                band entry{};
+                entry.y = y;
+                entry.height = std::min(rows, height - y);
+                entry.above = std::min(overlap_rows, y);
+                entry.below =
+                    std::min(overlap_rows, (height - (y + entry.height)) & ~1);
+                int converted = entry.above + entry.height + entry.below;
+                entry.scaler = sws_getContext(width, converted, format, width,
+                                              converted, AV_PIX_FMT_BGRA,
+                                              SWS_BILINEAR, nullptr, nullptr,
+                                              nullptr);
+                if (entry.scaler == nullptr) {
+                    throw std::runtime_error{
+                        "YUV to BGRA scaler creation fail"};
+                }
+                // Handed to the reserved vector before anything else can throw,
+                // so the context is owned and cannot leak past the catch.
+                bands.push_back(std::move(entry));
+                band& stored = bands.back();
+                sws_setColorspaceDetails(stored.scaler, coefficients, src_range,
+                                         sws_getCoefficients(SWS_CS_DEFAULT), 1,
+                                         0, 1 << 16, 1 << 16);
+                stored.scratch.assign(
+                    static_cast<size_t>(scratch_stride) * converted, 0);
+            }
+        } catch (...) {
+            for (band& entry : bands) {
+                if (entry.scaler != nullptr) {
+                    sws_freeContext(entry.scaler);
+                }
+            }
+            throw;
+        }
+        m_bands = std::move(bands);
+        m_width = width;
+        m_height = height;
+        m_format = format;
+        m_colorspace = frame->colorspace;
+        m_range = frame->color_range;
+        m_scratch_stride = scratch_stride;
+    }
+
+    std::vector<band> m_bands{};
+    int m_width{};
+    int m_height{};
+    int m_scratch_stride{};
+    AVPixelFormat m_format{AV_PIX_FMT_NONE};
+    AVColorSpace m_colorspace{AVCOL_SPC_UNSPECIFIED};
+    AVColorRange m_range{AVCOL_RANGE_UNSPECIFIED};
 };
 
 template<typename T>
@@ -218,7 +342,6 @@ public:
                 }
             }
         }
-        std::cout << "h264_decode end" << std::endl;
     }
 private:
     const AVCodec* decoder;
@@ -252,8 +375,8 @@ public:
             avcodec_free_context(&context);
         if (frame)
             av_frame_free(&frame);
-        //if (packet)
-            //av_packet_free(&packet);
+        if (packet)
+            av_packet_free(&packet);
     }
     void h264_decode(std::span<uint8_t> h264_data, int sx, int sy, int width, int height, std::span<uint8_t> frame_u8) {
         auto data = reinterpret_cast<uint8_t*>(av_malloc(h264_data.size()+AV_INPUT_BUFFER_PADDING_SIZE));
@@ -261,6 +384,13 @@ public:
         memcpy(data, h264_data.data(), data_size);
         memset(data+data_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
         av_packet_from_data(packet, data, data_size);
+        // avcodec_send_packet only takes a reference, so the buffer this
+        // packet owns has to be released again on every path out of here --
+        // otherwise the decoder leaks one compressed frame per update.
+        struct packet_guard {
+            AVPacket* p;
+            ~packet_guard() { av_packet_unref(p); }
+        } guard{packet};
         if (packet->size) {
             int ret = avcodec_send_packet(context, packet);
             if (ret < 0) {
@@ -288,7 +418,6 @@ public:
                 }
             }
         }
-        std::cout << "h264_decode end" << std::endl;
     }
  private:
     const AVCodec* codec;

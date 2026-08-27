@@ -109,6 +109,25 @@ public:
         return m_current;
     }
 
+    // How long until frame() would read the screen again. A session that
+    // already owes its client an update has nothing useful to do before then,
+    // and nothing to gain by waiting any longer.
+    //
+    // Deliberately not special-cased on m_current == nullptr. frame() stamps
+    // m_captured_at on every attempt, failures included, so a screen that
+    // cannot be captured at all still reports a full interval and the caller
+    // polls at the frame rate instead of spinning. Before the first attempt
+    // m_captured_at is its epoch default, which correctly yields zero: the
+    // very first frame should be read immediately.
+    std::chrono::steady_clock::duration time_to_next_capture() const {
+        std::lock_guard lock{m_mutex};
+        auto elapsed = std::chrono::steady_clock::now() - m_captured_at;
+        if (elapsed >= m_interval) {
+            return std::chrono::steady_clock::duration::zero();
+        }
+        return m_interval - elapsed;
+    }
+
 private:
     // Reuses buffers no session still holds, instead of allocating several
     // megabytes per captured frame.
@@ -123,7 +142,7 @@ private:
         return buffer;
     }
 
-    std::mutex m_mutex{};
+    mutable std::mutex m_mutex{};
     screen_capture m_capture;
     std::chrono::steady_clock::duration m_interval;
     std::chrono::steady_clock::time_point m_captured_at{};
@@ -388,10 +407,10 @@ private:
     void serve() {
         std::cout << std::format("[{}] session started ({}x{})\n", m_peer,
                                  m_screen.width(), m_screen.height());
-        int timeout_ms = std::max(1, 1000 / std::max(1, m_options.max_fps));
+        int frame_interval_ms = std::max(1, 1000 / std::max(1, m_options.max_fps));
         while (true) {
             pollfd fd{m_socket.get(), POLLIN, 0};
-            int ret = socket_helper::poll_sockets(&fd, 1, timeout_ms);
+            int ret = socket_helper::poll_sockets(&fd, 1, poll_timeout(frame_interval_ms));
             if (ret < 0) {
 #ifndef _WIN32
                 if (socket_helper::last_error() == EINTR) continue;
@@ -417,6 +436,27 @@ private:
             send_pending_update();
             send_pending_clipboard();
         }
+    }
+
+    // With no update owed, sleeping a whole frame interval costs nothing: the
+    // client is not waiting for anything. With one owed, that same sleep is
+    // pure added latency, because the update cannot go out until the screen is
+    // read again and the loop would keep sleeping past that moment. Waking
+    // exactly when the next capture falls due removes, on average, half a
+    // frame interval from every update -- 25ms at the default 20fps, far more
+    // than the whole encode costs.
+    int poll_timeout(int frame_interval_ms) const {
+        if (!m_update_pending) {
+            return frame_interval_ms;
+        }
+        auto wait = m_screen.time_to_next_capture();
+        // Rounded up, so a sub-millisecond wait sleeps 1ms rather than
+        // spinning the loop until the clock catches up.
+        auto wait_ms = std::chrono::duration_cast<
+            std::chrono::duration<int64_t, std::milli>>(
+            wait + std::chrono::microseconds{999}).count();
+        return static_cast<int>(
+            std::clamp<int64_t>(wait_ms, 0, frame_interval_ms));
     }
 
     void handle_client_message() {
@@ -696,13 +736,9 @@ private:
     // dirty detection only decides whether a frame is worth encoding at all.
     void send_h264_update(const frame_buffer& frame, uint64_t generation,
                           bool full) {
-        if (!full) {            std::vector<rectangle> dirty{};
-            collect_dirty(frame, rectangle{0, 0, frame.width, frame.height},
-                          dirty);
-            if (dirty.empty()) {
-                m_sent_generation = generation;
-                return;
-            }
+        if (!full && !frame_changed(frame)) {
+            m_sent_generation = generation;
+            return;
         }
 
         std::vector<uint8_t> payload{};
@@ -813,6 +849,19 @@ private:
             }
         }
         return false;
+    }
+
+    // H264 only needs to know whether anything moved, not where, so this stops
+    // at the first difference instead of walking the whole screen and building
+    // a rectangle list that send_h264_update would throw away.
+    bool frame_changed(const frame_buffer& frame) const {
+        if (m_previous.width != frame.width ||
+            m_previous.height != frame.height ||
+            m_previous.pixels.size() != frame.pixels.size()) {
+            return true;
+        }
+        return 0 != std::memcmp(frame.pixels.data(), m_previous.pixels.data(),
+                                frame.pixels.size());
     }
 
     void remember(const frame_buffer& frame) {

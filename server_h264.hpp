@@ -31,6 +31,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -331,20 +332,7 @@ private:
             throw std::runtime_error{"h264 packet allocation fail"};
         }
 
-        m_scaler = sws_getContext(m_encoded_width, m_encoded_height,
-                                  AV_PIX_FMT_BGRA, m_encoded_width,
-                                  m_encoded_height, AV_PIX_FMT_YUV420P,
-                                  SWS_BICUBIC | SWS_FULL_CHR_H_INT |
-                                      SWS_FULL_CHR_H_INP | SWS_ACCURATE_RND,
-                                  nullptr, nullptr, nullptr);
-        if (m_scaler == nullptr) {
-            throw std::runtime_error{"BGRA to YUV420P scaler creation fail"};
-        }
-        // The source is BGRA, which is always full range; the destination is
-        // the limited range BT.709 the encoder announces.
-        const int* coefficients = sws_getCoefficients(SWS_CS_ITU709);
-        sws_setColorspaceDetails(m_scaler, coefficients, 1, coefficients, 0, 0,
-                                 1 << 16, 1 << 16);
+        make_bands();
 
         if (m_encoded_width != m_width || m_encoded_height != m_height) {
             m_padded.assign(static_cast<size_t>(m_encoded_width) *
@@ -361,6 +349,70 @@ private:
         m_stream_reset = true;
     }
 
+    // BGRA to YUV420P is the single most expensive step of an update -- at 4K
+    // it costs about five times what the encode itself does -- and libswscale
+    // will not thread an unscaled conversion on its own. So the picture is cut
+    // into horizontal bands that convert in parallel, one scaler context per
+    // band.
+    //
+    // Naively converting a band in isolation does not reproduce the whole
+    // frame conversion: the chroma downsample has a vertical filter that reads
+    // rows beyond the 2x2 group, so every band edge comes out with chroma off
+    // by up to 16, a seam that lands on the same rows of every frame. Each
+    // band therefore also converts overlap_rows of its neighbours' pixels and
+    // keeps only its own interior, which makes the output bit-identical to the
+    // single band conversion. Four rows is enough for this filter; eight is
+    // used for margin, and costs a few percent of extra conversion.
+    static constexpr int overlap_rows = 8;
+
+    void make_bands() {
+        unsigned cores = std::thread::hardware_concurrency();
+        int count = static_cast<int>(std::clamp<unsigned>(cores, 1u, 8u));
+        // Bands smaller than this cost more in thread hand-off than they save.
+        constexpr int min_rows = 64;
+        count = std::clamp(count, 1, std::max(1, m_encoded_height / min_rows));
+        // Even, so that no 2x2 chroma group is split across two bands.
+        int rows = ((m_encoded_height + count - 1) / count + 1) & ~1;
+
+        // The source is BGRA, which is always full range; the destination is
+        // the limited range BT.709 the encoder announces.
+        const int* coefficients = sws_getCoefficients(SWS_CS_ITU709);
+        for (int y = 0; y < m_encoded_height; y += rows) {
+            band entry{};
+            entry.y = y;
+            entry.height = std::min(rows, m_encoded_height - y);
+            entry.above = std::min(overlap_rows, y);
+            int below =
+                std::min(overlap_rows, m_encoded_height - (y + entry.height));
+            int converted = entry.above + entry.height + below;
+
+            entry.scaler = sws_getContext(
+                m_encoded_width, converted, AV_PIX_FMT_BGRA, m_encoded_width,
+                converted, AV_PIX_FMT_YUV420P,
+                SWS_BICUBIC | SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP |
+                    SWS_ACCURATE_RND,
+                nullptr, nullptr, nullptr);
+            if (entry.scaler == nullptr) {
+                throw std::runtime_error{
+                    "BGRA to YUV420P scaler creation fail"};
+            }
+            sws_setColorspaceDetails(entry.scaler, coefficients, 1,
+                                     coefficients, 0, 0, 1 << 16, 1 << 16);
+
+            entry.scratch = av_frame_alloc();
+            if (entry.scratch == nullptr) {
+                throw std::runtime_error{"h264 band frame allocation fail"};
+            }
+            entry.scratch->format = AV_PIX_FMT_YUV420P;
+            entry.scratch->width = m_encoded_width;
+            entry.scratch->height = converted;
+            if (av_frame_get_buffer(entry.scratch, 32) < 0) {
+                throw std::runtime_error{"h264 band buffer allocation fail"};
+            }
+            m_bands.push_back(entry);
+        }
+    }
+
     void convert(const frame_buffer& source) {
         const uint8_t* data = source.pixels.data();
         int stride = static_cast<int>(source.stride());
@@ -369,10 +421,60 @@ private:
             data = m_padded.data();
             stride = m_encoded_width * 4;
         }
-        const uint8_t* slices[1] = {data};
-        int strides[1] = {stride};
-        sws_scale(m_scaler, slices, strides, 0, m_encoded_height, m_frame->data,
-                  m_frame->linesize);
+        auto convert_band = [&](const band& entry) {
+            const uint8_t* slices[1] = {
+                data + static_cast<size_t>(entry.y - entry.above) * stride};
+            int strides[1] = {stride};
+            sws_scale(entry.scaler, slices, strides, 0, entry.scratch->height,
+                      entry.scratch->data, entry.scratch->linesize);
+            // Only the interior is kept; the overlap existed purely to give the
+            // chroma filter the neighbouring rows it would have seen anyway.
+            for (int row = 0; row < entry.height; row++) {
+                std::memcpy(m_frame->data[0] +
+                                static_cast<size_t>(entry.y + row) *
+                                    m_frame->linesize[0],
+                            entry.scratch->data[0] +
+                                static_cast<size_t>(entry.above + row) *
+                                    entry.scratch->linesize[0],
+                            static_cast<size_t>(m_encoded_width));
+            }
+            for (int plane = 1; plane < 3; plane++) {
+                for (int row = 0; row < entry.height / 2; row++) {
+                    std::memcpy(m_frame->data[plane] +
+                                    static_cast<size_t>(entry.y / 2 + row) *
+                                        m_frame->linesize[plane],
+                                entry.scratch->data[plane] +
+                                    static_cast<size_t>(entry.above / 2 + row) *
+                                        entry.scratch->linesize[plane],
+                                static_cast<size_t>(m_encoded_width / 2));
+                }
+            }
+        };
+        if (m_bands.size() == 1) {
+            convert_band(m_bands.front());
+            return;
+        }
+        // The calling thread takes the last band rather than sitting idle.
+        std::vector<std::thread> workers{};
+        workers.reserve(m_bands.size() - 1);
+        // Joins whatever was started even when a later thread cannot be
+        // created: letting ~vector<thread> destroy a joinable thread calls
+        // std::terminate, while an exception out of here merely drops the
+        // session back to the ZRLE path the caller already handles.
+        struct joiner {
+            std::vector<std::thread>& threads;
+            ~joiner() {
+                for (std::thread& worker : threads) {
+                    if (worker.joinable()) {
+                        worker.join();
+                    }
+                }
+            }
+        } join_all{workers};
+        for (size_t i = 0; i + 1 < m_bands.size(); i++) {
+            workers.emplace_back(convert_band, std::cref(m_bands[i]));
+        }
+        convert_band(m_bands.back());
     }
 
     // Copies the frame into an even sized buffer, duplicating the last column
@@ -397,10 +499,15 @@ private:
     }
 
     void close() {
-        if (m_scaler != nullptr) {
-            sws_freeContext(m_scaler);
-            m_scaler = nullptr;
+        for (band& entry : m_bands) {
+            if (entry.scaler != nullptr) {
+                sws_freeContext(entry.scaler);
+            }
+            if (entry.scratch != nullptr) {
+                av_frame_free(&entry.scratch);
+            }
         }
+        m_bands.clear();
         if (m_packet != nullptr) {
             av_packet_free(&m_packet);
         }
@@ -418,7 +525,15 @@ private:
     AVCodecContext* m_context{};
     AVFrame* m_frame{};
     AVPacket* m_packet{};
-    SwsContext* m_scaler{};
+    // One horizontal band of the picture, converted independently of the rest.
+    struct band {
+        SwsContext* scaler;
+        AVFrame* scratch;
+        int y;       // first row of the band in the full picture
+        int height;  // rows this band owns
+        int above;   // overlap rows converted before y, then discarded
+    };
+    std::vector<band> m_bands{};
     std::vector<uint8_t> m_padded{};
     std::chrono::steady_clock::time_point m_opened_at{};
     int64_t m_last_pts{-1};
