@@ -567,6 +567,9 @@ int main(int argc, const char* argv[]) {
   try {
     auto usage_string =
                 "Usage: rfb_window_demo <address> <port> <encodings>\n"
+                "<encodings> is comma separated, by name or ID, e.g.\n"
+                "  h264,zrle,raw,quality9   or   50,16,0,-23\n"
+                "  quality0..quality9 set the H264 quality level\n"
                 "--log <enabled_logs>\n"
                 "--width <width>\n"
                 "--height <height>\n"
@@ -631,15 +634,14 @@ int main(int argc, const char* argv[]) {
                 port = strtol(argv[i], NULL, 10);
             }
             else if (pos_arg == 2) {
-                auto str = argv[i];
-                char* next;
-                while (*str != '\0') {
-                    auto v = strtol(str, &next, 10);
-                    if (next == str) {
-                        break;
-                    }
-                    str = next + 1;
-                    encodings.emplace_back(rfb::to_big_endian(v));
+                auto parsed = rfb::parse_encodings(argv[i]);
+                if (!parsed) {
+                    throw std::runtime_error{
+                        std::string{"unknown encoding: "} + argv[i]};
+                }
+                for (auto v : *parsed) {
+                    encodings.emplace_back(
+                        rfb::to_big_endian(static_cast<uint32_t>(v)));
                 }
             }
             else {

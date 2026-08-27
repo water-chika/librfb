@@ -313,7 +313,8 @@ int main(int argc, const char* argv[]) {
         "Connection options:\n"
         "  --password <pw>          password for VNC Authentication\n"
         "  --password-file <path>   read the password from the first line of <path>\n"
-        "  --encodings <list>       comma separated RFB encoding IDs (default: 0)\n"
+        "  --encodings <list>       comma separated RFB encodings, by name or ID,\n"
+        "                           e.g. zrle,raw or 16,0 (default: zrle,raw)\n"
         "  --key-delay <ms>         delay between keystrokes of --type (default: 12)\n"
         "  --timeout <ms>           framebuffer capture timeout (default: 10000)\n"
         "\n"
@@ -381,18 +382,15 @@ int main(int argc, const char* argv[]) {
             }
             else if (option == "encodings") {
                 require_args(i, 1, "--encodings");
-                auto str = argv[++i];
-                char* next;
-                while (*str != '\0') {
-                    auto v = strtol(str, &next, 10);
-                    if (next == str) {
-                        break;
-                    }
-                    str = next + (*next == '\0' ? 0 : 1);
-                    encodings.emplace_back(rfb::to_big_endian(static_cast<uint32_t>(v)));
-                    if (*next == '\0') {
-                        break;
-                    }
+                auto parsed = rfb::parse_encodings(argv[++i]);
+                if (!parsed) {
+                    throw std::runtime_error{
+                        std::string{"unknown encoding in --encodings: "} +
+                        argv[i]};
+                }
+                for (auto v : *parsed) {
+                    encodings.emplace_back(
+                        rfb::to_big_endian(static_cast<uint32_t>(v)));
                 }
             }
             else if (option == "move" || option == "click" || option == "press" || option == "release") {

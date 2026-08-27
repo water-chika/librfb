@@ -243,7 +243,8 @@ int main(int argc, const char* argv[]) {
                 "                         <n> seconds, for continuous/indefinite recording.\n"
                 "                         <path> is then used as a prefix: files are named\n"
                 "                         <stem>_<YYYYmmdd_HHMMSS><ext>, e.g. out_20260824_182322.mp4\n"
-                "<encodings>              comma/space separated numeric RFB encoding IDs\n"
+                "<encodings>              comma/space separated RFB encodings, by name or ID,\n"
+                "                         e.g. h264,zrle,raw or 50,16,0\n"
                 "                         (0=Raw, 16=ZRLE, 50=H264; default: 50,16,0)\n"
                 ;
     if (argc < 3) {
@@ -276,15 +277,14 @@ int main(int argc, const char* argv[]) {
                 port = strtol(argv[i], NULL, 10);
             }
             else if (pos_arg == 2) {
-                auto str = argv[i];
-                char* next;
-                while (*str != '\0') {
-                    auto v = strtol(str, &next, 10);
-                    if (next == str) {
-                        break;
-                    }
-                    str = next + 1;
-                    encodings.emplace_back(rfb::to_big_endian(v));
+                auto parsed = rfb::parse_encodings(argv[i]);
+                if (!parsed) {
+                    throw std::runtime_error{
+                        std::string{"unknown encoding: "} + argv[i]};
+                }
+                for (auto v : *parsed) {
+                    encodings.emplace_back(
+                        rfb::to_big_endian(static_cast<uint32_t>(v)));
                 }
             }
             else {

@@ -18,6 +18,8 @@ void print_usage() {
         "  --name <text>       desktop name shown by the viewer\n"
         "  --view-only         ignore keyboard and pointer events\n"
         "  --fps <n>           maximum capture rate (default 20)\n"
+        "  --quality <n>       H264 quality as a QP, 0 best .. 51 worst"
+        " (default 18)\n"
         "  --all-monitors      capture the whole virtual desktop\n"
         "  --no-cursor         do not draw the mouse cursor into the image\n"
         "  --console-launcher  (Windows) do not serve anything directly;\n"
@@ -101,6 +103,14 @@ int main(int argc, char** argv) {
                 options.max_fps = parse_int(require_value(argc, argv, i), "--fps");
                 if (options.max_fps < 1 || options.max_fps > 120) {
                     throw std::runtime_error{"--fps must be between 1 and 120"};
+                }
+            }
+            else if (argument == "--quality") {
+                options.h264_quality =
+                    parse_int(require_value(argc, argv, i), "--quality");
+                if (options.h264_quality < 0 || options.h264_quality > 51) {
+                    throw std::runtime_error{
+                        "--quality must be between 0 and 51"};
                 }
             }
             else if (argument == "--all-monitors") {

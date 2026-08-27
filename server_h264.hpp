@@ -26,8 +26,11 @@
 
 #ifdef RFB_SERVER_HAS_H264
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -70,6 +73,18 @@ public:
     // up_to_date says whether the packets describe the frame just handed in.
     // An encoder with output delay answers with an older picture instead, and
     // the caller must not then record this frame as one the client has seen.
+
+    // Constant-quality level in H.264 QP units. Takes effect the next time the
+    // encoder is opened, which a change here forces.
+    void set_quality(int quality) {
+        quality = std::clamp(quality, 0, 51);
+        if (quality == m_quality) {
+            return;
+        }
+        m_quality = quality;
+        close();
+    }
+
     bool encode(const frame_buffer& source, bool force_keyframe,
                 std::vector<uint8_t>& payload, uint32_t& flags,
                 bool& up_to_date) {
@@ -147,6 +162,50 @@ public:
     int height() const { return m_height; }
 
 private:
+    // Every encoder spells "constant quality" differently, and getting this
+    // wrong is what makes a screen stream look like a bad video call: with no
+    // rate control configured at all, both libx264 and h264_amf fall back to a
+    // fixed bitrate far too low for a 4K desktop, so text smears.
+    void apply_quality(const AVCodec* codec) {
+        const std::string_view name{codec->name};
+        const std::string quality = std::to_string(m_quality);
+        // A bitrate target and constant quality are mutually exclusive; the
+        // encoders below only honour the latter when no bitrate is asked for.
+        m_context->bit_rate = 0;
+        m_context->rc_max_rate = 0;
+        m_context->rc_buffer_size = 0;
+        if (name == "libx264") {
+            // x264's CRF is in QP units, so the same number means much the
+            // same thing here as it does for the hardware encoders.
+            av_opt_set(m_context->priv_data, "crf", quality.c_str(), 0);
+            return;
+        }
+        if (name.ends_with("_amf")) {
+            // AMF defaults to a latency-tuned VBR; constant QP is what keeps
+            // static text sharp instead of letting it settle over seconds.
+            av_opt_set(m_context->priv_data, "usage", "ultralowlatency", 0);
+            av_opt_set(m_context->priv_data, "quality", "quality", 0);
+            av_opt_set(m_context->priv_data, "rc", "cqp", 0);
+            av_opt_set(m_context->priv_data, "qp_i", quality.c_str(), 0);
+            av_opt_set(m_context->priv_data, "qp_p", quality.c_str(), 0);
+            av_opt_set(m_context->priv_data, "qp_b", quality.c_str(), 0);
+            // AMF's own defaults re-insert IDRs on a timer, which wastes
+            // bandwidth on a screen that mostly does not change.
+            av_opt_set(m_context->priv_data, "enforce_hrd", "0", 0);
+            return;
+        }
+        if (name.ends_with("_qsv") || name.ends_with("_nvenc")) {
+            av_opt_set(m_context->priv_data, "rc", "cqp", 0);
+            av_opt_set(m_context->priv_data, "cq", quality.c_str(), 0);
+            av_opt_set(m_context->priv_data, "qp", quality.c_str(), 0);
+            return;
+        }
+        // Anything else (libopenh264, the native encoders): the generic
+        // global_quality path, which is in FF_QP2LAMBDA units.
+        m_context->flags |= AV_CODEC_FLAG_QSCALE;
+        m_context->global_quality = FF_QP2LAMBDA * m_quality;
+    }
+
     void open(int width, int height) {
         // libx264 by name first: the tuning below is its, and a screen sharing
         // stream wants the one encoder that can be told to emit a packet per
@@ -194,6 +253,7 @@ private:
         m_context->color_trc = AVCOL_TRC_BT709;
         av_opt_set(m_context->priv_data, "preset", "veryfast", 0);
         av_opt_set(m_context->priv_data, "tune", "zerolatency", 0);
+        apply_quality(codec);
         if (avcodec_open2(m_context, codec, nullptr) < 0) {
             throw std::runtime_error{"h264 encoder open fail"};
         }
@@ -220,7 +280,9 @@ private:
         m_scaler = sws_getContext(m_encoded_width, m_encoded_height,
                                   AV_PIX_FMT_BGRA, m_encoded_width,
                                   m_encoded_height, AV_PIX_FMT_YUV420P,
-                                  SWS_BILINEAR, nullptr, nullptr, nullptr);
+                                  SWS_BICUBIC | SWS_FULL_CHR_H_INT |
+                                      SWS_FULL_CHR_H_INP | SWS_ACCURATE_RND,
+                                  nullptr, nullptr, nullptr);
         if (m_scaler == nullptr) {
             throw std::runtime_error{"BGRA to YUV420P scaler creation fail"};
         }
@@ -310,6 +372,7 @@ private:
     int m_encoded_width{};
     int m_encoded_height{};
     bool m_stream_reset{true};
+    int m_quality{18};
 };
 
 #else
@@ -320,6 +383,7 @@ inline constexpr bool h264_encoder_available = false;
 // encode(): negotiation never picks encoding 50 when the encoder is missing.
 class h264_encoder {
 public:
+    void set_quality(int) {}
     bool encode(const frame_buffer&, bool, std::vector<uint8_t>&, uint32_t&,
                 bool&) {
         return false;

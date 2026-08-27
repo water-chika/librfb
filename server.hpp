@@ -43,6 +43,10 @@ struct server_options {
     std::string desktop_name{"librfb"};
     bool view_only{false};
     int max_fps{20};
+    // H264 constant-quality level, in H.264 QP units (0 lossless .. 51 worst).
+    // Screen content is mostly flat colour and text, so it wants a far lower
+    // QP than camera video does before the text stops shimmering.
+    int h264_quality{18};
     capture_options capture{};
 };
 
@@ -138,6 +142,13 @@ inline constexpr uint32_t encoding_raw = 0;
 inline constexpr uint32_t encoding_zrle = 16;
 inline constexpr uint32_t encoding_h264 = 50;
 
+// Quality level pseudo-encodings: -32 is level 0 and -23 is level 9, sent as
+// two's complement in the 32 bit encoding field.
+inline constexpr uint32_t encoding_quality_min =
+    static_cast<uint32_t>(-32);
+inline constexpr uint32_t encoding_quality_max =
+    static_cast<uint32_t>(-23);
+
 // Thrown when the viewer goes away, which is an ordinary end of session
 // rather than a failure.
 struct client_gone : public std::runtime_error {
@@ -157,6 +168,7 @@ public:
           m_options{options},
           m_input{screen.origin_x(), screen.origin_y()} {
         socket_helper::set_no_delay(m_socket.get());
+        m_h264.set_quality(m_options.h264_quality);
     }
 
     void run() {
@@ -459,24 +471,56 @@ private:
         // The order the client sends is a priority hint, so the first entry
         // the server can produce wins. Raw needs no announcing, but a client
         // that lists it explicitly gets to rank it against the others.
+        // Pseudo-encodings carry no priority and may appear anywhere in the
+        // list, so the whole list is always scanned.
         auto chosen = encoding_raw;
+        bool picked = false;
+        int quality_level = -1;
         for (uint16_t i = 0; i < count; i++) {
             auto encoding = read_u32(&body[static_cast<size_t>(i) * 4]);
+            if (encoding >= encoding_quality_min &&
+                encoding <= encoding_quality_max) {
+                // -32 is level 0 (worst) and -23 is level 9 (best).
+                quality_level =
+                    static_cast<int>(encoding - encoding_quality_min);
+                continue;
+            }
+            if (picked) {
+                continue;
+            }
             if (encoding == encoding_h264 && h264_encoder_available) {
                 chosen = encoding_h264;
-                break;
+                picked = true;
             }
-            if (encoding == encoding_zrle) {
+            else if (encoding == encoding_zrle) {
                 chosen = encoding_zrle;
-                break;
+                picked = true;
             }
-            if (encoding == encoding_raw) {
-                break;
+            else if (encoding == encoding_raw) {
+                picked = true;
             }
+        }
+        if (quality_level >= 0) {
+            m_h264.set_quality(quality_to_qp(quality_level));
         }
         set_encoding(chosen);
         std::cout << std::format("[{}] encodings: {} offered, using {}\n", m_peer,
                                  count, encoding_name(m_encoding));
+        if (quality_level >= 0) {
+            std::cout << std::format("[{}] quality level {} (qp {})\n", m_peer,
+                                     quality_level,
+                                     quality_to_qp(quality_level));
+        }
+    }
+
+    // The ten quality levels are spread over the useful half of the QP scale:
+    // level 9 is visually lossless for screen content, level 0 is as coarse as
+    // is worth sending at all.
+    static int quality_to_qp(int level) {
+        constexpr int best_qp = 12;
+        constexpr int worst_qp = 39;
+        level = std::clamp(level, 0, 9);
+        return worst_qp - (worst_qp - best_qp) * level / 9;
     }
 
     static const char* encoding_name(uint32_t encoding) {
