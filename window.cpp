@@ -11,6 +11,7 @@
 #include "rfb.hpp"
 
 #include <memory>
+#include <deque>
 #include <thread>
 #include <fstream>
 
@@ -312,30 +313,70 @@ class add_rfb_latency_analyser : public T {
 public:
     using parent = T;
     add_rfb_latency_analyser(const configure auto& conf) : parent{conf},
-        framebuffer_update_request_time{std::chrono::steady_clock::now()},
         latency{}
     {
     }
     using clock = std::chrono::steady_clock;
+    // Summarises the frames drawn since the last read. A reporter sampling
+    // get_rfb_latency() on its own schedule would show whichever single frame
+    // happened to land last, which says little when the spread is what hurts.
+    struct latency_stats {
+        int count;
+        double mean_ms;
+        double worst_ms;
+    };
+    // The event loop pipelines: it asks for the next framebuffer before
+    // reading the one already sitting in the socket. Timing a draw against the
+    // most recent request therefore measures how long the local decode took
+    // rather than how long the client waited -- it reported under 2ms against
+    // a server measured at 28ms. Requests and framebuffer updates are one to
+    // one in RFB, so this queue pairs each drawn frame with the request that
+    // actually asked for it.
     auto draw() {
-        auto draw_time = clock::now();
-        latency = draw_time - framebuffer_update_request_time; // This ignores render and present latency
+        if (!m_pending.empty()) {
+            latency = clock::now() - m_pending.front();
+            m_pending.pop_front();
+            auto milliseconds =
+                std::chrono::duration<double, std::milli>(latency).count();
+            total_ms += milliseconds;
+            worst_ms = std::max(worst_ms, milliseconds);
+            count++;
+        }
         return parent::draw();
     }
     void request_framebuffer_update(int x, int y, int width, int height, bool increment_update=true) {
-        framebuffer_update_request_time = clock::now();
+        record_request();
         return parent::request_framebuffer_update(x, y, width, height, increment_update);
     }
     void request_framebuffer_update(int x=0, int y=0) {
-        framebuffer_update_request_time = clock::now();
+        record_request();
         return parent::request_framebuffer_update(x, y);
     }
     auto get_rfb_latency() {
         return latency;
     }
+    latency_stats take_rfb_latency_stats() {
+        latency_stats stats{count, count > 0 ? total_ms / count : 0.0, worst_ms};
+        count = 0;
+        total_ms = 0.0;
+        worst_ms = 0.0;
+        return stats;
+    }
 private:
-    clock::time_point framebuffer_update_request_time;
+    void record_request() {
+        // A server that answers none of them must not grow this without bound.
+        // Dropping the oldest also resynchronises the pairing rather than
+        // reporting an ever growing latency for the rest of the session.
+        if (m_pending.size() >= 64) {
+            m_pending.pop_front();
+        }
+        m_pending.push_back(clock::now());
+    }
+    std::deque<clock::time_point> m_pending;
     clock::duration latency;
+    int count{};
+    double total_ms{};
+    double worst_ms{};
 };
 
 template<typename T>
@@ -475,8 +516,15 @@ public:
             previous_time = now;
             auto encoding_type = parent::get_encoding();
             auto frame_network_byte_count = parent::get_frame_network_byte_count();
-            std::clog << std::format("encoding: {}, bytes: {}\r",
-                    encoding_type, frame_network_byte_count);
+            auto latency = parent::take_rfb_latency_stats();
+            // Fixed widths: the line is rewritten in place with a carriage
+            // return, so a shorter line would leave the tail of the previous
+            // one on screen.
+            std::clog << std::format(
+                    "encoding: {}, bytes: {:8}, latency: {:6.1f} ms"
+                    " (worst {:6.1f}, {:3} frames)\r",
+                    encoding_type, frame_network_byte_count,
+                    latency.mean_ms, latency.worst_ms, latency.count);
         }
         parent::process_events(fds);
     }
