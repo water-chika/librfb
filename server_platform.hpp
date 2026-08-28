@@ -442,6 +442,7 @@ public:
 
     void pointer_event(uint8_t button_mask, int x, int y) {
         follow_desktop();
+        m_pointer_seen = true;
         move_pointer(x, y);
 
         static constexpr struct {
@@ -505,7 +506,14 @@ public:
     // Releases whatever the client left held when it disconnects, so a
     // dropped connection cannot leave Ctrl or a mouse button stuck down.
     void release_all() {
-        pointer_event(0, m_last_x, m_last_y);
+        // Only clients that actually drove the pointer have anything to undo.
+        // A viewer that just watches - rfb_capture, or a second viewer that
+        // never moved the mouse - has m_last_x/m_last_y still at their zero
+        // default, and replaying that would teleport the cursor to the top
+        // left corner of the screen every time such a client disconnects.
+        if (m_pointer_seen && m_button_mask != 0) {
+            pointer_event(0, m_last_x, m_last_y);
+        }
         auto held = m_held_keys;
         for (auto vk : held) {
             send_key_vk(vk, false);
@@ -645,6 +653,7 @@ private:
     int m_origin_x{};
     int m_origin_y{};
     uint8_t m_button_mask{};
+    bool m_pointer_seen{false};
     int m_last_x{};
     int m_last_y{};
     bool m_control_down{false};

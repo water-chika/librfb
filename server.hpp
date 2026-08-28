@@ -493,7 +493,14 @@ private:
                     std::format("poll fail: {}", socket_helper::last_error())};
             }
             if (ret > 0) {
-                if (fd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                // POLLHUP comes back together with POLLIN when the peer wrote
+                // its last messages and closed straight away, which is exactly
+                // what a one-shot client like rfb_input does. Bailing out here
+                // would throw away input that has already arrived, so the
+                // hangup is only fatal once there is nothing left to read;
+                // read_exact reports the real end of the stream.
+                if ((fd.revents & POLLIN) == 0 &&
+                    (fd.revents & (POLLHUP | POLLERR | POLLNVAL))) {
                     throw client_gone{"connection dropped"};
                 }
                 // Drain what has already arrived before spending time

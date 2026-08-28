@@ -26,6 +26,19 @@ using cpp_helper::empty_configurable_class;
 
 namespace {
 
+// Reads and throws away everything the server has already queued for us, so the
+// connection can be closed cleanly. See the call site for why this matters.
+void drain_incoming(socket_helper::socket_t sock) {
+    char scratch[4096];
+    // Bounded: a server that keeps talking must not stall the tool forever.
+    for (int i = 0; i < 32; i++) {
+        pollfd fd{sock, POLLIN, 0};
+        if (socket_helper::poll_sockets(&fd, 1, 50) <= 0) break;
+        if ((fd.revents & POLLIN) == 0) break;
+        if (socket_helper::read_socket(sock, scratch, sizeof(scratch)) <= 0) break;
+    }
+}
+
 // Same headless protocol stack as rfb_recorder, plus a password layer so we can
 // talk to servers that require VNC Authentication.
 template<typename T>
@@ -426,6 +439,15 @@ int main(int argc, const char* argv[]) {
             break;
         }
     }
+
+    // The events are written, but the socket must not be slammed shut. This
+    // tool never asks for pixels, yet the server still pushes messages of its
+    // own - ServerCutText whenever the remote clipboard changes - and closing
+    // a connection while data is still queued for us makes the stack answer
+    // with an RST instead of a FIN. An RST discards whatever the peer has not
+    // read yet, so the events just sent die in the server's receive buffer and
+    // the click is silently lost. Draining first lets the close be orderly.
+    drain_incoming(client.get_socket());
   }
   catch (std::exception& e) {
     std::cerr << e.what() << std::endl;
