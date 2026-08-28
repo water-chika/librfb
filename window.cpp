@@ -140,6 +140,7 @@ public:
         }
     }
     void process_pointer_axis_event(uint32_t axis, int value) {
+        update_pointer_position();
         int mask = button_mask;
         if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
             if (value < 0) {
@@ -163,7 +164,14 @@ public:
         latest_y = y;
     }
     void process_pointer_button_event(int button, int button_state) {
-        std::cout << "pointer button event processing" << std::endl;
+        // Motion is only flushed once per poll iteration, so the press would
+        // otherwise be the first event carrying the new position: the server
+        // sees the pointer teleport and the button go down in one atomic
+        // event. X11 servers deliver that as a press at the new position with
+        // no motion before it, and toolkits that pick their click target from
+        // the preceding motion/enter simply drop the click. Send the move on
+        // its own first.
+        update_pointer_position();
         if (button_state == WL_POINTER_BUTTON_STATE_PRESSED) {
             if (button == BTN_LEFT) {
                 button_mask |= (1<<0);
@@ -183,7 +191,7 @@ public:
                 button_mask &= ~(1<<0);
             }
             else if (button == BTN_MIDDLE) {
-                button_mask &= ~(1<<2);
+                button_mask &= ~(1<<1);
             }
             else if (button == BTN_RIGHT) {
                 button_mask &= ~(1<<2);
