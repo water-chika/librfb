@@ -14,6 +14,7 @@ extern "C" {
 
 #include <chrono>
 #include <csignal>
+#include <fstream>
 #include <cstring>
 #include <ctime>
 #include <format>
@@ -31,6 +32,33 @@ volatile std::sig_atomic_t g_stop = 0;
 void handle_stop_signal(int) {
     g_stop = 1;
 }
+
+#ifndef _WIN32
+// std::signal() installs handlers with SA_RESTART on Linux (BSD signal
+// semantics), which transparently resumes an interrupted blocking recv()
+// once it returns EINTR. That is exactly why Ctrl-C did not stop this tool
+// promptly: g_stop was set, but process_server_message()'s read kept going
+// until the in-flight message finished arriving -- which, for the frozen
+// screen this tool exists to capture, can be never. sigaction() without
+// SA_RESTART makes that same recv() fail with EINTR immediately, so the
+// stop is felt mid-message rather than only between messages.
+void install_stop_signal(int sig) {
+    struct sigaction sa{};
+    sa.sa_handler = handle_stop_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (::sigaction(sig, &sa, nullptr) != 0) {
+        throw std::runtime_error("sigaction failed to install stop signal handler");
+    }
+}
+#else
+// Windows sockets are not interrupted by a signal handler the way a POSIX
+// blocking recv() is, so there is no equivalent fix to make here; keep the
+// previous behaviour (stop is still only noticed between messages).
+void install_stop_signal(int sig) {
+    std::signal(sig, handle_stop_signal);
+}
+#endif
 
 // RFB protocol stack: identical to the one used by rfb_window_demo
 // (window.cpp), minus everything Wayland/HIP/DRM related, since we only
@@ -53,14 +81,16 @@ using add_recorder_rfb =
     rfb::add_connection<
     rfb::set_port<
     rfb::set_address<
+    rfb::set_password_from_configure<
     T
-    >>>>>>>>>>>>>>>>
+    >>>>>>>>>>>>>>>>>
 ;
 
 struct config : public cpp_helper::empty_configure {
     const char* address;
     uint16_t port;
     std::vector<uint32_t> supported_encodings;
+    std::string password;
 };
 
 using recorder_rfb = add_recorder_rfb<empty_configurable_class>;
@@ -75,6 +105,21 @@ std::pair<std::string, std::string> split_stem_ext(const std::string& path) {
         return {path, ""};
     }
     return {path.substr(0, dot), path.substr(dot)};
+}
+
+// Same semantics as rfb_capture's: first line only, trailing CR/LF stripped,
+// so a password file written on Windows still works.
+std::string read_password_file(const char* path) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::logic_error(std::format("could not open password file: {}", path));
+    }
+    std::string password;
+    std::getline(in, password);
+    while (!password.empty() && (password.back() == '\r' || password.back() == '\n')) {
+        password.pop_back();
+    }
+    return password;
 }
 
 std::string make_segment_path(const std::string& output_path, bool segmented) {
@@ -237,8 +282,13 @@ private:
 int main(int argc, const char* argv[]) {
   try {
     auto usage_string =
-                "Usage: rfb_recorder <address> <port> <encodings> --output <path> [--segment-seconds <n>]\n"
+                "Usage: rfb_recorder <address> <port> <encodings> --output <path> [options]\n"
                 "--output <path>          output video file path (required, e.g. out.mp4)\n"
+                "--password <pw>          password for VNC Authentication\n"
+                "--password-file <path>   read the password from the first line of <path>\n"
+                "--heartbeat-seconds <n>  re-emit the last frame after <n>s of no updates so the\n"
+                "                         timeline keeps advancing while the screen is frozen\n"
+                "                         (default: 2, 0 disables)\n"
                 "--segment-seconds <n>    (optional) rotate to a new output file every\n"
                 "                         <n> seconds, for continuous/indefinite recording.\n"
                 "                         <path> is then used as a prefix: files are named\n"
@@ -254,7 +304,9 @@ int main(int argc, const char* argv[]) {
     uint16_t port = 5900;
     std::vector<uint32_t> encodings{};
     const char* output_path = nullptr;
+    std::string password{};
     long segment_seconds = 0; // 0 = disabled, single continuous file
+    long heartbeat_seconds = 2;
     for (int i = 1, pos_arg = 0; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] == '-') {
             if (strcmp(&argv[i][2], "output") == 0) {
@@ -263,6 +315,18 @@ int main(int argc, const char* argv[]) {
             }
             else if (strcmp(&argv[i][2], "segment-seconds") == 0) {
                 segment_seconds = strtol(argv[i+1], NULL, 10);
+                i += 1;
+            }
+            else if (strcmp(&argv[i][2], "password") == 0) {
+                password = argv[i+1];
+                i += 1;
+            }
+            else if (strcmp(&argv[i][2], "heartbeat-seconds") == 0) {
+                heartbeat_seconds = strtol(argv[i+1], NULL, 10);
+                i += 1;
+            }
+            else if (strcmp(&argv[i][2], "password-file") == 0) {
+                password = read_password_file(argv[i+1]);
                 i += 1;
             }
             else {
@@ -300,12 +364,13 @@ int main(int argc, const char* argv[]) {
         throw std::logic_error(usage_string);
     }
 
-    std::signal(SIGINT, handle_stop_signal);
-    std::signal(SIGTERM, handle_stop_signal);
+    install_stop_signal(SIGINT);
+    install_stop_signal(SIGTERM);
 
     auto conf = config{
         .address = address, .port = port,
         .supported_encodings = std::move(encodings),
+        .password = std::move(password),
     };
     recorder_rfb client{conf};
 
@@ -329,12 +394,51 @@ int main(int argc, const char* argv[]) {
     auto segment_start = std::chrono::steady_clock::now();
 
     client.framebuffer_update_request(0, 0, width, height, false);
+    auto last_write = std::chrono::steady_clock::now();
     while (!g_stop) {
-        client.process_server_message();
+        // Wait on the socket with a timeout rather than blocking in
+        // process_server_message(). A blocking read is indefinite when the
+        // screen is static, which means the heartbeat below would never get
+        // a chance to run while nothing has arrived yet.
+        pollfd pfd{client.get_socket(), POLLIN, 0};
+        int ready = socket_helper::poll_sockets(&pfd, 1, 200);
+        if (ready > 0) {
+            try {
+                client.process_server_message();
+            }
+            catch (std::exception&) {
+                // A message can still be arriving when Ctrl-C lands, and
+                // install_stop_signal() makes that recv() fail with EINTR
+                // right away rather than silently resuming. g_stop being set
+                // is how we tell that expected interruption apart from a
+                // real I/O error: only the former should reach video_writer's
+                // finish() below instead of being reported as a failure.
+                if (g_stop) {
+                    break;
+                }
+                throw;
+            }
+        }
+        else if (ready < 0 && errno != EINTR) {
+            throw std::runtime_error("poll on rfb socket failed");
+        }
         if (client.is_frame_updated()) {
             client.reset_frame_updated();
             auto frame_data = client.get_frame();
             writer->write_frame(frame_data.data(), width, height);
+            last_write = std::chrono::steady_clock::now();
+        }
+        else if (heartbeat_seconds > 0) {
+            // Re-emit the last framebuffer so elapsed wall-clock stays visible
+            // in the video even while nothing changes. Without this a frozen
+            // screen simply ends the recording, and the duration of the freeze
+            // -- evidence in its own right -- would be unrecoverable.
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_write >= std::chrono::seconds(heartbeat_seconds)) {
+                auto frame_data = client.get_frame();
+                writer->write_frame(frame_data.data(), width, height);
+                last_write = now;
+            }
         }
         if (segmented) {
             auto now = std::chrono::steady_clock::now();
