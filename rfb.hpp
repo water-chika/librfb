@@ -651,6 +651,11 @@ public:
     auto get_supported_encodings() {
         return supported_encodings;
     }
+    // Lets a live session re-negotiate its encodings without reconnecting.
+    // The state already lives here, so the setter belongs here too.
+    void set_supported_encodings(std::vector<uint32_t> encodings) {
+        supported_encodings = std::move(encodings);
+    }
 private:
     std::vector<uint32_t> supported_encodings;
 };

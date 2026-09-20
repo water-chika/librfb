@@ -9,6 +9,7 @@
 #include "linux/input-event-codes.h"
 
 #include "rfb.hpp"
+#include "control.hpp"
 
 #include <memory>
 #include <deque>
@@ -570,6 +571,7 @@ using draw_app =
     xkb_helper::add_keymap<
     xkb_helper::add_context<
     add_info_printer<
+    rfb_control::add_control_port<
     add_rfb_socket_pollfd<
     add_rfb_reduce_update<
     add_rfb_latency_analyser<
@@ -598,7 +600,7 @@ using draw_app =
     wayland_helper::add_wayland_surface<
     cpp_helper::add_logger<
     empty_class
-    >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 ;
 
 using namespace std::literals;
@@ -626,6 +628,7 @@ struct config : public empty_configure {
     const char* drm_device_path;
     bool view_only;
     std::string password;
+    uint16_t control_port;
 };
 
 int main(int argc, const char* argv[]) {
@@ -642,6 +645,9 @@ int main(int argc, const char* argv[]) {
                 "--view-only\n"
                 "--password <password>\n"
                 "--password-file <path>\n"
+                "--control-port <port>   accept line-oriented control\n"
+                "                        commands on 127.0.0.1:<port>\n"
+                "                        (off unless given)\n"
                 ;
     if (argc < 3) {
         throw std::logic_error(
@@ -656,6 +662,7 @@ int main(int argc, const char* argv[]) {
     const char* drm_device_path = "";
     bool view_only = false;
     std::string password{};
+    uint16_t control_port = 0;
     for (int i = 1, pos_arg=0; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] == '-') {
             if (strcmp(&argv[i][2], "log") == 0) {
@@ -679,6 +686,10 @@ int main(int argc, const char* argv[]) {
             }
             else if (strcmp(&argv[i][2], "password") == 0) {
                 password = argv[i+1];
+                i += 1;
+            }
+            else if (strcmp(&argv[i][2], "control-port") == 0) {
+                control_port = strtol(argv[i+1], NULL, 10);
                 i += 1;
             }
             else if (strcmp(&argv[i][2], "password-file") == 0) {
@@ -729,6 +740,7 @@ int main(int argc, const char* argv[]) {
         .drm_device_path = drm_device_path,
         .view_only = view_only,
         .password = std::move(password),
+        .control_port = control_port,
     };
     auto app = draw_app{conf};
   } catch (rfb::connection_closed &e) {
