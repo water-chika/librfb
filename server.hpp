@@ -57,6 +57,22 @@ struct server_options {
     // Zero means no limit. Purely a test knob: it makes a fast loopback
     // connection behave like a slow link.
     int bandwidth_kbit{0};
+    // Server-side downscale, applied to the captured image before it is
+    // encoded. 1.0 serves the desktop at its real size. 0.5 serves it at half
+    // width and half height, i.e. a quarter of the pixels.
+    //
+    // This is where scaling actually saves bandwidth: the client receives
+    // fewer pixels. Scaling in the viewer instead would fit the window but
+    // send exactly as many bytes.
+    double scale{1.0};
+    // Upper bound on the served width, in pixels. Zero means no bound. When
+    // both are given the stricter of the two wins, so --max-width can cap a
+    // large desktop without having to know its size in advance.
+    int max_width{0};
+    // Downscale filter: true averages the source block (box), false samples a
+    // single pixel (nearest). Nearest preserves the flat colour runs that
+    // ZRLE compresses, box keeps small text readable.
+    bool scale_box_filter{true};
     capture_options capture{};
 };
 
@@ -73,15 +89,130 @@ inline std::string default_desktop_name() {
 
 // Captures the desktop at most max_fps times a second and shares the result
 // with every connected session. Frames are handed out as shared_ptr so a
+// Works out what size a capture of src_width x src_height should be served
+// at. The scale factor and the width cap are both honoured, whichever binds
+// harder, and the result is rounded down to even dimensions because the H264
+// encoder cannot take odd ones.
+inline void served_size(int src_width, int src_height, double scale,
+                        int max_width, int& out_width, int& out_height) {
+    out_width = src_width;
+    out_height = src_height;
+    if (src_width <= 0 || src_height <= 0) {
+        return;
+    }
+    double factor = (scale > 0.0 && scale < 1.0) ? scale : 1.0;
+    if (max_width > 0 && src_width > max_width) {
+        factor = std::min(factor, static_cast<double>(max_width) / src_width);
+    }
+    if (factor >= 1.0) {
+        return;
+    }
+    out_width = std::max(2, static_cast<int>(src_width * factor) & ~1);
+    out_height = std::max(2, static_cast<int>(src_height * factor) & ~1);
+}
+
+// Reduces the captured image to the served size, either by averaging each
+// destination pixel over the source block it covers (box) or by picking one
+// source pixel from it (nearest).
+//
+// The filter choice is a bandwidth decision, not just a quality one. Box
+// averaging keeps small text legible, but it invents an intermediate colour
+// at every edge, which destroys the long identical-colour runs that ZRLE
+// relies on: on flat, poster-like content a box-filtered half-size frame can
+// encode LARGER than the full-size original. Nearest-neighbour keeps flat
+// regions flat and so keeps the encoder's runs intact, at the cost of
+// aliasing thin glyphs. Measured numbers for both are in the README.
+inline void downscale_frame(const frame_buffer& src, frame_buffer& dst,
+                            int dst_width, int dst_height,
+                            bool box_filter = true) {
+    if (dst.width != dst_width || dst.height != dst_height) {
+        dst.resize(dst_width, dst_height);
+    }
+    if (src.width <= 0 || src.height <= 0) {
+        return;
+    }
+    for (int y = 0; y < dst_height; y++) {
+        int y0 = static_cast<int>(static_cast<int64_t>(y) * src.height / dst_height);
+        int y1 = static_cast<int>(static_cast<int64_t>(y + 1) * src.height / dst_height);
+        if (y1 <= y0) y1 = y0 + 1;
+        uint8_t* dst_row = dst.pixels.data() + static_cast<size_t>(y) * dst.stride();
+        for (int x = 0; x < dst_width; x++) {
+            int x0 = static_cast<int>(static_cast<int64_t>(x) * src.width / dst_width);
+            int x1 = static_cast<int>(static_cast<int64_t>(x + 1) * src.width / dst_width);
+            if (x1 <= x0) x1 = x0 + 1;
+            uint32_t blue = 0, green = 0, red = 0, count = 0;
+            if (!box_filter) {
+                const uint8_t* pixel = src.pixels.data()
+                    + static_cast<size_t>(y0) * src.stride()
+                    + static_cast<size_t>(x0) * 4;
+                blue = pixel[0];
+                green = pixel[1];
+                red = pixel[2];
+                count = 1;
+            } else
+            for (int sy = y0; sy < y1; sy++) {
+                const uint8_t* src_row =
+                    src.pixels.data() + static_cast<size_t>(sy) * src.stride();
+                for (int sx = x0; sx < x1; sx++) {
+                    const uint8_t* pixel = src_row + static_cast<size_t>(sx) * 4;
+                    blue += pixel[0];
+                    green += pixel[1];
+                    red += pixel[2];
+                    count++;
+                }
+            }
+            uint8_t* out = dst_row + static_cast<size_t>(x) * 4;
+            out[0] = static_cast<uint8_t>(blue / count);
+            out[1] = static_cast<uint8_t>(green / count);
+            out[2] = static_cast<uint8_t>(red / count);
+            out[3] = 0;
+        }
+    }
+}
+
 // slow client can keep encoding an older frame while a new one is captured.
 class screen_source {
 public:
-    screen_source(const capture_options& options, int max_fps)
+    screen_source(const capture_options& options, int max_fps,
+                  double scale = 1.0, int max_width = 0,
+                  bool box_filter = true)
         : m_capture{options},
-          m_interval{std::chrono::microseconds{1000000 / std::max(1, max_fps)}} {}
+          m_interval{std::chrono::microseconds{1000000 / std::max(1, max_fps)}},
+          m_scale{scale},
+          m_max_width{max_width},
+          m_box_filter{box_filter} {}
 
-    int width() const { return m_capture.width(); }
-    int height() const { return m_capture.height(); }
+    // The size the client is told about and every encoder works in, which is
+    // the captured size only when no downscale is configured.
+    int width() const {
+        int w = 0, h = 0;
+        served_size(m_capture.width(), m_capture.height(), m_scale, m_max_width,
+                    w, h);
+        return w;
+    }
+    int height() const {
+        int w = 0, h = 0;
+        served_size(m_capture.width(), m_capture.height(), m_scale, m_max_width,
+                    w, h);
+        return h;
+    }
+    bool scaling() const {
+        return width() != m_capture.width() || height() != m_capture.height();
+    }
+    // Maps a viewer coordinate back into the real desktop, so that a pointer
+    // event still lands where the user aimed it when the image was shrunk.
+    int to_capture_x(int x) const {
+        int served = width();
+        if (served <= 0 || served == m_capture.width()) return x;
+        return static_cast<int>(static_cast<int64_t>(x) * m_capture.width() /
+                                served);
+    }
+    int to_capture_y(int y) const {
+        int served = height();
+        if (served <= 0 || served == m_capture.height()) return y;
+        return static_cast<int>(static_cast<int64_t>(y) * m_capture.height() /
+                                served);
+    }
     int origin_x() const { return m_capture.origin_x(); }
     int origin_y() const { return m_capture.origin_y(); }
 
@@ -93,7 +224,20 @@ public:
         auto now = std::chrono::steady_clock::now();
         if (m_current == nullptr || now - m_captured_at >= m_interval) {
             auto next = acquire_buffer();
-            if (m_capture.capture(*next)) {
+            // With no downscale the capture lands straight in the buffer the
+            // session will encode. With one, it goes through m_raw first and
+            // only the shrunk copy is ever published.
+            bool captured = false;
+            if (scaling()) {
+                captured = m_capture.capture(m_raw);
+                if (captured) {
+                    downscale_frame(m_raw, *next, width(), height(), m_box_filter);
+                }
+            }
+            else {
+                captured = m_capture.capture(*next);
+            }
+            if (captured) {
                 m_current = next;
                 m_generation++;
                 m_failures = 0;
@@ -160,6 +304,12 @@ private:
     std::vector<std::shared_ptr<frame_buffer>> m_pool{};
     uint64_t m_generation{0};
     uint64_t m_failures{0};
+    double m_scale{1.0};
+    int m_max_width{0};
+    bool m_box_filter{true};
+    // Scratch full-size capture, used only when downscaling. Kept as a member
+    // so the full-resolution buffer is allocated once, not once per frame.
+    frame_buffer m_raw{};
 };
 
 struct rectangle {
@@ -808,8 +958,9 @@ private:
         std::array<uint8_t, 5> message{};
         read_exact(message.data(), message.size());
         if (m_options.view_only) return;
-        m_input.pointer_event(message[0], read_u16(&message[1]),
-                              read_u16(&message[3]));
+        m_input.pointer_event(message[0],
+                              m_screen.to_capture_x(read_u16(&message[1])),
+                              m_screen.to_capture_y(read_u16(&message[3])));
     }
 
     void client_cut_text() {
@@ -1129,7 +1280,8 @@ class rfb_server {
 public:
     explicit rfb_server(const server_options& options)
         : m_options{options},
-          m_screen{options.capture, options.max_fps} {}
+          m_screen{options.capture, options.max_fps, options.scale,
+                   options.max_width, options.scale_box_filter} {}
 
     int width() const { return m_screen.width(); }
     int height() const { return m_screen.height(); }

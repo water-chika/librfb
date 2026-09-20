@@ -1,6 +1,7 @@
 #include "server.hpp"
 
 #include <charconv>
+#include <cstdlib>
 
 namespace {
 
@@ -27,6 +28,20 @@ void print_usage() {
         "  --bandwidth <kbit>  cap what each client is written at, in kbit/s,\n"
         "                      to imitate a slow link (default: no cap). A\n"
         "                      test knob, not a fair-sharing policy\n"
+        "  --scale <factor>    serve the desktop downscaled by this factor,\n"
+        "                      e.g. 0.5 for half width and half height, i.e.\n"
+        "                      a quarter of the pixels (default 1.0, no\n"
+        "                      scaling). The image is shrunk before it is\n"
+        "                      encoded, so the saving is real bytes on the\n"
+        "                      wire, not just a smaller window\n"
+        "  --max-width <n>     never serve wider than this many pixels,\n"
+        "                      shrinking proportionally if the desktop is\n"
+        "                      bigger (default: no limit). Combines with\n"
+        "                      --scale; the stricter of the two wins\n"
+        "  --scale-filter <f>  box (default) or nearest. box averages and\n"
+        "                      keeps text legible; nearest preserves flat\n"
+        "                      colour runs, which ZRLE compresses far\n"
+        "                      better on poster-like content\n"
         "  --all-monitors      capture the whole virtual desktop\n"
         "  --no-cursor         do not draw the mouse cursor into the image\n"
         "  --console-launcher  (Windows) do not serve anything directly;\n"
@@ -54,6 +69,19 @@ int parse_int(const std::string& text, const char* what) {
     int value = 0;
     auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
     if (ec != std::errc{} || ptr != text.data() + text.size()) {
+        throw std::runtime_error{std::format("{} is not a number: {}", what, text)};
+    }
+    return value;
+}
+
+// std::from_chars for floating point is not available everywhere this builds,
+// so the scale factor is parsed with strtod and then checked to have consumed
+// the whole argument, which rejects "0.5x" the same way parse_int would.
+double parse_double(const std::string& text, const char* what) {
+    const char* begin = text.c_str();
+    char* end = nullptr;
+    double value = std::strtod(begin, &end);
+    if (end != begin + text.size() || text.empty()) {
         throw std::runtime_error{std::format("{} is not a number: {}", what, text)};
     }
     return value;
@@ -129,6 +157,37 @@ int main(int argc, char** argv) {
                 if (options.bandwidth_kbit < 0) {
                     throw std::runtime_error{
                         "--bandwidth must not be negative"};
+                }
+            }
+            else if (argument == "--scale") {
+                options.scale =
+                    parse_double(require_value(argc, argv, i), "--scale");
+                // Upscaling would cost bandwidth rather than save it, and an
+                // arbitrarily small factor collapses the image to nothing.
+                if (!(options.scale > 0.0) || options.scale > 1.0) {
+                    throw std::runtime_error{
+                        "--scale must be greater than 0 and at most 1.0"};
+                }
+            }
+            else if (argument == "--max-width") {
+                options.max_width =
+                    parse_int(require_value(argc, argv, i), "--max-width");
+                if (options.max_width < 0) {
+                    throw std::runtime_error{
+                        "--max-width must not be negative"};
+                }
+            }
+            else if (argument == "--scale-filter") {
+                std::string filter = require_value(argc, argv, i);
+                if (filter == "box") {
+                    options.scale_box_filter = true;
+                }
+                else if (filter == "nearest") {
+                    options.scale_box_filter = false;
+                }
+                else {
+                    throw std::runtime_error{
+                        "--scale-filter must be box or nearest"};
                 }
             }
             else if (argument == "--all-monitors") {
