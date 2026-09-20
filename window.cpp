@@ -36,6 +36,7 @@ public:
 template<typename T>
 using add_rfb_parent =
     rfb::add_rfb<
+    rfb::add_request_scale<
     rfb::add_process_framebuffer_update<
     rfb::add_decode_h264<
     rfb::add_yuv_to_rgb<
@@ -54,7 +55,7 @@ using add_rfb_parent =
     rfb::set_address<
     rfb::set_password_from_configure<
     T
-    >>>>>>>>>>>>>>>>>>
+    >>>>>>>>>>>>>>>>>>>
 ;
 template<class T>
 class add_rfb : public add_rfb_parent<T> {
@@ -272,11 +273,22 @@ public:
         auto fb_width = parent::get_fb_width();
         auto fb_height = parent::get_fb_height();
         hipHostMalloc(&upload_ptr, fb_width*fb_height*sizeof(uint32_t));
+        upload_size = static_cast<size_t>(fb_width) * fb_height
+                * sizeof(uint32_t);
         assert(upload_ptr != nullptr);
     }
     void draw() {
         auto fb_width = parent::get_fb_width();
         auto fb_height = parent::get_fb_height();
+        // The server can rescale mid-session, so the staging buffer is sized
+        // per draw rather than once at construction.
+        auto needed = static_cast<size_t>(fb_width) * fb_height
+                * sizeof(uint32_t);
+        if (needed > upload_size) {
+            if (upload_ptr) hipHostFree(upload_ptr);
+            hipHostMalloc(&upload_ptr, needed);
+            upload_size = needed;
+        }
         auto [width,height] = parent::get_surface_resolution();
         auto hip_memory = parent::get_external_memory();
         auto frame_ptr = reinterpret_cast<uint32_t*>(parent::get_external_memory_buffer());
@@ -315,6 +327,7 @@ public:
     }
 private:
     uint32_t* upload_ptr;
+    size_t upload_size{};
 };
 
 template<class T>
@@ -731,6 +744,11 @@ int main(int argc, const char* argv[]) {
     if (encodings.size() == 0) {
         encodings = {rfb::to_big_endian(50), rfb::to_big_endian(16), 0};
     }
+    // Advertise the private scale extension. A server that does not know it
+    // ignores it like any other unsupported pseudo-encoding, and this viewer
+    // then never sends a scale request, so nothing is wedged either way.
+    encodings.emplace_back(rfb::to_big_endian(
+            static_cast<uint32_t>(rfb::encoding::scale_ext)));
     auto conf = config{
         .address=address, .port=port,
         .supported_encodings = std::move(encodings),

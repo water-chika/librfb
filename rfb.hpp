@@ -43,11 +43,17 @@ enum class encoding : uint32_t {
     raw = 0,
     zrle = 16,
     h264 = 50,
+    // Private librfb pseudo-encoding: "server supports live rescaling, and
+    // the rectangle header carries the size it is now serving". -1729 as
+    // unsigned. Pseudo-encodings are ignorable by definition, so a standard
+    // server simply never mentions it and a standard viewer never sees it.
+    scale_ext = 0xFFFFF93Fu,
 };
 static auto encoding_str_map = std::map<rfb::encoding, std::string_view>{
     {encoding::raw, "raw"},
     {encoding::zrle, "ZRLE"},
     {encoding::h264, "H264"},
+    {encoding::scale_ext, "SCALE_EXT"},
 };
 
 auto& operator<<(std::ostream& out, rfb::encoding encode) {
@@ -89,6 +95,11 @@ public:
         internal_frame(parent::get_width()*parent::get_height()*4)
     {
     }
+private:
+    bool scale_ext_supported{false};
+public:
+
+    bool is_scale_ext_supported() const { return scale_ext_supported; }
 
     auto process_framebuffer_update(auto& framebuffer_update_head) {
         uint16_t rectangles_count = from_big_endian_bytes(framebuffer_update_head[2], framebuffer_update_head[3]);
@@ -119,6 +130,18 @@ public:
                 std::cerr << "width: " << width << std::endl;
                 std::cerr << "height: " << height << std::endl;
                 std::cerr << "encoding_type: " << encoding_type << std::endl;
+            }
+            if (encoding_type == encoding::scale_ext) {
+                // Carries no pixel data: the header IS the message. Seeing it
+                // at all is the server advertising support, so the client may
+                // start asking for scale changes from here on.
+                scale_ext_supported = true;
+                parent::set_framebuffer_size(width, height);
+                internal_frame.assign(
+                        static_cast<size_t>(width) * height * 4, 0);
+                fb_width = width;
+                fb_height = height;
+                continue;
             }
             if (encoding_type == encoding::raw) {
                 auto pixels = std::vector<uint8_t>(width*height*4);
@@ -682,6 +705,38 @@ public:
     }
 };
 
+// Client half of the private scale extension. Sends "serve me at this
+// fraction of the captured size" on the existing connection, so nothing
+// reconnects and no second port is needed.
+//
+// Degrades gracefully by construction: the request is only ever written after
+// the server has advertised support by sending a scale_ext rectangle, so a
+// standard server is never handed a message type it cannot parse. Guarding on
+// the peer's advertisement, rather than on our own, is what keeps this from
+// wedging anything that does not speak it.
+inline constexpr uint8_t client_message_set_scale = 180;
+
+template<typename T>
+class add_request_scale : public T {
+public:
+    using parent = T;
+    add_request_scale(const configure auto& conf) : parent{conf} {}
+    // permille: 1000 = native size, 500 = half, 250 = quarter.
+    bool request_scale(int permille) {
+        if (!parent::is_scale_ext_supported()) {
+            return false;
+        }
+        permille = std::clamp(permille, 10, 1000);
+        auto message = std::to_array<uint8_t>({
+            client_message_set_scale, 0,
+            to_big_endian_byte(static_cast<uint16_t>(permille), 0),
+            to_big_endian_byte(static_cast<uint16_t>(permille), 1),
+        });
+        parent::rfb_write(message);
+        return true;
+    }
+};
+
 template<typename T>
 class add_set_encodings : public T {
 public:
@@ -788,6 +843,12 @@ public:
     }
     auto get_height() {
         return server_info.fb_height;
+    }
+    // The served size changes when the peer rescales, which is the whole
+    // point of the scale extension, so it cannot stay fixed at ServerInit.
+    void set_framebuffer_size(uint16_t width, uint16_t height) {
+        server_info.fb_width = width;
+        server_info.fb_height = height;
     }
 private:
     server_init_message server_info;

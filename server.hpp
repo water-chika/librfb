@@ -196,6 +196,10 @@ public:
                     w, h);
         return h;
     }
+    void set_scale(double scale) {
+        std::lock_guard lock{m_mutex};
+        m_scale = scale;
+    }
     bool scaling() const {
         return width() != m_capture.width() || height() != m_capture.height();
     }
@@ -374,6 +378,14 @@ private:
 inline constexpr uint32_t encoding_raw = 0;
 inline constexpr uint32_t encoding_zrle = 16;
 inline constexpr uint32_t encoding_h264 = 50;
+// Private librfb pseudo-encoding (-1729) and the matching client message
+// type. See rfb.hpp for the negotiation rules: the server only ever emits the
+// pseudo-encoding to a client that advertised it, and only such a client will
+// ever send client_message_set_scale, so neither half can confuse a standard
+// peer. The value is far from the assigned pseudo-encoding ranges to avoid
+// colliding with Tight, DesktopSize, Fence and friends.
+inline constexpr uint32_t encoding_scale_ext = 0xFFFFF93Fu;
+inline constexpr uint8_t client_message_set_scale = 180;
 
 // Quality level pseudo-encodings: -32 is level 0 and -23 is level 9, sent as
 // two's complement in the 32 bit encoding field.
@@ -700,6 +712,7 @@ private:
         case 4: key_event(); break;
         case 5: pointer_event(); break;
         case 6: client_cut_text(); break;
+        case client_message_set_scale: set_scale_request(); break;
         default:
             // Message lengths are not self describing, so an unknown type
             // makes the rest of the stream unparseable.
@@ -731,6 +744,43 @@ private:
                                  static_cast<int>(format.depth));
     }
 
+    // Applies a live rescale requested over the extension. The served size
+    // changes, so the retained previous frame is worthless and the next
+    // update must be a full one -- a resolution change is the one case where
+    // a full resend genuinely cannot be avoided.
+    void set_scale_request() {
+        std::array<uint8_t, 3> body{};
+        read_exact(body.data(), body.size());
+        uint16_t permille = read_u16(&body[1]);
+        if (!m_scale_ext) {
+            return;
+        }
+        permille = std::clamp<uint16_t>(permille, 10, 1000);
+        m_screen.set_scale(permille / 1000.0);
+        m_previous = frame_buffer{};
+        m_announce_scale = true;
+        m_requested = rectangle{0, 0, m_screen.width(), m_screen.height()};
+        std::cerr << std::format("[{}] scale set to {} -> {}x{}\n", m_peer,
+                                 permille / 1000.0, m_screen.width(),
+                                 m_screen.height());
+    }
+
+    // One rectangle, no pixel payload: the header tells the client the size
+    // now being served. Also doubles as the support advertisement.
+    void send_scale_announcement() {
+        std::vector<uint8_t> message{};
+        message.push_back(0); // FramebufferUpdate
+        message.push_back(0); // padding
+        push_u16(message, 1);
+        push_u16(message, 0);
+        push_u16(message, 0);
+        push_u16(message, static_cast<uint16_t>(m_screen.width()));
+        push_u16(message, static_cast<uint16_t>(m_screen.height()));
+        push_u32(message, encoding_scale_ext);
+        write_bytes(message);
+        m_announce_scale = false;
+    }
+
     void set_encodings() {
         std::array<uint8_t, 3> header{};
         read_exact(header.data(), header.size());
@@ -749,6 +799,13 @@ private:
         int quality_level = -1;
         for (uint16_t i = 0; i < count; i++) {
             auto encoding = read_u32(&body[static_cast<size_t>(i) * 4]);
+            if (encoding == encoding_scale_ext) {
+                // The client speaks the extension, so it is safe to answer
+                // with the pseudo-encoding rectangle.
+                m_scale_ext = true;
+                m_announce_scale = true;
+                continue;
+            }
             if (encoding >= encoding_quality_min &&
                 encoding <= encoding_quality_max) {
                 // -32 is level 0 (worst) and -23 is level 9 (best).
@@ -1011,6 +1068,9 @@ private:
         if (frame == nullptr || frame->width == 0) {
             return;
         }
+        if (m_announce_scale) {
+            send_scale_announcement();
+        }
         bool full = !m_incremental || m_previous.pixels.empty() ||
                     m_previous.width != frame->width ||
                     m_previous.height != frame->height;
@@ -1260,6 +1320,8 @@ private:
     rectangle m_requested{};
     bool m_update_pending{false};
     bool m_incremental{false};
+    bool m_scale_ext{false};
+    bool m_announce_scale{false};
     uint32_t m_encoding{encoding_raw};
     bool m_force_keyframe{true};
     uint64_t m_sent_generation{0};

@@ -206,12 +206,18 @@ private:
                 return set_encoding(spec);
             }
             if (command == "scale") {
-                // Honest refusal rather than a silent no-op: scaling happens
-                // in the server, before encoding, and RFB has no client
-                // message that asks a server to resample. Changing it live
-                // needs a server-side control path, not a viewer one.
-                return "error scale is a server-side rfb_server option "
-                       "(--scale); no RFB client message can change it live";
+                double factor = 0;
+                in >> factor;
+                if (!(factor > 0) || factor > 1.0) {
+                    return "error scale must be >0 and <=1.0";
+                }
+                // Server-side resample over the private extension, on this
+                // same connection. False means the peer never advertised it.
+                if (!parent::request_scale(
+                            static_cast<int>(factor * 1000 + 0.5))) {
+                    return "error peer does not support the scale extension";
+                }
+                return std::format("ok {}", factor);
             }
             return std::format("error unknown command: {}", command);
         }
