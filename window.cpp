@@ -10,6 +10,7 @@
 
 #include "rfb.hpp"
 #include "control.hpp"
+#include "trace.hpp"
 
 #include <memory>
 #include <deque>
@@ -606,6 +607,7 @@ using draw_app =
     wayland_helper::add_dummy_recreate_surface<
     drm_helper::add_amdgpu_device<
     drm_helper::add_drm_fd<
+    rfb_trace::add_trace_recorder<
     add_rfb<
     rfb::set_address<
     rfb::set_port<
@@ -613,7 +615,7 @@ using draw_app =
     wayland_helper::add_wayland_surface<
     cpp_helper::add_logger<
     empty_class
-    >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 ;
 
 using namespace std::literals;

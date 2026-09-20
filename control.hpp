@@ -38,6 +38,7 @@
 
 #include "rfb.hpp"
 #include "png.hpp"
+#include "trace.hpp"
 
 #include <socket_helper.hpp>
 
@@ -199,6 +200,39 @@ private:
                 in >> keysym >> state;
                 parent::send_key_event(keysym, state);
                 return "ok";
+            }
+            if (command == "record") {
+                std::string action;
+                in >> action;
+                if (action == "start") {
+                    std::string dir;
+                    int interval_ms = 0;
+                    in >> dir >> interval_ms;
+                    if (dir.empty()) {
+                        return "error record start needs a directory";
+                    }
+                    return parent::record_start(dir, interval_ms);
+                }
+                if (action == "stop") {
+                    return parent::record_stop();
+                }
+                return "error record needs start or stop";
+            }
+            if (command == "mark") {
+                std::string text;
+                std::getline(in, text);
+                if (!text.empty() && text.front() == ' ') {
+                    text.erase(0, 1);
+                }
+                return parent::record_mark(text);
+            }
+            if (command == "frame") {
+                std::string note;
+                std::getline(in, note);
+                if (!note.empty() && note.front() == ' ') {
+                    note.erase(0, 1);
+                }
+                return parent::record_frame(note);
             }
             if (command == "encoding") {
                 std::string spec;
