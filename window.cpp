@@ -466,6 +466,20 @@ private:
         }
         wayland_frame = true;
         set_callback();
+        // A wl_surface frame callback only fires again after a SUBSEQUENT
+        // commit -- but the only other commit in this program is inside
+        // draw(), which only runs when a new framebuffer update actually
+        // arrived. A new update only arrives in response to a request, and a
+        // request is only sent once this callback fires: on an idle remote
+        // desktop (nothing to draw) that chain has nothing left to close it,
+        // so set_callback() above would register a callback the compositor
+        // then never delivers, and the RFB request loop would stop firing
+        // FOREVER, not just slow down -- looking exactly like the reported
+        // stall (it just takes however long normal post-connect screen
+        // activity lasts to first go idle). Committing here, independent of
+        // whether new pixels arrived, guarantees this callback keeps
+        // completing the loop even when the remote screen never changes.
+        wl_surface_commit(parent::get_wayland_surface());
     }
     bool wayland_frame;
     bool ignored_update;
