@@ -92,6 +92,8 @@ public:
     void request_framebuffer_update(int x=0, int y=0) {
         request_framebuffer_update(x, y, get_fb_width(), get_fb_height(), true);
     }
+    bool get_view_only() const { return view_only; }
+    void set_view_only(bool v) { view_only = v; }
 private:
     bool view_only;
 };

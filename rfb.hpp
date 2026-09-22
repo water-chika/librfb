@@ -206,6 +206,7 @@ public:
             }
         }
         frame_updated = true;
+        last_update_time = std::chrono::steady_clock::now();
     }
     void get_frame(std::span<uint8_t> frame) {
         std::copy(internal_frame.begin(), internal_frame.end(), frame.begin());
@@ -225,11 +226,22 @@ public:
     auto get_frame_network_byte_count() {
         return frame_network_byte_count;
     }
+    // How long ago the last FramebufferUpdate finished arriving. This is the
+    // one number that tells a stalled stream apart from a static screen: a
+    // static remote desktop still has this stay small if the client keeps
+    // asking (RFB just answers "nothing changed" quickly), while a genuinely
+    // stuck request loop makes it grow without bound.
+    double ms_since_last_update() const {
+        return std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - last_update_time).count();
+    }
 private:
     std::vector<uint8_t> internal_frame;
     bool frame_updated;
     encoding encoding_type;
     uint32_t frame_network_byte_count;
+    std::chrono::steady_clock::time_point last_update_time{
+        std::chrono::steady_clock::now()};
 };
 
 template<typename T>

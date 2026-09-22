@@ -270,6 +270,55 @@ expectation gives a mean error of 0.76 and a worst case of 12.
 `rfb_window_demo` renders to a Wayland surface using DRM (amdgpu BOs exported as
 dma-buf) shared with ROCm/HIP via external memory. Vulkan is no longer used.
 
+### Control port
+
+`--control-port <port>` opens a line-oriented text protocol on
+`127.0.0.1:<port>` (loopback only, never a real interface — the protocol has
+no authentication, so treat it exactly like the RFB port itself: reach a
+remote instance only through an SSH tunnel you already control). One command
+per line, one `ok ...`/`error ...` reply per line. Verbs:
+
+| Command | Effect |
+|---|---|
+| `ping` | liveness check |
+| `size` | current framebuffer width/height |
+| `capture <path>` | write the current decoded frame to a PNG at `<path>` |
+| `pointer <x> <y> <buttons>` | inject a pointer event |
+| `click <x> <y> <button>` | pointer down+up at a position |
+| `key <keysym> <state>` | inject a key event |
+| `encoding <name>` | renegotiate encoding |
+| `scale <factor>` | change display scale |
+| `record start <dir> <interval_ms>` / `record stop` | start/stop the input+frame trace recorder (`trace.hpp`), writing `trace.jsonl` plus numbered PNGs under `<dir>` |
+| `mark [text]` / `frame` | insert a labelled checkpoint / an extra frame capture into an in-progress recording |
+| `refresh` | force a full, non-incremental repaint — a cheap "is the request loop still alive" probe |
+| `status` | `host`, `port`, negotiated `encoding`, `bytes_received`, `ms_since_last_update`, `view_only` — the last field is the direct stalled-vs-static check: on an unchanging remote screen it stays small because nothing new arrived to update it, while a stuck request loop makes it grow without bound |
+| `view-only on\|off` | toggle whether input is forwarded to the remote host at runtime |
+| `quit` | ask the viewer to exit cleanly |
+
+### `rfb_ctl.py`
+
+`rfb_ctl.py` is a stdlib-only (optional Pillow for pixel-exact comparison)
+Python client for the control port, meant to run unmodified on the Windows
+boxes these viewers are pointed at. One-shot subcommands
+(`status`/`refresh`/`capture`/`view-only`/`quit`/`cmd <raw line>`), plus
+`replay <trace_dir>`: replays the `key`/`pointer` events from a
+`record`-produced `trace.jsonl` against a *live* viewer at their recorded
+timing, and after each `start`/`stop`/`mark`/`frame` line captures the live
+frame and compares it against the one recorded at that point — reporting a
+`MISMATCH` rather than silently continuing if a click landed somewhere else
+than it did when recorded. See `rfb_ctl.py --help` and its module docstring
+for the full protocol and the security-model note. `test_rfb_ctl.py` covers
+the client and replay logic entirely offline, against a small fake
+control-port stub the test starts itself (no `rfb_window_demo`/`rfb_server`
+required); run with `python3 test_rfb_ctl.py`.
+
+Recording itself is not new: it is the existing `record`/`mark`/`frame`
+verbs above, implemented by `trace.hpp`, reached through `rfb_ctl.py cmd`.
+What is new here is replay, and the `refresh`/`status`/`view-only`/`quit`
+verbs that make the control port sufficient to script a viewer end to end.
+Video/frame encoding beyond the existing per-checkpoint PNGs is deliberately
+out of scope for this first version.
+
 ## Platforms
 
 | Target | Linux | Windows |

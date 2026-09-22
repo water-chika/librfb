@@ -62,7 +62,8 @@ public:
     using parent = T;
 
     add_control_port(const cpp_helper::configure auto& conf) : parent{conf},
-        m_port{conf.control_port}
+        m_port{conf.control_port},
+        m_host{conf.address}, m_rfb_port{conf.port}
     {
         if (m_port != 0) {
             m_listener = socket_helper::listen_on_port(m_port, "127.0.0.1");
@@ -239,6 +240,46 @@ private:
                 in >> spec;
                 return set_encoding(spec);
             }
+            if (command == "refresh") {
+                // Forces a full, non-incremental repaint. Cheap way to prove
+                // (or disprove) that the request loop is still alive: if the
+                // viewer is genuinely stuck, this does nothing either, and
+                // that is itself useful evidence, not a failure of the verb.
+                parent::request_framebuffer_update(
+                        0, 0, parent::get_fb_width(), parent::get_fb_height(),
+                        false);
+                return "ok";
+            }
+            if (command == "status") {
+                return std::format(
+                        "ok host={} port={} encoding={} bytes_received={} "
+                        "ms_since_last_update={:.1f} view_only={}",
+                        m_host, m_rfb_port,
+                        static_cast<int>(parent::get_encoding()),
+                        parent::get_frame_network_byte_count(),
+                        parent::ms_since_last_update(),
+                        parent::get_view_only() ? "true" : "false");
+            }
+            if (command == "view-only") {
+                std::string state;
+                in >> state;
+                if (state == "on") {
+                    parent::set_view_only(true);
+                }
+                else if (state == "off") {
+                    parent::set_view_only(false);
+                }
+                else {
+                    return "error view-only needs on or off";
+                }
+                return std::format("ok {}", state);
+            }
+            if (command == "quit") {
+                // Reuses the same exception the viewer already treats as a
+                // clean shutdown when the server hangs up, so main()'s
+                // existing "not a failure" handling applies here too.
+                throw rfb::connection_closed{"quit requested over control port"};
+            }
             if (command == "scale") {
                 double factor = 0;
                 in >> factor;
@@ -291,6 +332,8 @@ private:
     }
 
     uint16_t m_port;
+    std::string m_host;
+    uint16_t m_rfb_port;
     socket_helper::unique_socket m_listener{};
     socket_helper::unique_socket m_client{};
     std::string m_pending;
