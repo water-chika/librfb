@@ -2,8 +2,45 @@ cmake_minimum_required(VERSION 3.20)
 
 project(librfb)
 
+include(CTest)
+
 find_package(ZLIB REQUIRED)
 find_package(OpenSSL REQUIRED)
+
+if(NOT TARGET remote_media::remote_media)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../remote-media/CMakeLists.txt")
+        add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../remote-media"
+                         "${CMAKE_CURRENT_BINARY_DIR}/remote-media")
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/remote-media/CMakeLists.txt")
+        add_subdirectory(third_party/remote-media)
+    endif()
+endif()
+
+if(NOT TARGET remote_media::remote_media)
+    message(FATAL_ERROR
+        "librfb server support requires remote_media::remote_media; add the "
+        "remote-media submodule or provide the target before add_subdirectory(librfb)")
+endif()
+
+add_library(rfb_server_core
+    server_core.cpp
+    server_core.hpp
+    server.hpp
+    server_encode.hpp
+    server_h264.hpp
+    server_platform.hpp
+    keysym.hpp
+)
+target_compile_features(rfb_server_core PUBLIC cxx_std_20)
+target_include_directories(rfb_server_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(rfb_server_core PUBLIC
+    remote_media::remote_media
+    cpp_helper
+    socket_helper
+    ZLIB::ZLIB
+    OpenSSL::Crypto
+)
+add_library(rfb::server_core ALIAS rfb_server_core)
 
 if(WIN32)
     # vcpkg ships a FindFFMPEG module that resolves the whole set of av*
@@ -140,10 +177,7 @@ target_include_directories(rfb_server PRIVATE
 )
 
 target_link_libraries(rfb_server PUBLIC
-    cpp_helper
-    socket_helper
-    ZLIB::ZLIB
-    OpenSSL::Crypto
+    rfb::server_core
 )
 
 # H264 is the one thing that would drag ffmpeg into the server, so it is opt
@@ -172,6 +206,23 @@ endif()
 
 if(MSVC)
     target_compile_options(rfb_server PUBLIC /utf-8 /Zc:__cplusplus /EHsc)
+endif()
+
+if(BUILD_TESTING)
+    add_executable(rfb_server_core_tests test_server_core.cpp)
+    target_compile_features(rfb_server_core_tests PRIVATE cxx_std_20)
+    target_link_libraries(rfb_server_core_tests PRIVATE
+        rfb::server_core
+        ${RFB_PLATFORM_LIBS}
+    )
+    if(WIN32)
+        target_link_libraries(rfb_server_core_tests PRIVATE gdi32 user32)
+        target_compile_definitions(rfb_server_core_tests PRIVATE
+            ${RFB_PLATFORM_DEFINITIONS})
+    else()
+        target_link_libraries(rfb_server_core_tests PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME rfb_server_core_tests COMMAND rfb_server_core_tests)
 endif()
 
 # The window demo and the HIP test render through Wayland + DRM/amdgpu + HIP

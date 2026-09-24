@@ -28,6 +28,7 @@
 
 #include <socket_helper.hpp>
 
+#include "server_core.hpp"
 #include "server_encode.hpp"
 #include "server_h264.hpp"
 #include "server_platform.hpp"
@@ -170,8 +171,25 @@ inline void downscale_frame(const frame_buffer& src, frame_buffer& dst,
     }
 }
 
-// slow client can keep encoding an older frame while a new one is captured.
-class screen_source {
+// Internal source shape consumed by the protocol/session code. The standalone
+// capture and the remote-media adapter both implement it, so all encoders keep
+// operating on the same proven BGRX framebuffer path.
+class frame_source {
+public:
+    virtual ~frame_source() = default;
+    virtual int width() const = 0;
+    virtual int height() const = 0;
+    virtual void set_scale(double) {}
+    virtual int to_capture_x(int x) const { return x; }
+    virtual int to_capture_y(int y) const { return y; }
+    virtual int origin_x() const { return 0; }
+    virtual int origin_y() const { return 0; }
+    virtual std::shared_ptr<const frame_buffer> frame(uint64_t& generation) = 0;
+    virtual std::chrono::steady_clock::duration time_to_next_capture() const = 0;
+};
+
+// A slow client can keep encoding an older frame while a new one is captured.
+class screen_source final : public frame_source {
 public:
     screen_source(const capture_options& options, int max_fps,
                   double scale = 1.0, int max_width = 0,
@@ -184,19 +202,19 @@ public:
 
     // The size the client is told about and every encoder works in, which is
     // the captured size only when no downscale is configured.
-    int width() const {
+    int width() const override {
         int w = 0, h = 0;
         served_size(m_capture.width(), m_capture.height(), m_scale, m_max_width,
                     w, h);
         return w;
     }
-    int height() const {
+    int height() const override {
         int w = 0, h = 0;
         served_size(m_capture.width(), m_capture.height(), m_scale, m_max_width,
                     w, h);
         return h;
     }
-    void set_scale(double scale) {
+    void set_scale(double scale) override {
         std::lock_guard lock{m_mutex};
         m_scale = scale;
     }
@@ -205,25 +223,25 @@ public:
     }
     // Maps a viewer coordinate back into the real desktop, so that a pointer
     // event still lands where the user aimed it when the image was shrunk.
-    int to_capture_x(int x) const {
+    int to_capture_x(int x) const override {
         int served = width();
         if (served <= 0 || served == m_capture.width()) return x;
         return static_cast<int>(static_cast<int64_t>(x) * m_capture.width() /
                                 served);
     }
-    int to_capture_y(int y) const {
+    int to_capture_y(int y) const override {
         int served = height();
         if (served <= 0 || served == m_capture.height()) return y;
         return static_cast<int>(static_cast<int64_t>(y) * m_capture.height() /
                                 served);
     }
-    int origin_x() const { return m_capture.origin_x(); }
-    int origin_y() const { return m_capture.origin_y(); }
+    int origin_x() const override { return m_capture.origin_x(); }
+    int origin_y() const override { return m_capture.origin_y(); }
 
     // Returns the newest frame, capturing a fresh one if the previous is
     // older than the frame interval. generation changes whenever the pixels
     // were re-read.
-    std::shared_ptr<const frame_buffer> frame(uint64_t& generation) {
+    std::shared_ptr<const frame_buffer> frame(uint64_t& generation) override {
         std::lock_guard lock{m_mutex};
         auto now = std::chrono::steady_clock::now();
         if (m_current == nullptr || now - m_captured_at >= m_interval) {
@@ -277,7 +295,7 @@ public:
     // polls at the frame rate instead of spinning. Before the first attempt
     // m_captured_at is its epoch default, which correctly yields zero: the
     // very first frame should be read immediately.
-    std::chrono::steady_clock::duration time_to_next_capture() const {
+    std::chrono::steady_clock::duration time_to_next_capture() const override {
         std::lock_guard lock{m_mutex};
         auto elapsed = std::chrono::steady_clock::now() - m_captured_at;
         if (elapsed >= m_interval) {
@@ -314,6 +332,106 @@ private:
     // Scratch full-size capture, used only when downscaling. Kept as a member
     // so the full-resolution buffer is allocated once, not once per frame.
     frame_buffer m_raw{};
+};
+
+// Adapts the public remote-media frame contract to the server's established
+// BGRX encoder input. The provider retains ownership of its frame while this
+// adapter copies/converts it into a reusable immutable snapshot for sessions.
+class remote_frame_source final : public frame_source {
+public:
+    remote_frame_source(std::shared_ptr<remote_media::FrameProvider> provider,
+                        int max_fps)
+        : m_provider{std::move(provider)},
+          m_interval{std::chrono::microseconds{1000000 / std::max(1, max_fps)}} {
+        if (!m_provider) {
+            throw std::invalid_argument{"frame provider must not be null"};
+        }
+        refresh();
+    }
+
+    int width() const override {
+        std::lock_guard lock{m_mutex};
+        return m_current ? m_current->width : 0;
+    }
+    int height() const override {
+        std::lock_guard lock{m_mutex};
+        return m_current ? m_current->height : 0;
+    }
+
+    std::shared_ptr<const frame_buffer> frame(uint64_t& generation) override {
+        std::lock_guard lock{m_mutex};
+        refresh_locked();
+        generation = m_sequence;
+        return m_current;
+    }
+
+    std::chrono::steady_clock::duration time_to_next_capture() const override {
+        std::lock_guard lock{m_mutex};
+        auto elapsed = std::chrono::steady_clock::now() - m_checked_at;
+        return elapsed >= m_interval
+                   ? std::chrono::steady_clock::duration::zero()
+                   : m_interval - elapsed;
+    }
+
+private:
+    void refresh() {
+        std::lock_guard lock{m_mutex};
+        refresh_locked();
+    }
+
+    void refresh_locked() const {
+        auto now = std::chrono::steady_clock::now();
+        if (m_checked_at != std::chrono::steady_clock::time_point{} &&
+            now - m_checked_at < m_interval) {
+            return;
+        }
+        m_checked_at = now;
+        auto next = m_provider->latest_after(m_sequence);
+        if (!next || !next->frame) return;
+
+        auto view = next->frame->view();
+        auto converted = std::make_shared<frame_buffer>();
+        converted->resize(static_cast<int>(view.width()),
+                          static_cast<int>(view.height()));
+        for (std::uint32_t y = 0; y < view.height(); ++y) {
+            auto* dst = converted->pixels.data() +
+                        static_cast<std::size_t>(y) * converted->stride();
+            const auto* src = reinterpret_cast<const std::uint8_t*>(view.row(y));
+            for (std::uint32_t x = 0; x < view.width(); ++x) {
+                std::uint8_t r{}, g{}, b{};
+                switch (view.format()) {
+                case remote_media::PixelFormat::rgba8:
+                    r = src[x * 4]; g = src[x * 4 + 1]; b = src[x * 4 + 2];
+                    break;
+                case remote_media::PixelFormat::bgra8:
+                    b = src[x * 4]; g = src[x * 4 + 1]; r = src[x * 4 + 2];
+                    break;
+                case remote_media::PixelFormat::rgb8:
+                    r = src[x * 3]; g = src[x * 3 + 1]; b = src[x * 3 + 2];
+                    break;
+                case remote_media::PixelFormat::bgr8:
+                    b = src[x * 3]; g = src[x * 3 + 1]; r = src[x * 3 + 2];
+                    break;
+                case remote_media::PixelFormat::gray8:
+                    r = g = b = src[x];
+                    break;
+                }
+                dst[x * 4] = b;
+                dst[x * 4 + 1] = g;
+                dst[x * 4 + 2] = r;
+                dst[x * 4 + 3] = 0;
+            }
+        }
+        m_sequence = next->sequence;
+        m_current = std::move(converted);
+    }
+
+    std::shared_ptr<remote_media::FrameProvider> m_provider;
+    std::chrono::steady_clock::duration m_interval;
+    mutable std::mutex m_mutex{};
+    mutable std::chrono::steady_clock::time_point m_checked_at{};
+    mutable std::shared_ptr<const frame_buffer> m_current{};
+    mutable std::uint64_t m_sequence{};
 };
 
 struct rectangle {
@@ -406,12 +524,17 @@ struct client_gone : public std::runtime_error {
 class session {
 public:
     session(socket_helper::unique_socket socket, std::string peer,
-            screen_source& screen, const server_options& options)
+            frame_source& screen, const server_options& options,
+            std::shared_ptr<remote_media::InputSink> input_sink = {})
         : m_socket{std::move(socket)},
           m_peer{std::move(peer)},
           m_screen{screen},
           m_options{options},
           m_input{screen.origin_x(), screen.origin_y()} {
+        if (input_sink) {
+            m_forwarded_input =
+                std::make_unique<input_forwarder>(std::move(input_sink));
+        }
         socket_helper::set_no_delay(m_socket.get());
         m_limit = rate_limiter{m_options.bandwidth_kbit};
         m_base_qp = std::clamp(m_options.h264_quality, 0, 51);
@@ -431,7 +554,8 @@ public:
             std::cerr << std::format("[{}] session error: {}\n", m_peer, e.what());
         }
         if (!m_options.view_only) {
-            m_input.release_all();
+            if (m_forwarded_input) m_forwarded_input->release_all();
+            else m_input.release_all();
         }
     }
 
@@ -1008,16 +1132,19 @@ private:
         std::array<uint8_t, 7> message{};
         read_exact(message.data(), message.size());
         if (m_options.view_only) return;
-        m_input.key_event(read_u32(&message[3]), message[0] != 0);
+        auto keysym = read_u32(&message[3]);
+        if (m_forwarded_input) m_forwarded_input->key_event(keysym, message[0] != 0);
+        else m_input.key_event(keysym, message[0] != 0);
     }
 
     void pointer_event() {
         std::array<uint8_t, 5> message{};
         read_exact(message.data(), message.size());
         if (m_options.view_only) return;
-        m_input.pointer_event(message[0],
-                              m_screen.to_capture_x(read_u16(&message[1])),
-                              m_screen.to_capture_y(read_u16(&message[3])));
+        auto x = m_screen.to_capture_x(read_u16(&message[1]));
+        auto y = m_screen.to_capture_y(read_u16(&message[3]));
+        if (m_forwarded_input) m_forwarded_input->pointer_event(message[0], x, y);
+        else m_input.pointer_event(message[0], x, y);
     }
 
     void client_cut_text() {
@@ -1308,9 +1435,10 @@ private:
 
     socket_helper::unique_socket m_socket;
     std::string m_peer;
-    screen_source& m_screen;
+    frame_source& m_screen;
     server_options m_options;
     input_injector m_input;
+    std::unique_ptr<input_forwarder> m_forwarded_input{};
     clipboard m_clipboard{};
     pixel_writer m_writer{};
     zrle_encoder m_zrle{};
@@ -1342,11 +1470,20 @@ class rfb_server {
 public:
     explicit rfb_server(const server_options& options)
         : m_options{options},
-          m_screen{options.capture, options.max_fps, options.scale,
-                   options.max_width, options.scale_box_filter} {}
+          m_source{std::make_unique<screen_source>(
+              options.capture, options.max_fps, options.scale,
+              options.max_width, options.scale_box_filter)} {}
 
-    int width() const { return m_screen.width(); }
-    int height() const { return m_screen.height(); }
+    rfb_server(const server_options& options,
+               std::shared_ptr<remote_media::FrameProvider> frame_provider,
+               std::shared_ptr<remote_media::InputSink> input_sink = {})
+        : m_options{options},
+          m_source{std::make_unique<remote_frame_source>(
+              std::move(frame_provider), options.max_fps)},
+          m_input_sink{std::move(input_sink)} {}
+
+    int width() const { return m_source->width(); }
+    int height() const { return m_source->height(); }
 
     void run() {
         warn_if_not_interactive();
@@ -1355,8 +1492,8 @@ public:
             m_options.listen_address.empty() ? nullptr
                                              : m_options.listen_address.c_str());
         std::cout << std::format(
-            "serving {}x{} on {}:{} ({}, {})\n", m_screen.width(),
-            m_screen.height(),
+            "serving {}x{} on {}:{} ({}, {})\n", m_source->width(),
+            m_source->height(),
             m_options.listen_address.empty() ? "*" : m_options.listen_address,
             m_options.port,
             m_options.password.empty() ? "no authentication" : "VNC authentication",
@@ -1373,7 +1510,8 @@ public:
             // Detached: a session ends on its own when the viewer leaves,
             // and the accept loop must never block waiting for one.
             std::thread{[this, socket = std::move(client), peer]() mutable {
-                session current{std::move(socket), peer, m_screen, m_options};
+                session current{std::move(socket), peer, *m_source, m_options,
+                                m_input_sink};
                 current.run();
             }}.detach();
         }
@@ -1399,7 +1537,8 @@ private:
     }
 
     server_options m_options;
-    screen_source m_screen;
+    std::unique_ptr<frame_source> m_source;
+    std::shared_ptr<remote_media::InputSink> m_input_sink{};
 };
 
 } // namespace rfb::server
