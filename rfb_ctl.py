@@ -65,6 +65,13 @@ class ControlError(RuntimeError):
     pass
 
 
+def positive_float(value):
+    value = float(value)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return value
+
+
 class ControlClient:
     """One control-port connection. Not reused across processes: control.hpp
     replaces rather than refuses a second connection, so a script that keeps
@@ -288,7 +295,7 @@ def main(argv=None):
     p_cmd.set_defaults(func=cmd_raw)
     p_replay = sub.add_parser("replay")
     p_replay.add_argument("trace_dir")
-    p_replay.add_argument("--speed", type=float, default=1.0,
+    p_replay.add_argument("--speed", type=positive_float, default=1.0,
                            help="playback speed multiplier (default 1.0, "
                                 "real time)")
     p_replay.set_defaults(func=cmd_replay)

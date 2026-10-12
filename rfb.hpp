@@ -12,8 +12,12 @@ extern "C" {
 
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <optional>
+#include <span>
 #include <string>
 #include <thread>
 
@@ -135,17 +139,23 @@ public:
                 // Carries no pixel data: the header IS the message. Seeing it
                 // at all is the server advertising support, so the client may
                 // start asking for scale changes from here on.
+                auto frame_bytes = static_cast<size_t>(width) * height * 4;
+                if (!width || !height || frame_bytes > 256 * 1024 * 1024)
+                    throw std::runtime_error{"invalid framebuffer dimensions"};
                 scale_ext_supported = true;
                 parent::set_framebuffer_size(width, height);
-                internal_frame.assign(
-                        static_cast<size_t>(width) * height * 4, 0);
+                internal_frame.assign(frame_bytes, 0);
                 fb_width = width;
                 fb_height = height;
                 continue;
             }
+            if (!width || !height || x > fb_width || y > fb_height ||
+                width > fb_width - x || height > fb_height - y)
+                throw std::runtime_error{"framebuffer rectangle is out of bounds"};
             if (encoding_type == encoding::raw) {
-                auto pixels = std::vector<uint8_t>(width*height*4);
-                frame_network_byte_count += width*height*4;
+                auto pixel_bytes = static_cast<size_t>(width) * height * 4;
+                auto pixels = std::vector<uint8_t>(pixel_bytes);
+                frame_network_byte_count += pixel_bytes;
                 try{
                 parent::rfb_read(pixels);
                 }
@@ -339,6 +349,234 @@ private:
         empty_configurable_class
         >>>>;
     connection_t connection;
+};
+
+// Buffers post-handshake server traffic on a nonblocking socket and exposes
+// only whole, resource-bounded RFB messages to the existing decoders. Handshake
+// reads stay blocking because this layer is enabled explicitly by an event-loop
+// client.
+template<typename T>
+class add_server_message_buffer : public T {
+public:
+    using parent = T;
+    add_server_message_buffer(const configure auto& conf) : parent{conf} {}
+
+    // Bound each event-loop turn even when a peer continuously keeps the socket
+    // readable. The next turn resumes from the buffered bytes.
+    bool read_available_server_data() {
+        if (!socket_helper::set_nonblocking(parent::get_socket()))
+            throw std::runtime_error{"could not make RFB socket nonblocking"};
+        auto restore_blocking = [&] {
+            if (!socket_helper::set_nonblocking(parent::get_socket(), false))
+                throw std::runtime_error{"could not restore blocking RFB socket"};
+        };
+        try {
+            std::array<uint8_t, INPUT_SIZE> chunk{};
+            for (size_t read = 0; read < max_reads_per_poll; ++read) {
+                auto count = socket_helper::read_socket(parent::get_socket(),
+                                                         chunk.data(), chunk.size());
+                if (count > 0) {
+                    if (buffered_size() + static_cast<size_t>(count) > max_buffered_bytes)
+                        throw std::runtime_error{"RFB input exceeds resource limit"};
+                    m_input.insert(m_input.end(), chunk.begin(), chunk.begin() + count);
+                    continue;
+                }
+                if (count == 0) {
+                    m_closed = true;
+                    restore_blocking();
+                    return false;
+                }
+                auto error = socket_helper::last_error();
+                if (socket_helper::would_block(error)) {
+                    restore_blocking();
+                    return true;
+                }
+#ifndef _WIN32
+                if (error == EINTR) { --read; continue; }
+#endif
+                throw std::runtime_error{std::format("read fail: {}", error)};
+            }
+            restore_blocking();
+            return true;
+        }
+        catch (...) {
+            socket_helper::set_nonblocking(parent::get_socket(), false);
+            throw;
+        }
+    }
+
+    bool has_complete_server_message() {
+        if (!m_cached_message_size) m_cached_message_size = next_server_message_size();
+        return m_cached_message_size.has_value();
+    }
+
+    void begin_complete_server_message() {
+        if (!has_complete_server_message())
+            throw std::logic_error{"incomplete RFB server message"};
+        m_message_size = m_cached_message_size;
+        m_message_offset = 0;
+    }
+
+    void finish_complete_server_message() {
+        if (!m_message_size || m_message_offset != *m_message_size)
+            throw std::logic_error{"RFB decoder did not consume one message"};
+        m_consumed += *m_message_size;
+        m_message_size.reset();
+        m_cached_message_size.reset();
+        m_message_offset = 0;
+        compact_input();
+    }
+
+    bool server_connection_closed() const { return m_closed; }
+    bool has_buffered_server_data() const { return buffered_size() != 0; }
+
+    void rfb_read(auto& buf) {
+        if (!m_message_size) {
+            parent::rfb_read(buf);
+            return;
+        }
+        auto bytes = buf.size() * sizeof(buf[0]);
+        if (bytes > *m_message_size - m_message_offset)
+            throw std::logic_error{"RFB decoder read beyond framed message"};
+        std::memcpy(buf.data(), m_input.data() + m_consumed + m_message_offset, bytes);
+        m_message_offset += bytes;
+    }
+
+    void append_server_data(std::span<const uint8_t> bytes) {
+        if (buffered_size() + bytes.size() > max_buffered_bytes)
+            throw std::runtime_error{"RFB input exceeds resource limit"};
+        m_input.insert(m_input.end(), bytes.begin(), bytes.end());
+        m_cached_message_size.reset();
+    }
+
+private:
+    static constexpr size_t max_reads_per_poll = 4;
+    static constexpr size_t max_buffered_bytes = 64 * 1024 * 1024;
+    static constexpr size_t max_clipboard_bytes = 16 * 1024 * 1024;
+    static constexpr size_t max_encoded_rectangle_bytes = 32 * 1024 * 1024;
+    static constexpr size_t max_framebuffer_bytes = 256 * 1024 * 1024;
+    static constexpr uint16_t max_rectangles = 4096;
+
+    size_t buffered_size() const { return m_input.size() - m_consumed; }
+    uint8_t byte_at(size_t offset) const { return m_input[m_consumed + offset]; }
+
+    static size_t checked_add(size_t left, size_t right) {
+        if (right > std::numeric_limits<size_t>::max() - left)
+            throw std::runtime_error{"RFB server message is too large"};
+        return left + right;
+    }
+    static size_t checked_multiply(size_t left, size_t right) {
+        if (left && right > std::numeric_limits<size_t>::max() / left)
+            throw std::runtime_error{"RFB server message is too large"};
+        return left * right;
+    }
+    static size_t checked_frame_bytes(uint16_t width, uint16_t height) {
+        if (!width || !height) throw std::runtime_error{"invalid framebuffer dimensions"};
+        auto bytes = checked_multiply(checked_multiply(width, height), size_t{4});
+        if (bytes > max_framebuffer_bytes)
+            throw std::runtime_error{"framebuffer exceeds resource limit"};
+        return bytes;
+    }
+
+    void compact_input() {
+        if (!m_consumed) return;
+        if (m_consumed == m_input.size()) {
+            m_input.clear();
+            m_consumed = 0;
+            if (m_input.capacity() > max_buffered_bytes / 4) {
+                std::vector<uint8_t>{}.swap(m_input);
+            }
+        }
+        else if (m_consumed >= m_input.size() / 2) {
+            m_input.erase(m_input.begin(), m_input.begin() + m_consumed);
+            m_consumed = 0;
+        }
+    }
+
+    std::optional<size_t> next_server_message_size() {
+        if (!buffered_size()) return {};
+        switch (byte_at(0)) {
+        case 0: return framebuffer_update_size();
+        case 1: {
+            if (buffered_size() < 6) return {};
+            auto count = from_big_endian_bytes(byte_at(4), byte_at(5));
+            auto size = checked_add(size_t{6}, checked_multiply(count, size_t{6}));
+            return buffered_size() >= size ? std::optional<size_t>{size} : std::nullopt;
+        }
+        case 2: return size_t{1};
+        case 3: {
+            if (buffered_size() < 8) return {};
+            auto length = from_big_endian_bytes(byte_at(4), byte_at(5), byte_at(6), byte_at(7));
+            if (length > max_clipboard_bytes)
+                throw std::runtime_error{"clipboard payload exceeds resource limit"};
+            auto size = checked_add(size_t{8}, length);
+            return buffered_size() >= size ? std::optional<size_t>{size} : std::nullopt;
+        }
+        default:
+            throw std::runtime_error{std::format(
+                "server message type not supported: {}", byte_at(0))};
+        }
+    }
+
+    std::optional<size_t> framebuffer_update_size() {
+        if (buffered_size() < 4) return {};
+        auto rectangles = from_big_endian_bytes(byte_at(2), byte_at(3));
+        if (rectangles > max_rectangles)
+            throw std::runtime_error{"framebuffer rectangle count exceeds resource limit"};
+        size_t offset = 4;
+        auto fb_width = static_cast<uint16_t>(parent::get_width());
+        auto fb_height = static_cast<uint16_t>(parent::get_height());
+        for (uint16_t i = 0; i < rectangles; ++i) {
+            if (buffered_size() < checked_add(offset, 12)) return {};
+            auto x = from_big_endian_bytes(byte_at(offset), byte_at(offset + 1));
+            auto y = from_big_endian_bytes(byte_at(offset + 2), byte_at(offset + 3));
+            auto width = from_big_endian_bytes(byte_at(offset + 4), byte_at(offset + 5));
+            auto height = from_big_endian_bytes(byte_at(offset + 6), byte_at(offset + 7));
+            auto type = static_cast<encoding>(from_big_endian_bytes(
+                byte_at(offset + 8), byte_at(offset + 9),
+                byte_at(offset + 10), byte_at(offset + 11)));
+            offset += 12;
+            size_t payload{};
+            if (type == encoding::scale_ext) {
+                checked_frame_bytes(width, height);
+                fb_width = width;
+                fb_height = height;
+            }
+            else {
+                if (!width || !height || x > fb_width || y > fb_height ||
+                    width > fb_width - x || height > fb_height - y)
+                    throw std::runtime_error{"framebuffer rectangle is out of bounds"};
+                if (type == encoding::raw) {
+                    payload = checked_frame_bytes(width, height);
+                }
+                else if (type == encoding::zrle || type == encoding::h264) {
+                    auto prefix = type == encoding::zrle ? size_t{4} : size_t{8};
+                    if (buffered_size() < checked_add(offset, prefix)) return {};
+                    auto length = from_big_endian_bytes(
+                        byte_at(offset), byte_at(offset + 1),
+                        byte_at(offset + 2), byte_at(offset + 3));
+                    if (length > max_encoded_rectangle_bytes)
+                        throw std::runtime_error{"encoded rectangle exceeds resource limit"};
+                    payload = checked_add(prefix, length);
+                }
+                else {
+                    throw std::runtime_error{std::format("encoding not support: {}", type)};
+                }
+            }
+            offset = checked_add(offset, payload);
+            if (offset > max_buffered_bytes)
+                throw std::runtime_error{"RFB server message exceeds resource limit"};
+            if (buffered_size() < offset) return {};
+        }
+        return offset;
+    }
+
+    std::vector<uint8_t> m_input;
+    size_t m_consumed{};
+    std::optional<size_t> m_cached_message_size;
+    std::optional<size_t> m_message_size;
+    size_t m_message_offset{};
+    bool m_closed{};
 };
 
 struct pixel_format {
@@ -1014,29 +1252,52 @@ public:
     }
 
     void process_server_message() {
-        std::array<uint8_t, 4> framebuffer_update_head{};
+        std::array<uint8_t, 1> type{};
         try{
-        parent::rfb_read(framebuffer_update_head);
+            parent::rfb_read(type);
         }
         catch (connection_closed&) {
             throw;
         }
-        catch (std::exception& e) {
-            throw std::runtime_error("framebuffer update head read fail");
+        catch (std::exception&) {
+            throw std::runtime_error("server message type read fail");
         }
-        //std::cerr << "server message: " << (int)framebuffer_update_head[0] << std::endl;
-        if (framebuffer_update_head[0] == 0) {
+        if (type[0] == 0) {
+            std::array<uint8_t, 4> framebuffer_update_head{type[0], 0, 0, 0};
+            std::span<uint8_t> remainder{framebuffer_update_head.data() + 1, 3};
+            parent::rfb_read(remainder);
             parent::process_framebuffer_update(framebuffer_update_head);
         }
-        else if (framebuffer_update_head[0] == 1) {
+        else if (type[0] == 1) {
+            std::array<uint8_t, 3> padding_and_first_colour{};
+            parent::rfb_read(padding_and_first_colour);
             process_colour_map_entries();
         }
-        else if (framebuffer_update_head[0] == 3) {
+        else if (type[0] == 2) {
+            // Bell has no payload.
+        }
+        else if (type[0] == 3) {
+            std::array<uint8_t, 3> padding{};
+            parent::rfb_read(padding);
             parent::process_server_cut_text();
         }
         else {
-            std::cerr << "not implemented message type: " << (int)framebuffer_update_head[0] << std::endl;
+            std::cerr << "not implemented message type: " << (int)type[0] << std::endl;
         }
+    }
+
+    bool process_buffered_server_message()
+        requires requires(parent& p) {
+            p.has_complete_server_message();
+            p.begin_complete_server_message();
+            p.finish_complete_server_message();
+        }
+    {
+        if (!parent::has_complete_server_message()) return false;
+        parent::begin_complete_server_message();
+        process_server_message();
+        parent::finish_complete_server_message();
+        return true;
     }
 }; // class rfb
 

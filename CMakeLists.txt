@@ -240,6 +240,11 @@ if(BUILD_TESTING)
     target_link_libraries(rfb_trace_tests PRIVATE rfb)
     add_test(NAME rfb_trace_tests COMMAND rfb_trace_tests)
 
+    add_executable(rfb_fragmentation_tests test_rfb_fragmentation.cpp)
+    target_compile_features(rfb_fragmentation_tests PRIVATE cxx_std_20)
+    target_link_libraries(rfb_fragmentation_tests PRIVATE rfb)
+    add_test(NAME rfb_fragmentation_tests COMMAND rfb_fragmentation_tests)
+
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME rfb_ctl_python_tests

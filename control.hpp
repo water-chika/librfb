@@ -42,7 +42,9 @@
 
 #include <socket_helper.hpp>
 
+#include <algorithm>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <iomanip>
 #include <span>
@@ -54,6 +56,31 @@
 namespace rfb_control {
 
 inline constexpr size_t max_pending_bytes = 64 * 1024;
+inline constexpr size_t max_read_bytes_per_poll = 16 * 1024;
+inline constexpr size_t max_reads_per_poll = 4;
+inline constexpr size_t max_commands_per_poll = 32;
+
+inline std::ptrdiff_t write_control_port_socket(socket_helper::socket_t socket,
+                                                const void* data,
+                                                std::size_t size) {
+#ifdef MSG_NOSIGNAL
+    return ::send(socket, static_cast<const char*>(data),
+                  static_cast<int>(size), MSG_NOSIGNAL);
+#else
+    return socket_helper::write_socket(socket, data, size);
+#endif
+}
+
+inline bool prepare_control_port_socket(socket_helper::socket_t socket) {
+#ifdef SO_NOSIGPIPE
+    int enabled = 1;
+    if (::setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE,
+                     reinterpret_cast<const char*>(&enabled),
+                     sizeof(enabled)) != 0)
+        return false;
+#endif
+    return socket_helper::set_nonblocking(socket);
+}
 
 // Accepts one controller at a time. A second connection would interleave
 // commands with the first for no benefit, since the commands act on one shared
@@ -101,7 +128,8 @@ public:
             // These events describe the controller that was present when poll
             // ran. Drain it before accepting a replacement, and process readable
             // bytes before HUP so a final complete command is not discarded.
-            if (client_poll.revents & POLLIN) {
+            if ((client_poll.revents & POLLIN) ||
+                m_pending.find('\n') != std::string::npos) {
                 read_commands();
             }
             if (socket_helper::is_valid(m_client.get()) &&
@@ -124,7 +152,7 @@ private:
         // Replace rather than refuse: a controller that died without closing
         // cleanly would otherwise lock the port out until the viewer restarts.
         m_client = std::move(sock);
-        if (!socket_helper::set_nonblocking(m_client.get())) {
+        if (!prepare_control_port_socket(m_client.get())) {
             drop_controller();
             return;
         }
@@ -139,45 +167,58 @@ private:
     void read_commands() {
         char buffer[4096];
         bool eof{};
-        for (;;) {
+        size_t bytes{}, reads{};
+        while (bytes < max_read_bytes_per_poll && reads < max_reads_per_poll) {
+            auto capacity = std::min(sizeof(buffer), max_read_bytes_per_poll - bytes);
             auto count = socket_helper::read_socket(
-                    m_client.get(), buffer, sizeof(buffer));
+                    m_client.get(), buffer, capacity);
             if (count > 0) {
+                ++reads;
+                bytes += static_cast<size_t>(count);
                 m_pending.append(buffer, static_cast<size_t>(count));
-                process_pending_commands();
-                if (!socket_helper::is_valid(m_client.get())) return;
-                if (m_pending.size() > max_pending_bytes) {
-                    respond("error command too long");
-                    drop_controller();
-                    return;
-                }
+                if (!process_pending_commands()) return;
                 continue;
             }
             if (count == 0) eof = true;
             else if (!socket_helper::would_block(socket_helper::last_error())) eof = true;
             break;
         }
-        process_pending_commands();
         if (eof) drop_controller();
     }
 
-    void process_pending_commands() {
-        for (auto newline = m_pending.find('\n');
-             newline != std::string::npos;
-             newline = m_pending.find('\n')) {
-            auto line = m_pending.substr(0, newline);
-            m_pending.erase(0, newline + 1);
+    bool process_pending_commands() {
+        size_t consumed{}, commands{};
+        while (commands < max_commands_per_poll) {
+            auto newline = m_pending.find('\n', consumed);
+            if (newline == std::string::npos) break;
+            if (newline - consumed > max_pending_bytes) {
+                respond("error command too long");
+                drop_controller();
+                return false;
+            }
+            auto line = m_pending.substr(consumed, newline - consumed);
+            consumed = newline + 1;
+            ++commands;
             if (!line.empty() && line.back() == '\r') line.pop_back();
             respond(run_command(line));
-            if (!socket_helper::is_valid(m_client.get())) return;
+            if (!socket_helper::is_valid(m_client.get())) return false;
         }
+        if (consumed) m_pending.erase(0, consumed);
+        auto newline = m_pending.find('\n');
+        if ((newline == std::string::npos && m_pending.size() > max_pending_bytes) ||
+            (newline != std::string::npos && newline > max_pending_bytes)) {
+            respond("error command too long");
+            drop_controller();
+            return false;
+        }
+        return true;
     }
 
     void respond(const std::string& reply) {
         auto line = reply + "\n";
         size_t sent{};
         while (sent < line.size()) {
-            auto count = socket_helper::write_socket(
+            auto count = write_control_port_socket(
                 m_client.get(), line.data() + sent, line.size() - sent);
             if (count > 0) { sent += static_cast<size_t>(count); continue; }
             // The GUI event loop must never wait for a controller that stopped
@@ -374,6 +415,8 @@ private:
             encodings.emplace_back(
                     rfb::to_big_endian(static_cast<uint32_t>(value)));
         }
+        encodings.emplace_back(rfb::to_big_endian(
+                static_cast<uint32_t>(rfb::encoding::scale_ext)));
         parent::set_supported_encodings(std::move(encodings));
         parent::set_encodings();
         return std::format("ok {}", spec);

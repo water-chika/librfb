@@ -5,7 +5,9 @@
 
 #include <socket_helper.hpp>
 
+#include <algorithm>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <iomanip>
 #include <sstream>
@@ -16,6 +18,31 @@
 namespace rfb_control {
 
 inline constexpr std::size_t max_control_line = 64 * 1024;
+inline constexpr std::size_t max_control_read_bytes = 16 * 1024;
+inline constexpr std::size_t max_control_reads = 4;
+inline constexpr std::size_t max_control_commands = 32;
+
+inline std::ptrdiff_t write_control_socket(socket_helper::socket_t socket,
+                                           const void* data,
+                                           std::size_t size) {
+#ifdef MSG_NOSIGNAL
+    return ::send(socket, static_cast<const char*>(data),
+                  static_cast<int>(size), MSG_NOSIGNAL);
+#else
+    return socket_helper::write_socket(socket, data, size);
+#endif
+}
+
+inline bool prepare_control_socket(socket_helper::socket_t socket) {
+#ifdef SO_NOSIGPIPE
+    int enabled = 1;
+    if (::setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE,
+                     reinterpret_cast<const char*>(&enabled),
+                     sizeof(enabled)) != 0)
+        return false;
+#endif
+    return socket_helper::set_nonblocking(socket);
+}
 
 inline bool read_argument(std::istringstream& in, std::string& value) {
     in >> std::ws;
@@ -24,7 +51,7 @@ inline bool read_argument(std::istringstream& in, std::string& value) {
     } else {
         in >> value;
     }
-    return !value.empty();
+    return static_cast<bool>(in) && !value.empty();
 }
 
 template<class Session>
@@ -159,6 +186,12 @@ public:
 
     bool poll_once() {
         if (!m_port) return true;
+        // Continue a bounded batch on a later GUI iteration even when all bytes
+        // were already read during the previous iteration.
+        if (m_client && m_pending.find('\n') != std::string::npos) {
+            process_pending();
+            if (m_quit) return false;
+        }
         pollfd fds[2]{{m_listener.get(), POLLIN, 0},
                       {m_client.get(), POLLIN, 0}};
         auto count = m_client ? 2u : 1u;
@@ -169,7 +202,7 @@ public:
         if (m_client && (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL))) drop();
         if (fds[0].revents & POLLIN) {
             m_client = socket_helper::accept_connection(m_listener.get());
-            if (!socket_helper::set_nonblocking(m_client.get())) {
+            if (!prepare_control_socket(m_client.get())) {
                 drop();
                 return !m_quit;
             }
@@ -183,7 +216,7 @@ private:
     void send_all(std::string_view text) {
         std::size_t sent{};
         while (sent < text.size()) {
-            auto n = socket_helper::write_socket(
+            auto n = write_control_socket(
                 m_client.get(), text.data() + sent, text.size() - sent);
             if (n > 0) { sent += static_cast<std::size_t>(n); continue; }
             if (n < 0 && socket_helper::would_block(socket_helper::last_error())) {
@@ -196,35 +229,52 @@ private:
     void read_commands() {
         char buffer[4096];
         bool eof{};
-        for (;;) {
-            auto n = socket_helper::read_socket(m_client.get(), buffer, sizeof buffer);
+        std::size_t bytes{}, reads{};
+        while (bytes < max_control_read_bytes && reads < max_control_reads) {
+            auto capacity = std::min(sizeof buffer, max_control_read_bytes - bytes);
+            auto n = socket_helper::read_socket(m_client.get(), buffer, capacity);
             if (n > 0) {
+                ++reads;
+                bytes += static_cast<std::size_t>(n);
                 m_pending.append(buffer, static_cast<std::size_t>(n));
-                process_pending();
-                if (!m_client) return;
-                if (m_pending.size() > max_control_line) {
-                    send_all("error command too long\n"); drop(); return;
-                }
+                if (!process_pending()) return;
                 continue;
             }
             if (n == 0) eof = true;
             else if (!socket_helper::would_block(socket_helper::last_error())) eof = true;
             break;
         }
-        process_pending();
         if (eof) drop();
     }
-    void process_pending() {
-        for (auto pos = m_pending.find('\n'); pos != std::string::npos;
-             pos = m_pending.find('\n')) {
-            auto line = m_pending.substr(0, pos);
-            m_pending.erase(0, pos + 1);
+    bool process_pending() {
+        std::size_t consumed{}, commands{};
+        while (commands < max_control_commands) {
+            auto pos = m_pending.find('\n', consumed);
+            if (pos == std::string::npos) break;
+            if (pos - consumed > max_control_line) {
+                send_all("error command too long\n"); drop(); return false;
+            }
+            auto line = m_pending.substr(consumed, pos - consumed);
+            consumed = pos + 1;
+            ++commands;
             if (!line.empty() && line.back() == '\r') line.pop_back();
             auto reply = run_command(m_session, m_host, m_rfb_port, line);
-            if (reply == "ok quit") { send_all("ok\n"); m_quit = true; return; }
+            if (reply == "ok quit") {
+                send_all("ok\n");
+                m_quit = true;
+                drop();
+                return false;
+            }
             send_all(reply + "\n");
-            if (!m_client) return;
+            if (!m_client) return false;
         }
+        if (consumed) m_pending.erase(0, consumed);
+        auto newline = m_pending.find('\n');
+        if ((newline == std::string::npos && m_pending.size() > max_control_line) ||
+            (newline != std::string::npos && newline > max_control_line)) {
+            send_all("error command too long\n"); drop(); return false;
+        }
+        return true;
     }
 
     std::uint16_t m_port{};

@@ -55,12 +55,13 @@ using viewer_client_protocol =
     add_set_format<
     add_server_init<
     add_client_init<
+    add_server_message_buffer<
     add_connection<
     set_port<
     set_address<
     set_password_from_configure<
     T
-    >>>>>>>>>>>>>>>>>>>;
+    >>>>>>>>>>>>>>>>>>>>;
 
 template<typename T>
 class viewer_client : public viewer_client_protocol<T> {

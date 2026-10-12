@@ -148,12 +148,12 @@ public:
             }
             return;
         }
-        record_key_event(keysym, state);
+        if (!input_suppressed()) record_key_event(keysym, state);
         parent::send_key_event(keysym, state);
     }
 
     void send_pointer_event(uint32_t button_mask, int x, int y) {
-        record_pointer_event(button_mask, x, y);
+        if (!input_suppressed()) record_pointer_event(button_mask, x, y);
         parent::send_pointer_event(button_mask, x, y);
     }
 
@@ -171,6 +171,13 @@ public:
     }
 
 private:
+    bool input_suppressed() const {
+        if constexpr (requires { parent::get_view_only(); }) {
+            return parent::get_view_only();
+        }
+        return false;
+    }
+
     void record_key_event(int keysym, int state) {
         if (!recording()) return;
         interval_frame();
@@ -200,19 +207,21 @@ private:
     }
 
     std::string capture_frame() {
-        auto name = std::format("frame_{:06}.png", m_frame_index++);
         int width = parent::get_fb_width();
         int height = parent::get_fb_height();
-        if (width > 0 && height > 0) {
-            m_pixels.resize(static_cast<size_t>(width) * height * 4);
-            parent::get_frame(std::span<uint8_t>{m_pixels});
-            auto path = (std::filesystem::path{m_dir} / name).string();
-            try {
-                rfb_png::write_png(path.c_str(), m_pixels.data(), width, height);
-            }
-            catch (const std::exception&) {
-                return "";  // A failed frame must not abort the recording.
-            }
+        if (width <= 0 || height <= 0) {
+            m_last_frame = clock::now();
+            return "";
+        }
+        auto name = std::format("frame_{:06}.png", m_frame_index++);
+        m_pixels.resize(static_cast<size_t>(width) * height * 4);
+        parent::get_frame(std::span<uint8_t>{m_pixels});
+        auto path = (std::filesystem::path{m_dir} / name).string();
+        try {
+            rfb_png::write_png(path.c_str(), m_pixels.data(), width, height);
+        }
+        catch (const std::exception&) {
+            return "";  // A failed frame must not abort the recording.
         }
         m_last_frame = clock::now();
         return name;

@@ -144,7 +144,10 @@ public:
             if (!m_running || !m_control.poll_once()) break;
             poll_clipboard();
             poll_rfb();
-            Sleep(1);
+            // Sleep until GUI work arrives, with a short ceiling so socket work
+            // remains responsive without spinning at 1 kHz while idle.
+            MsgWaitForMultipleObjectsEx(0, nullptr, 10, QS_ALLINPUT,
+                                        MWMO_INPUTAVAILABLE);
         }
         release_input();
         return 0;
@@ -170,7 +173,9 @@ private:
         case WM_CLOSE: DestroyWindow(m_window); return 0;
         case WM_DESTROY: m_running = false; PostQuitMessage(0); return 0;
         case WM_ERASEBKGND: return 1;
-        case WM_KILLFOCUS: release_input(); return 0;
+        case WM_KILLFOCUS:
+        case WM_CANCELMODE:
+            release_input(); return 0;
         case WM_KEYDOWN: case WM_SYSKEYDOWN:
         case WM_KEYUP: case WM_SYSKEYUP: {
             bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
@@ -188,8 +193,13 @@ private:
                     // A negative result is a dead key: ToUnicodeEx has updated
                     // the layout's composition state, but there is no character
                     // (and therefore no RFB keysym) to send for this event.
-                    if (count == 1) {
-                        auto codepoint = static_cast<std::uint32_t>(chars[0]);
+                    if (count == 1 || (count == 2 &&
+                        IS_HIGH_SURROGATE(chars[0]) && IS_LOW_SURROGATE(chars[1]))) {
+                        auto codepoint = count == 1
+                            ? static_cast<std::uint32_t>(chars[0])
+                            : static_cast<std::uint32_t>(
+                                0x10000 + ((chars[0] - 0xd800) << 10) +
+                                (chars[1] - 0xdc00));
                         keysym = codepoint <= 0xff ? codepoint
                                                   : 0x01000000u | codepoint;
                     }
@@ -218,12 +228,22 @@ private:
         case WM_MBUTTONUP: set_button(1, false, lparam); return 0;
         case WM_RBUTTONDOWN: set_button(2, true, lparam); return 0;
         case WM_RBUTTONUP: set_button(2, false, lparam); return 0;
+        case WM_CAPTURECHANGED:
+            if (m_buttons) {
+                m_buttons = 0;
+                m_client.release_remote_input();
+            }
+            return 0;
         case WM_MOUSEWHEEL: {
             auto point = POINT{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
             ScreenToClient(m_window, &point);
-            auto wheel = GET_WHEEL_DELTA_WPARAM(wparam) > 0 ? 3u : 4u;
-            send_pointer(point.x, point.y, m_buttons | (1u << wheel));
-            send_pointer(point.x, point.y); return 0;
+            auto delta = GET_WHEEL_DELTA_WPARAM(wparam);
+            auto wheel = delta > 0 ? 3u : 4u;
+            for (auto steps = std::abs(delta) / WHEEL_DELTA; steps > 0; --steps) {
+                send_pointer(point.x, point.y, m_buttons | (1u << wheel));
+                send_pointer(point.x, point.y);
+            }
+            return 0;
         }
         }
         return DefWindowProcW(m_window, message, wparam, lparam);
@@ -301,12 +321,11 @@ private:
         pollfd fd{m_client.get_socket(), POLLIN, 0};
         auto ready = socket_helper::poll_sockets(&fd, 1, 0);
         if (ready < 0) throw std::runtime_error{"RFB socket poll failed"};
-        if (fd.revents & POLLIN) {
-            // A single readiness notification may cover several complete server
-            // messages, including the final batch delivered with HUP. Re-poll
-            // after each framed message and drain everything already readable.
-            do {
-                m_client.process_server_message();
+        if (fd.revents & (POLLIN | POLLHUP)) {
+            auto open = m_client.read_available_server_data();
+            bool processed{};
+            while (m_client.process_buffered_server_message()) {
+                processed = true;
                 if (m_client.is_frame_updated()) {
                     m_client.reset_frame_updated();
                     present();
@@ -316,13 +335,22 @@ private:
                     if (m_client.take_server_cut_text(remote_clipboard))
                         m_pending_remote_clipboard = std::move(remote_clipboard);
                 }
-                fd.revents = 0;
-            } while (socket_helper::poll_sockets(&fd, 1, 0) > 0 &&
-                     (fd.revents & POLLIN));
+            }
             if (m_pending_remote_clipboard &&
-                set_clipboard(*m_pending_remote_clipboard))
+                set_clipboard(*m_pending_remote_clipboard)) {
                 m_pending_remote_clipboard.reset();
-            m_client.request_framebuffer_update();
+                std::string remote_clipboard;
+                if (m_client.take_server_cut_text(remote_clipboard)) {
+                    if (!set_clipboard(remote_clipboard))
+                        m_pending_remote_clipboard = std::move(remote_clipboard);
+                }
+            }
+            if (!open) {
+                if (m_client.has_buffered_server_data())
+                    throw std::runtime_error{"server closed with a truncated RFB message"};
+                throw rfb::connection_closed{"server closed the connection"};
+            }
+            if (processed) m_client.request_framebuffer_update();
         }
         if (fd.revents & (POLLERR | POLLHUP | POLLNVAL))
             throw rfb::connection_closed{"server closed the connection"};
@@ -343,24 +371,33 @@ private:
     void release_input() {
         m_client.release_remote_input();
         m_physical_keysyms.clear();
+        if (m_buttons) ReleaseCapture();
         m_buttons = 0;
     }
 
     bool set_clipboard(const std::string& text) {
-        if (!OpenClipboard(m_window)) return false;
-        EmptyClipboard();
-        int chars = MultiByteToWideChar(CP_UTF8, 0, text.data(),
+        if (text.size() > static_cast<std::size_t>(INT_MAX)) return false;
+        int chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
                                         static_cast<int>(text.size()), nullptr, 0);
-        auto memory = GlobalAlloc(GMEM_MOVEABLE, (chars + 1) * sizeof(wchar_t));
-        if (memory) {
-            auto* wide = static_cast<wchar_t*>(GlobalLock(memory));
-            MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), wide, chars);
-            wide[chars] = 0; GlobalUnlock(memory);
-            if (!SetClipboardData(CF_UNICODETEXT, memory)) GlobalFree(memory);
+        if (!chars && !text.empty()) return false;
+        auto memory = GlobalAlloc(GMEM_MOVEABLE, (static_cast<std::size_t>(chars) + 1) * sizeof(wchar_t));
+        if (!memory) return false;
+        auto* wide = static_cast<wchar_t*>(GlobalLock(memory));
+        if (!wide) { GlobalFree(memory); return false; }
+        if (chars) MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                                       static_cast<int>(text.size()), wide, chars);
+        wide[chars] = 0;
+        GlobalUnlock(memory);
+        if (!OpenClipboard(m_window)) { GlobalFree(memory); return false; }
+        bool success = false;
+        if (EmptyClipboard()) {
+            // Ownership transfers only when SetClipboardData succeeds.
+            success = SetClipboardData(CF_UNICODETEXT, memory) != nullptr;
         }
+        if (!success) GlobalFree(memory);
         CloseClipboard();
-        m_clipboard_sequence = GetClipboardSequenceNumber();
-        return true;
+        if (success) m_clipboard_sequence = GetClipboardSequenceNumber();
+        return success;
     }
     void poll_clipboard() {
         auto sequence = GetClipboardSequenceNumber();

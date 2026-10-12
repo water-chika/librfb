@@ -19,7 +19,9 @@ struct fake_client {
     void release_remote_input() { keys.clear(); pointer = {0, std::get<1>(pointer), std::get<2>(pointer)}; }
     int get_fb_width() const { return 0; }
     int get_fb_height() const { return 0; }
+    bool get_view_only() const { return view_only; }
     void get_frame(std::span<std::uint8_t>) {}
+    bool view_only{};
     std::set<int> keys;
     std::tuple<std::uint32_t, int, int> pointer{};
 };
@@ -38,10 +40,16 @@ int main() {
     client.send_key_event(65, 1);
     client.send_pointer_event(1, 12, 34);
     client.release_remote_input();
+    client.view_only = true;
+    client.send_key_event(66, 1);
+    client.send_pointer_event(1, 56, 78);
     CHECK(client.record_stop().starts_with("ok "));
     std::ifstream in{dir / "trace.jsonl"};
     std::string text{std::istreambuf_iterator<char>{in}, {}};
     CHECK(text.find("\"keysym\":65,\"state\":0") != std::string::npos);
     CHECK(text.find("\"x\":12,\"y\":34,\"buttons\":0") != std::string::npos);
+    CHECK(text.find("\"keysym\":66") == std::string::npos);
+    CHECK(text.find("\"x\":56") == std::string::npos);
+    CHECK(text.find("\"frame\":\"frame_") == std::string::npos);
     std::filesystem::remove_all(dir);
 }
