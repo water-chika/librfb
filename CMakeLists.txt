@@ -196,6 +196,27 @@ if(RFB_SERVER_H264)
 endif()
 
 if(WIN32)
+    # The release-supported Windows viewer path is read-only display. The
+    # executable contains experimental input, clipboard and control plumbing,
+    # but those broader interaction paths have not been release-validated.
+    add_executable(rfb_window_win32
+        windows_viewer.cpp
+        viewer_client.hpp
+        control_server.hpp
+        trace.hpp
+    )
+    target_compile_features(rfb_window_win32 PRIVATE cxx_std_20)
+    target_link_libraries(rfb_window_win32 PRIVATE
+        rfb
+        remote_media::remote_media
+        d3d11 dxgi user32 gdi32
+    )
+    target_compile_definitions(rfb_window_win32 PRIVATE
+        ${RFB_PLATFORM_DEFINITIONS})
+    if(MSVC)
+        target_compile_options(rfb_window_win32 PRIVATE /utf-8 /Zc:__cplusplus /EHsc)
+    endif()
+
     # GDI capture and SendInput.
     target_link_libraries(rfb_server PUBLIC gdi32 user32)
     target_compile_definitions(rfb_server PUBLIC ${RFB_PLATFORM_DEFINITIONS})
@@ -209,6 +230,22 @@ if(MSVC)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(rfb_control_tests test_control.cpp)
+    target_compile_features(rfb_control_tests PRIVATE cxx_std_20)
+    target_link_libraries(rfb_control_tests PRIVATE rfb)
+    add_test(NAME rfb_control_tests COMMAND rfb_control_tests)
+
+    add_executable(rfb_trace_tests test_trace.cpp)
+    target_compile_features(rfb_trace_tests PRIVATE cxx_std_20)
+    target_link_libraries(rfb_trace_tests PRIVATE rfb)
+    add_test(NAME rfb_trace_tests COMMAND rfb_trace_tests)
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME rfb_ctl_python_tests
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_rfb_ctl.py)
+    endif()
+
     add_executable(rfb_server_core_tests test_server_core.cpp)
     target_compile_features(rfb_server_core_tests PRIVATE cxx_std_20)
     target_link_libraries(rfb_server_core_tests PRIVATE

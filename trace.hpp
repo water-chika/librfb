@@ -32,6 +32,8 @@
 
 #include "png.hpp"
 
+#include <cpp_helper.hpp>
+
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -146,26 +148,45 @@ public:
             }
             return;
         }
-        if (recording()) {
-            interval_frame();
-            write_line(std::format(
-                    "\"type\":\"key\",\"keysym\":{},\"state\":{}",
-                    keysym, state));
-        }
+        record_key_event(keysym, state);
         parent::send_key_event(keysym, state);
     }
 
     void send_pointer_event(uint32_t button_mask, int x, int y) {
-        if (recording()) {
-            interval_frame();
-            write_line(std::format(
-                    "\"type\":\"pointer\",\"x\":{},\"y\":{},\"buttons\":{}",
-                    x, y, button_mask));
-        }
+        record_pointer_event(button_mask, x, y);
         parent::send_pointer_event(button_mask, x, y);
     }
 
+    // Synthesized releases must bypass view-only suppression in the parent, but
+    // remain visible in the trace so replay cannot leave remote input held.
+    void release_remote_input() {
+        if constexpr (requires { parent::held_remote_keys(); }) {
+            for (auto key : parent::held_remote_keys()) record_key_event(key, 0);
+        }
+        if constexpr (requires { parent::held_remote_pointer(); }) {
+            auto [mask, x, y] = parent::held_remote_pointer();
+            if (mask) record_pointer_event(0, x, y);
+        }
+        parent::release_remote_input();
+    }
+
 private:
+    void record_key_event(int keysym, int state) {
+        if (!recording()) return;
+        interval_frame();
+        write_line(std::format(
+                "\"type\":\"key\",\"keysym\":{},\"state\":{}",
+                keysym, state));
+    }
+
+    void record_pointer_event(uint32_t button_mask, int x, int y) {
+        if (!recording()) return;
+        interval_frame();
+        write_line(std::format(
+                "\"type\":\"pointer\",\"x\":{},\"y\":{},\"buttons\":{}",
+                x, y, button_mask));
+    }
+
     int64_t elapsed_ms() const {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
                 clock::now() - m_start).count();

@@ -273,9 +273,11 @@ dma-buf) shared with ROCm/HIP via external memory. Vulkan is no longer used.
 ### Control port
 
 `--control-port <port>` opens a line-oriented text protocol on
-`127.0.0.1:<port>` (loopback only, never a real interface — the protocol has
-no authentication, so treat it exactly like the RFB port itself: reach a
-remote instance only through an SSH tunnel you already control). One command
+`127.0.0.1:<port>` (loopback only, never a real interface). Loopback is an
+exposure reduction, not an identity check: another process running as any user
+on the same machine may be able to connect. The protocol has no authentication,
+so enable it only on a trusted single-user host and reach a remote instance only
+through an SSH tunnel you already control. One command
 per line, one `ok ...`/`error ...` reply per line. Verbs:
 
 | Command | Effect |
@@ -331,11 +333,18 @@ out of scope for this first version.
 | `rfb_recorder` | yes | yes |
 | `rfb_server` | test pattern | yes |
 | `rfb_window_demo` | yes | no |
+| `rfb_window_win32` | no | yes |
 | `test_hip` | yes | no |
 
 `rfb_window_demo` and `test_hip` are Linux only: they render through Wayland,
-DRM/amdgpu and HIP external memory, which have no Windows equivalent. CMake
-skips them automatically on Windows.
+DRM/amdgpu and HIP external memory. Windows builds instead provide
+`rfb_window_win32`, a native Win32 window with a D3D11 swap chain using the same
+RFB Raw/ZRLE/H264 protocol stack. **The release-supported Windows path is
+read-only viewing:** run it with `--view-only`. Input, clipboard, scale, trace
+recording and control-port code is present for development, but those broader
+interaction paths have not been validated for release and are not claimed as
+supported. `capture` and `record start` accept quoted paths, including normal
+Windows paths containing spaces.
 
 ### Building on Windows
 
@@ -344,13 +353,23 @@ The CMake files use plain `find_package`, so any provider works; vcpkg is the
 easiest:
 
 ```bat
-vcpkg install zlib:x64-windows openssl:x64-windows ^
-    "ffmpeg[avcodec,avformat,avdevice,swscale,zlib,x264]:x64-windows"
-
+rem Dependencies are declared by the repository-root vcpkg.json manifest.
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
     -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
 ```
+
+Run the native viewer with:
+
+```bat
+build\librfb\Release\rfb_window_win32.exe 127.0.0.1 5900 h264,zrle,raw ^
+    --view-only
+```
+
+The control port is disabled by default and binds only to `127.0.0.1` when
+enabled. D3D11, DXGI, User32 and GDI32 come from the Windows SDK; vcpkg supplies
+zlib, OpenSSL and FFmpeg. Visual Studio 2022 with current C++20 library support
+is required.
 
 Add `-DRFB_SERVER_H264=ON` to the configure line to build `rfb_server` with
 H264; it reuses the same vcpkg ffmpeg the client tools need.

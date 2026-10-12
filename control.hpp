@@ -44,6 +44,7 @@
 
 #include <charconv>
 #include <cstdint>
+#include <iomanip>
 #include <span>
 #include <sstream>
 #include <string>
@@ -51,6 +52,8 @@
 #include <vector>
 
 namespace rfb_control {
+
+inline constexpr size_t max_pending_bytes = 64 * 1024;
 
 // Accepts one controller at a time. A second connection would interleave
 // commands with the first for no benefit, since the commands act on one shared
@@ -80,12 +83,13 @@ public:
         // A negative fd is ignored by poll(), which is how both slots stay
         // present in the fixed-size array while disabled or unconnected.
         fds.emplace_back(pollfd{
-                .fd = m_port != 0 ? static_cast<int>(m_listener.get()) : -1,
+                .fd = m_port != 0 ? m_listener.get()
+                                  : socket_helper::invalid_socket,
                 .events = POLLIN,
                 });
         fds.emplace_back(pollfd{
                 .fd = socket_helper::is_valid(m_client.get())
-                    ? static_cast<int>(m_client.get()) : -1,
+                    ? m_client.get() : socket_helper::invalid_socket,
                 .events = POLLIN,
                 });
         return fds;
@@ -93,15 +97,19 @@ public:
 
     void process_events(auto& fds) {
         if (m_port != 0) {
-            if (fds[FDS_INDEX].revents & POLLIN) {
-                accept_controller();
-            }
             auto& client_poll = fds[FDS_INDEX + 1];
-            if (client_poll.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            // These events describe the controller that was present when poll
+            // ran. Drain it before accepting a replacement, and process readable
+            // bytes before HUP so a final complete command is not discarded.
+            if (client_poll.revents & POLLIN) {
+                read_commands();
+            }
+            if (socket_helper::is_valid(m_client.get()) &&
+                (client_poll.revents & (POLLHUP | POLLERR | POLLNVAL))) {
                 drop_controller();
             }
-            else if (client_poll.revents & POLLIN) {
-                read_commands();
+            if (fds[FDS_INDEX].revents & POLLIN) {
+                accept_controller();
             }
         }
         parent::process_events(fds);
@@ -116,6 +124,10 @@ private:
         // Replace rather than refuse: a controller that died without closing
         // cleanly would otherwise lock the port out until the viewer restarts.
         m_client = std::move(sock);
+        if (!socket_helper::set_nonblocking(m_client.get())) {
+            drop_controller();
+            return;
+        }
         m_pending.clear();
     }
 
@@ -126,28 +138,53 @@ private:
 
     void read_commands() {
         char buffer[4096];
-        auto count = socket_helper::read_socket(
-                m_client.get(), buffer, sizeof(buffer));
-        if (count <= 0) {
-            drop_controller();
-            return;
+        bool eof{};
+        for (;;) {
+            auto count = socket_helper::read_socket(
+                    m_client.get(), buffer, sizeof(buffer));
+            if (count > 0) {
+                m_pending.append(buffer, static_cast<size_t>(count));
+                process_pending_commands();
+                if (!socket_helper::is_valid(m_client.get())) return;
+                if (m_pending.size() > max_pending_bytes) {
+                    respond("error command too long");
+                    drop_controller();
+                    return;
+                }
+                continue;
+            }
+            if (count == 0) eof = true;
+            else if (!socket_helper::would_block(socket_helper::last_error())) eof = true;
+            break;
         }
-        m_pending.append(buffer, static_cast<size_t>(count));
+        process_pending_commands();
+        if (eof) drop_controller();
+    }
+
+    void process_pending_commands() {
         for (auto newline = m_pending.find('\n');
              newline != std::string::npos;
              newline = m_pending.find('\n')) {
             auto line = m_pending.substr(0, newline);
             m_pending.erase(0, newline + 1);
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
+            if (!line.empty() && line.back() == '\r') line.pop_back();
             respond(run_command(line));
+            if (!socket_helper::is_valid(m_client.get())) return;
         }
     }
 
     void respond(const std::string& reply) {
         auto line = reply + "\n";
-        socket_helper::write_socket(m_client.get(), line.data(), line.size());
+        size_t sent{};
+        while (sent < line.size()) {
+            auto count = socket_helper::write_socket(
+                m_client.get(), line.data() + sent, line.size() - sent);
+            if (count > 0) { sent += static_cast<size_t>(count); continue; }
+            // The GUI event loop must never wait for a controller that stopped
+            // reading. Drop it on back-pressure or any send error.
+            drop_controller();
+            return;
+        }
     }
 
     // Commands arrive as text at runtime, so this one function dispatches on a
@@ -171,7 +208,7 @@ private:
             }
             if (command == "capture") {
                 std::string path;
-                in >> path;
+                in >> std::quoted(path);
                 if (path.empty()) {
                     return "error capture needs a file path";
                 }
@@ -179,14 +216,18 @@ private:
             }
             if (command == "pointer") {
                 int x = 0, y = 0, mask = 0;
-                in >> x >> y >> mask;
+                if (!(in >> x >> y >> mask) || mask < 0 || mask > 255) {
+                    return "error pointer needs x y buttons";
+                }
                 parent::send_pointer_event(
                         static_cast<uint32_t>(mask), x, y);
                 return "ok";
             }
             if (command == "click") {
                 int x = 0, y = 0, button = 0;
-                in >> x >> y >> button;
+                if (!(in >> x >> y >> button) || button < 0 || button > 7) {
+                    return "error click needs x y button";
+                }
                 // A press carrying a new position looks to many toolkits like
                 // a teleport with no motion before it, and the click is
                 // dropped, so move first exactly as the pointer layer does.
@@ -198,7 +239,9 @@ private:
             }
             if (command == "key") {
                 int keysym = 0, state = 1;
-                in >> keysym >> state;
+                if (!(in >> keysym >> state) || (state != 0 && state != 1)) {
+                    return "error key needs keysym state";
+                }
                 parent::send_key_event(keysym, state);
                 return "ok";
             }
@@ -208,7 +251,7 @@ private:
                 if (action == "start") {
                     std::string dir;
                     int interval_ms = 0;
-                    in >> dir >> interval_ms;
+                    in >> std::quoted(dir) >> interval_ms;
                     if (dir.empty()) {
                         return "error record start needs a directory";
                     }
@@ -264,6 +307,11 @@ private:
                 std::string state;
                 in >> state;
                 if (state == "on") {
+                    // Release through an unsuppressed path before input is
+                    // disabled, otherwise held remote keys/buttons can stick.
+                    if constexpr (requires { parent::release_remote_input(); }) {
+                        parent::release_remote_input();
+                    }
                     parent::set_view_only(true);
                 }
                 else if (state == "off") {

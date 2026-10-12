@@ -94,7 +94,11 @@ class FakeControlServer:
                             return
 
     def _handle(self, line):
-        parts = line.split()
+        import shlex
+        parts = shlex.split(line, posix=False)
+        parts = [part[1:-1].replace('\\\\', '\\').replace('\\"', '"')
+                 if len(part) >= 2 and part[0] == part[-1] == '"' else part
+                 for part in parts]
         if not parts:
             return "ok"
         cmd = parts[0]
@@ -141,7 +145,7 @@ class ControlClientTest(unittest.TestCase):
 
     def test_capture_subcommand(self):
         with tempfile.TemporaryDirectory() as d:
-            out = Path(d) / "frame.png"
+            out = Path(d) / "frame with spaces.png"
             rc = rfb_ctl.main([
                 "127.0.0.1", str(self.server.port), "capture", str(out)])
             self.assertEqual(rc, 0)

@@ -132,9 +132,14 @@ def cmd_refresh(args):
         return 0 if reply.startswith("ok") else 1
 
 
+def quote_argument(value):
+    """Quote one control-protocol argument with C++ std::quoted semantics."""
+    return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
 def cmd_capture(args):
     with ControlClient(args.host, args.port) as c:
-        reply = c.send(f"capture {args.path}")
+        reply = c.send(f"capture {quote_argument(args.path)}")
         print(reply)
         return 0 if reply.startswith("ok") else 1
 
@@ -239,7 +244,7 @@ def cmd_replay(args):
                 if not recorded_png.exists():
                     continue
                 live_png = Path(args.trace_dir) / f"replay_{ev['frame']}"
-                reply = c.send(f"capture {live_png}")
+                reply = c.send(f"capture {quote_argument(live_png)}")
                 if not reply.startswith("ok"):
                     print(
                         f"error capturing replay frame at t={ev['t_ms']}ms: "

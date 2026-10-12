@@ -14,6 +14,7 @@
 
 #include <memory>
 #include <deque>
+#include <set>
 #include <thread>
 #include <fstream>
 
@@ -77,10 +78,25 @@ public:
     void send_key_event(int key, int state) {
         if (view_only) return;
         parent::key_event(key, state);
+        if (state) pressed_keys.insert(key); else pressed_keys.erase(key);
     }
     void send_pointer_event(uint32_t button_mask, int x, int y) {
         if (view_only) return;
         parent::pointer_event(button_mask, x, y);
+        pointer_mask = button_mask;
+        pointer_x = x;
+        pointer_y = y;
+    }
+    const std::set<int>& held_remote_keys() const { return pressed_keys; }
+    auto held_remote_pointer() const {
+        struct state { uint32_t mask; int x; int y; };
+        return state{pointer_mask, pointer_x, pointer_y};
+    }
+    void release_remote_input() {
+        for (auto key : pressed_keys) parent::key_event(key, 0);
+        pressed_keys.clear();
+        if (pointer_mask) parent::pointer_event(0, pointer_x, pointer_y);
+        pointer_mask = 0;
     }
     void send_cut_text(auto& str) {
         if (view_only) return;
@@ -96,6 +112,9 @@ public:
     void set_view_only(bool v) { view_only = v; }
 private:
     bool view_only;
+    std::set<int> pressed_keys;
+    uint32_t pointer_mask{};
+    int pointer_x{}, pointer_y{};
 };
 
 template<typename T>
@@ -502,9 +521,6 @@ public:
         // The server can drop the connection without anything left to read, in
         // which case only POLLHUP/POLLERR is set and the POLLIN branch below
         // would never notice.
-        if (fds[FDS_INDEX].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-            throw rfb::connection_closed{"server closed the connection"};
-        }
         if (fds[FDS_INDEX].revents & POLLIN) {
             parent::request_framebuffer_update(); // request next framebuffer, decrease delay, increase fps.
             parent::update_pointer_position(); // pointer and key events is after frame request to increase fps.
@@ -522,6 +538,9 @@ public:
                 parent::draw();
             }
             previous_time = now;
+        }
+        if (fds[FDS_INDEX].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            throw rfb::connection_closed{"server closed the connection"};
         }
         else if (now - previous_time > 30ms) {
             parent::update_pointer_position();
