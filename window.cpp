@@ -18,6 +18,11 @@
 #include <thread>
 #include <fstream>
 
+#include <dirent.h>
+#include <cerrno>
+#include <cstring>
+#include <algorithm>
+
 using cpp_helper::empty_class;
 using cpp_helper::configure;
 using cpp_helper::empty_configure;
@@ -31,8 +36,12 @@ public:
     add_rfb_process_server_cut_text(const configure auto& conf) : parent{conf}
     {}
     void process_server_cut_text(const auto& text) {
+        m_server_cut_text.assign(text.begin(), text.end());
         parent::set_selection_source_content(text);
     }
+    std::string_view server_cut_text() const { return m_server_cut_text; }
+private:
+    std::string m_server_cut_text;
 };
 
 template<typename T>
@@ -655,6 +664,70 @@ using draw_app =
 
 using namespace std::literals;
 
+// Default DRM device selection rule: enumerate /dev/dri/cardN nodes in
+// numeric order and pick the first one that is actually usable for KMS
+// display output, i.e. it opens, it answers drmModeGetResources, and it has
+// at least one connected connector with a usable mode. Render-only nodes,
+// nodes we lack permission on, and KMS-capable-but-nothing-plugged-in nodes
+// are all skipped rather than picked blindly as /dev/dri/card0 would be. An
+// explicit --gpu path always takes priority and is never probed here.
+std::string pick_default_drm_device() {
+    std::vector<std::string> candidates;
+    if (DIR* dir = opendir("/dev/dri")) {
+        while (dirent* entry = readdir(dir)) {
+            std::string name = entry->d_name;
+            if (name.rfind("card", 0) == 0) {
+                candidates.push_back("/dev/dri/" + name);
+            }
+        }
+        closedir(dir);
+    }
+    std::sort(candidates.begin(), candidates.end());
+
+    std::string probe_log;
+    for (auto& path : candidates) {
+        int fd = open(path.c_str(), O_RDWR);
+        if (fd == -1) {
+            probe_log += std::format("  {}: open failed: {}\n", path, strerror(errno));
+            continue;
+        }
+        drmModeRes* resources = drmModeGetResources(fd);
+        if (resources == nullptr) {
+            probe_log += std::format("  {}: no KMS resources (likely a render-only node)\n", path);
+            close(fd);
+            continue;
+        }
+        bool has_connected_display = false;
+        for (int i = 0; i < resources->count_connectors && !has_connected_display; i++) {
+            drmModeConnector* connector = drmModeGetConnector(fd, resources->connectors[i]);
+            if (connector != nullptr) {
+                if (connector->connection == DRM_MODE_CONNECTED && connector->count_modes > 0) {
+                    has_connected_display = true;
+                }
+                drmModeFreeConnector(connector);
+            }
+        }
+        drmModeFreeResources(resources);
+        close(fd);
+        if (has_connected_display) {
+            return path;
+        }
+        probe_log += std::format("  {}: KMS-capable but no connected display\n", path);
+    }
+
+    if (candidates.empty()) {
+        throw std::runtime_error{
+            "no DRM devices found under /dev/dri; pass --gpu <path> to "
+            "select one explicitly"};
+    }
+    throw std::runtime_error{std::format(
+        "no usable DRM device with a connected display found among {} "
+        "candidate(s) under /dev/dri:\n{}"
+        "pass --gpu <path> to select one explicitly, or check permissions "
+        "(you may need to be in the 'video'/'render' group)",
+        candidates.size(), probe_log)};
+}
+
 std::string read_password_file(const char* path) {
     std::ifstream in{path};
     if (!in) {
@@ -691,7 +764,10 @@ int main(int argc, const char* argv[]) {
                 "--log <enabled_logs>\n"
                 "--width <width>\n"
                 "--height <height>\n"
-                "--gpu <drm_device_path>\n"
+                "--gpu <drm_device_path>  override DRM device probing;\n"
+                "                        default is to probe /dev/dri/card*\n"
+                "                        and pick the first with a connected\n"
+                "                        display\n"
                 "--view-only\n"
                 "--password <password>\n"
                 "--password-file <path>\n"
@@ -786,13 +862,16 @@ int main(int argc, const char* argv[]) {
     // then never sends a scale request, so nothing is wedged either way.
     encodings.emplace_back(rfb::to_big_endian(
             static_cast<uint32_t>(rfb::encoding::scale_ext)));
+    // An explicit --gpu path always wins; otherwise probe for the default.
+    std::string resolved_drm_device_path =
+        (drm_device_path[0] != '\0') ? drm_device_path : pick_default_drm_device();
     auto conf = config{
         .address=address, .port=port,
         .supported_encodings = std::move(encodings),
         .enabled_logs = enabled_logs,
         .width = width,
         .height = height,
-        .drm_device_path = drm_device_path,
+        .drm_device_path = resolved_drm_device_path.c_str(),
         .view_only = view_only,
         .password = std::move(password),
         .control_port = control_port,

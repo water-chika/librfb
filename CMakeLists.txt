@@ -196,6 +196,16 @@ if(RFB_SERVER_H264)
 endif()
 
 if(WIN32)
+    # rfb_window_win32 is the Windows counterpart of the Linux rfb_window_demo
+    # below: both are an interactive viewer window for an RFB server. The
+    # rendering path differs because the GPU surfaces differ, not because
+    # Windows lacks the feature: this one renders through D3D11/DXGI/GDI,
+    # picking the system default adapter (D3D11CreateDeviceAndSwapChain with
+    # a null adapter argument), the Windows analogue of rfb_window_demo's
+    # default-DRM-device probing. DRM/Wayland/HIP are Linux-only, so there is
+    # no DRM device selection here to port - that would be faking a path that
+    # does not exist on this platform.
+    #
     # The release-supported Windows viewer path is read-only display. The
     # executable contains experimental input, clipboard and control plumbing,
     # but those broader interaction paths have not been release-validated.
@@ -267,8 +277,11 @@ if(BUILD_TESTING)
     add_test(NAME rfb_server_core_tests COMMAND rfb_server_core_tests)
 endif()
 
-# The window demo and the HIP test render through Wayland + DRM/amdgpu + HIP
-# external memory, which have no Windows equivalent.
+# The window demo renders through Wayland + DRM/amdgpu + HIP external
+# memory, which are Linux-only facilities with no Windows equivalent to port
+# to; the Windows counterpart viewer, rfb_window_win32, is defined above and
+# renders through D3D11/DXGI/GDI instead. See the comment on rfb_window_win32
+# for how the two relate.
 if(UNIX)
     add_executable(rfb_window_demo
         window.cpp
