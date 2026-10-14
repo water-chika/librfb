@@ -1,5 +1,12 @@
 #ifdef _WIN32
 
+// windows.h first enters this translation unit indirectly, via
+// socket_helper.hpp below (through winsock2.h/windows.h), before the direct
+// <windows.h> include further down. OEMRESOURCE must be defined before that
+// first inclusion, or its include guard suppresses the OCR_* resource
+// constants (e.g. OCR_NORMAL) on every later include.
+#define OEMRESOURCE
+
 #include "control_server.hpp"
 #include "trace.hpp"
 #include "viewer_client.hpp"
