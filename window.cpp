@@ -303,10 +303,12 @@ public:
     {
         auto fb_width = parent::get_fb_width();
         auto fb_height = parent::get_fb_height();
-        hipHostMalloc(&upload_ptr, fb_width*fb_height*sizeof(uint32_t));
         upload_size = static_cast<size_t>(fb_width) * fb_height
                 * sizeof(uint32_t);
-        assert(upload_ptr != nullptr);
+        int ret = hipHostMalloc(&upload_ptr, upload_size);
+        if (ret != hipSuccess || upload_ptr == nullptr) {
+            throw std::runtime_error{std::format("hipHostMalloc failed: {}", ret)};
+        }
     }
     void draw() {
         auto fb_width = parent::get_fb_width();
@@ -316,8 +318,13 @@ public:
         auto needed = static_cast<size_t>(fb_width) * fb_height
                 * sizeof(uint32_t);
         if (needed > upload_size) {
-            if (upload_ptr) hipHostFree(upload_ptr);
-            hipHostMalloc(&upload_ptr, needed);
+            if (upload_ptr) (void)hipHostFree(upload_ptr);
+            upload_ptr = nullptr;
+            int ret = hipHostMalloc(&upload_ptr, needed);
+            if (ret != hipSuccess || upload_ptr == nullptr) {
+                upload_size = 0;
+                throw std::runtime_error{std::format("hipHostMalloc failed: {}", ret)};
+            }
             upload_size = needed;
         }
         auto [width,height] = parent::get_surface_resolution();
