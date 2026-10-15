@@ -664,19 +664,29 @@ using draw_app =
 
 using namespace std::literals;
 
-// Default DRM device selection rule: enumerate /dev/dri/cardN nodes in
-// numeric order and pick the first one that is actually usable for KMS
-// display output, i.e. it opens, it answers drmModeGetResources, and it has
-// at least one connected connector with a usable mode. Render-only nodes,
-// nodes we lack permission on, and KMS-capable-but-nothing-plugged-in nodes
-// are all skipped rather than picked blindly as /dev/dri/card0 would be. An
-// explicit --gpu path always takes priority and is never probed here.
+// Default DRM device selection rule.
+//
+// This demo gets its window surface from Wayland (wl_compositor/xdg_wm_base
+// etc.); the DRM fd it opens is used for exactly one thing, amdgpu buffer
+// allocation/export for the dma-buf it hands to the compositor (see
+// add_amdgpu_device/add_drm_fd in drm_helper.hpp and their use in draw_app
+// below). That only works on a node we are authorized to do GEM/accel
+// ioctls on without being DRM master. A /dev/dri/cardN (primary) node
+// requires DRM master or explicit auth - normally held by the Wayland
+// compositor already - so amdgpu_device_initialize on a card node fails
+// with EACCES for an ordinary client, which is exactly the "needs
+// /dev/dri/render" failure this function exists to avoid. A
+// /dev/dri/renderDN node needs no master/auth for GEM/accel, which is what
+// this demo actually needs, so that is what gets probed and picked here:
+// enumerate /dev/dri/renderD* in numeric order, try amdgpu_device_initialize
+// on each, and return the first path that succeeds. An explicit --gpu path
+// always takes priority and is never probed here.
 std::string pick_default_drm_device() {
     std::vector<std::string> candidates;
     if (DIR* dir = opendir("/dev/dri")) {
         while (dirent* entry = readdir(dir)) {
             std::string name = entry->d_name;
-            if (name.rfind("card", 0) == 0) {
+            if (name.rfind("renderD", 0) == 0) {
                 candidates.push_back("/dev/dri/" + name);
             }
         }
@@ -691,40 +701,31 @@ std::string pick_default_drm_device() {
             probe_log += std::format("  {}: open failed: {}\n", path, strerror(errno));
             continue;
         }
-        drmModeRes* resources = drmModeGetResources(fd);
-        if (resources == nullptr) {
-            probe_log += std::format("  {}: no KMS resources (likely a render-only node)\n", path);
+        amdgpu_device_handle handle{};
+        uint32_t major_version{}, minor_version{};
+        int ret = amdgpu_device_initialize(fd, &major_version, &minor_version, &handle);
+        if (ret < 0) {
+            probe_log += std::format(
+                "  {}: amdgpu_device_initialize failed: {}\n", path, strerror(-ret));
             close(fd);
             continue;
         }
-        bool has_connected_display = false;
-        for (int i = 0; i < resources->count_connectors && !has_connected_display; i++) {
-            drmModeConnector* connector = drmModeGetConnector(fd, resources->connectors[i]);
-            if (connector != nullptr) {
-                if (connector->connection == DRM_MODE_CONNECTED && connector->count_modes > 0) {
-                    has_connected_display = true;
-                }
-                drmModeFreeConnector(connector);
-            }
-        }
-        drmModeFreeResources(resources);
+        amdgpu_device_deinitialize(handle);
         close(fd);
-        if (has_connected_display) {
-            return path;
-        }
-        probe_log += std::format("  {}: KMS-capable but no connected display\n", path);
+        return path;
     }
 
     if (candidates.empty()) {
         throw std::runtime_error{
-            "no DRM devices found under /dev/dri; pass --gpu <path> to "
-            "select one explicitly"};
+            "no DRM render nodes (/dev/dri/renderD*) found; pass --gpu "
+            "<path> to select a device explicitly, or check that the "
+            "amdgpu kernel driver is loaded"};
     }
     throw std::runtime_error{std::format(
-        "no usable DRM device with a connected display found among {} "
-        "candidate(s) under /dev/dri:\n{}"
+        "no usable DRM render node found among {} candidate(s) under "
+        "/dev/dri:\n{}"
         "pass --gpu <path> to select one explicitly, or check permissions "
-        "(you may need to be in the 'video'/'render' group)",
+        "(you may need to be in the 'render' group)",
         candidates.size(), probe_log)};
 }
 
@@ -765,9 +766,9 @@ int main(int argc, const char* argv[]) {
                 "--width <width>\n"
                 "--height <height>\n"
                 "--gpu <drm_device_path>  override DRM device probing;\n"
-                "                        default is to probe /dev/dri/card*\n"
-                "                        and pick the first with a connected\n"
-                "                        display\n"
+                "                        default is to probe\n"
+                "                        /dev/dri/renderD* and pick the\n"
+                "                        first that initializes amdgpu\n"
                 "--view-only\n"
                 "--password <password>\n"
                 "--password-file <path>\n"
