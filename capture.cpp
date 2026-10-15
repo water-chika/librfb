@@ -22,6 +22,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <format>
@@ -55,12 +56,13 @@ using add_capture_rfb =
     rfb::add_set_format<
     rfb::add_server_init<
     rfb::add_client_init<
+    rfb::add_server_message_buffer<
     rfb::add_connection<
     rfb::set_port<
     rfb::set_address<
     rfb::set_password_from_configure<
     T
-    >>>>>>>>>>>>>>>>>
+    >>>>>>>>>>>>>>>>>>
 ;
 
 struct config : public cpp_helper::empty_configure {
@@ -72,43 +74,58 @@ struct config : public cpp_helper::empty_configure {
 
 using capture_rfb = add_capture_rfb<empty_configurable_class>;
 
-// Pumps server messages until a framebuffer update has been decoded, so the
-// captured image reflects the current screen rather than a blank buffer.
-//
-// A full-screen update is normally split across several FramebufferUpdate
-// messages, and each one only covers part of the screen, so capturing after the
-// first message yields a mostly empty image. Instead keep reading until the
-// server goes quiet for quiet_ms, which means the screen has been fully sent.
-// poll() is used because the underlying reads block indefinitely, which would
-// otherwise make the timeout unenforceable.
-void wait_for_frame(auto& client, int width, int height, int timeout_ms, int quiet_ms = 400) {
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+struct capture_result {
+    std::size_t updates{};
+    std::size_t rectangles{};
+    std::size_t payload_bytes{};
+    std::chrono::milliseconds elapsed{};
+};
+
+// One retained, non-incremental request is enough: it asks for the complete
+// framebuffer, and the bounded message buffer prevents a partial peer message
+// from turning the deadline into a blocking read. Quiet time after the last
+// complete update accommodates servers that split one request across messages.
+capture_result wait_for_frame(auto& client, int width, int height,
+                              int timeout_ms, int quiet_ms = 400) {
+    using clock = std::chrono::steady_clock;
+    auto started = clock::now();
+    auto deadline = started + std::chrono::milliseconds(timeout_ms);
+    auto last_update = started;
+    capture_result result;
     client.reset_frame_updated();
     client.framebuffer_update_request(0, 0, width, height, false);
 
-    bool got_update = false;
-    while (std::chrono::steady_clock::now() < deadline) {
-        pollfd fd{};
-        fd.fd = client.get_socket();
-        fd.events = POLLIN;
-        int ready = socket_helper::poll_sockets(&fd, 1, quiet_ms);
-        if (ready < 0) {
-            throw std::runtime_error("poll on rfb socket failed");
-        }
-        if (ready == 0) {
-            // Server went quiet: everything it wanted to send has arrived.
-            if (got_update) {
-                return;
+    while (true) {
+        while (client.process_buffered_server_message()) {
+            if (client.is_frame_updated()) {
+                client.reset_frame_updated();
+                ++result.updates;
+                result.rectangles += client.get_last_rectangle_count();
+                result.payload_bytes += client.get_frame_network_byte_count();
+                last_update = clock::now();
             }
-            continue;
         }
-        client.process_server_message();
-        if (client.is_frame_updated()) {
-            got_update = true;
+        auto now = clock::now();
+        if (result.updates && now - last_update >= std::chrono::milliseconds(quiet_ms)) {
+            result.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - started);
+            return result;
         }
-    }
-    if (!got_update) {
-        throw std::runtime_error("timed out waiting for a framebuffer update");
+        if (now >= deadline)
+            throw std::runtime_error{"timed out before the framebuffer response settled"};
+
+        auto remaining = deadline - now;
+        if (result.updates)
+            remaining = std::min(remaining,
+                std::chrono::duration_cast<clock::duration>(
+                    std::chrono::milliseconds(quiet_ms) - (now - last_update)));
+        auto poll_ms = std::max<int>(1, static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count()));
+        pollfd fd{client.get_socket(), POLLIN, 0};
+        int ready = socket_helper::poll_sockets(&fd, 1, poll_ms);
+        if (ready < 0) throw std::runtime_error{"poll on rfb socket failed"};
+        if (ready > 0 && !client.read_available_server_data() &&
+            !client.has_buffered_server_data())
+            throw rfb::connection_closed{"server closed during capture"};
     }
 }
 
@@ -188,10 +205,13 @@ int main(int argc, const char* argv[]) {
             else if (option == "wait") {
                 require_args(i, 1, "--wait");
                 wait_ms = strtol(argv[++i], nullptr, 10);
+                if (wait_ms < 0) throw std::logic_error{"--wait must be non-negative"};
             }
             else if (option == "timeout") {
                 require_args(i, 1, "--timeout");
                 timeout_ms = strtol(argv[++i], nullptr, 10);
+                if (timeout_ms < 400 || timeout_ms > 600000)
+                    throw std::logic_error{"--timeout must be between 400 and 600000 ms"};
             }
             else if (option == "encodings") {
                 require_args(i, 1, "--encodings");
@@ -254,19 +274,17 @@ int main(int argc, const char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
     }
 
-    // The first update a server sends after connecting often covers only part
-    // of the screen, so drain one throwaway cycle before the one that is kept.
-    try {
-        wait_for_frame(client, width, height, timeout_ms);
-    }
-    catch (std::exception& e) {
-        std::cerr << "warning: initial framebuffer sync failed: " << e.what() << std::endl;
-    }
-
-    wait_for_frame(client, width, height, timeout_ms);
+    auto result = wait_for_frame(client, width, height, timeout_ms);
+    width = client.get_width();
+    height = client.get_height();
     auto frame_data = client.get_frame();
     rfb_png::write_png(output.c_str(), frame_data.data(), width, height);
-    std::cerr << "captured: " << output << std::endl;
+    std::cerr << std::format(
+        "captured: {} size={}x{} updates={} rectangles={} payload_bytes={} "
+        "wait_ms={} encoding={}",
+        output, width, height, result.updates, result.rectangles,
+        result.payload_bytes, result.elapsed.count(), client.get_encoding())
+        << std::endl;
   }
   catch (std::exception& e) {
     std::cerr << e.what() << std::endl;

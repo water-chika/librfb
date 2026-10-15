@@ -36,6 +36,16 @@ using cpp_helper::empty_configurable_class;
 
 namespace rfb {
 
+// Shared protocol ceilings apply equally to blocking tools and buffered GUI
+// clients.  The byte limits leave room for an uncompressible 7680x4320 BGRA
+// rectangle while remaining bounded against hostile length fields.
+inline constexpr size_t max_clipboard_bytes = 16 * 1024 * 1024;
+inline constexpr size_t max_encoded_rectangle_bytes = 160 * 1024 * 1024;
+inline constexpr size_t max_framebuffer_bytes = 256 * 1024 * 1024;
+inline constexpr size_t max_buffered_server_bytes = 192 * 1024 * 1024;
+inline constexpr uint16_t max_framebuffer_rectangles = 4096;
+inline constexpr size_t max_server_name_bytes = 1024 * 1024;
+
 // Thrown when the peer closes the connection, as distinct from an I/O error.
 // A clean shutdown is normal (the server exited, the tunnel dropped), so
 // callers generally want to unwind and quit rather than report a failure.
@@ -95,9 +105,12 @@ template<typename T>
 class add_process_framebuffer_update : public T{
 public:
     using parent = T;
-    add_process_framebuffer_update(const configure auto& conf) : parent{conf},
-        internal_frame(parent::get_width()*parent::get_height()*4)
-    {
+    add_process_framebuffer_update(const configure auto& conf) : parent{conf} {
+        auto width = static_cast<size_t>(parent::get_width());
+        auto height = static_cast<size_t>(parent::get_height());
+        if (!width || !height || width > max_framebuffer_bytes / 4 / height)
+            throw std::runtime_error{"framebuffer exceeds resource limit"};
+        internal_frame.resize(width * height * 4);
     }
 private:
     bool scale_ext_supported{false};
@@ -107,7 +120,11 @@ public:
 
     auto process_framebuffer_update(auto& framebuffer_update_head) {
         uint16_t rectangles_count = from_big_endian_bytes(framebuffer_update_head[2], framebuffer_update_head[3]);
+        if (rectangles_count > max_framebuffer_rectangles)
+            throw std::runtime_error{"framebuffer rectangle count exceeds resource limit"};
         //std::cerr << "rectangles count: " << rectangles_count << std::endl;
+        frame_network_byte_count = 0;
+        last_rectangle_count = rectangles_count;
         std::vector<uint8_t> last_update{};
         for (uint16_t i = 0; i < rectangles_count; i++) {
             std::array<uint8_t, 12> rectangle{};
@@ -127,7 +144,6 @@ public:
             uint16_t width = from_big_endian_bytes(rectangle[4], rectangle[5]);
             uint16_t height = from_big_endian_bytes(rectangle[6], rectangle[7]);
             encoding_type = static_cast<encoding>(from_big_endian_bytes(rectangle[8], rectangle[9], rectangle[10], rectangle[11]));
-            frame_network_byte_count = 0;
             if (false) {
                 std::cerr << "x: " << x << std::endl;
                 std::cerr << "y: " << y << std::endl;
@@ -140,7 +156,7 @@ public:
                 // at all is the server advertising support, so the client may
                 // start asking for scale changes from here on.
                 auto frame_bytes = static_cast<size_t>(width) * height * 4;
-                if (!width || !height || frame_bytes > 256 * 1024 * 1024)
+                if (!width || !height || frame_bytes > max_framebuffer_bytes)
                     throw std::runtime_error{"invalid framebuffer dimensions"};
                 scale_ext_supported = true;
                 parent::set_framebuffer_size(width, height);
@@ -188,6 +204,8 @@ public:
                 }
                 auto length = from_big_endian_bytes(length_buf[0], length_buf[1], length_buf[2], length_buf[3]);
                 //std::cerr << "zlib length: " << length << std::endl;
+                if (length > max_encoded_rectangle_bytes)
+                    throw std::runtime_error{"encoded rectangle exceeds resource limit"};
                 auto zlib_data = std::vector<uint8_t>(length);
                 frame_network_byte_count += length;
                 try{
@@ -206,6 +224,8 @@ public:
                 parent::rfb_read(message);
                 auto length = from_big_endian_bytes(message[0], message[1], message[2], message[3]);
                 auto flags = from_big_endian_bytes(message[4], message[5], message[6], message[7]);
+                if (length > max_encoded_rectangle_bytes)
+                    throw std::runtime_error{"encoded rectangle exceeds resource limit"};
                 auto h264_data = std::vector<uint8_t>(length);
                 frame_network_byte_count += length;
                 parent::rfb_read(h264_data);
@@ -218,23 +238,28 @@ public:
         frame_updated = true;
         last_update_time = std::chrono::steady_clock::now();
     }
-    void get_frame(std::span<uint8_t> frame) {
+    void get_frame(std::span<uint8_t> frame) const {
+        if (frame.size() < internal_frame.size())
+            throw std::invalid_argument{"frame destination is too small"};
         std::copy(internal_frame.begin(), internal_frame.end(), frame.begin());
     }
-    auto get_frame() {
+    std::span<const uint8_t> get_frame() const noexcept {
         return internal_frame;
     }
-    bool is_frame_updated() {
+    bool is_frame_updated() const {
         return frame_updated;
     }
     void reset_frame_updated() {
         frame_updated = false;
     }
-    auto get_encoding() {
+    auto get_encoding() const {
         return encoding_type;
     }
-    auto get_frame_network_byte_count() {
+    auto get_frame_network_byte_count() const {
         return frame_network_byte_count;
+    }
+    auto get_last_rectangle_count() const {
+        return last_rectangle_count;
     }
     // How long ago the last FramebufferUpdate finished arriving. This is the
     // one number that tells a stalled stream apart from a static screen: a
@@ -248,8 +273,9 @@ public:
 private:
     std::vector<uint8_t> internal_frame;
     bool frame_updated;
-    encoding encoding_type;
-    uint32_t frame_network_byte_count;
+    encoding encoding_type{};
+    uint32_t frame_network_byte_count{};
+    uint16_t last_rectangle_count{};
     std::chrono::steady_clock::time_point last_update_time{
         std::chrono::steady_clock::now()};
 };
@@ -359,7 +385,17 @@ template<typename T>
 class add_server_message_buffer : public T {
 public:
     using parent = T;
-    add_server_message_buffer(const configure auto& conf) : parent{conf} {}
+    add_server_message_buffer(const configure auto& conf) : parent{conf} {
+        if constexpr (requires(const parent& p) { p.get_width(); p.get_height(); }) {
+            m_fb_width = static_cast<uint16_t>(parent::get_width());
+            m_fb_height = static_cast<uint16_t>(parent::get_height());
+        }
+    }
+
+    void set_buffer_framebuffer_size(uint16_t width, uint16_t height) {
+        m_fb_width = width;
+        m_fb_height = height;
+    }
 
     // Bound each event-loop turn even when a peer continuously keeps the socket
     // readable. The next turn resumes from the buffered bytes.
@@ -376,7 +412,7 @@ public:
                 auto count = socket_helper::read_socket(parent::get_socket(),
                                                          chunk.data(), chunk.size());
                 if (count > 0) {
-                    if (buffered_size() + static_cast<size_t>(count) > max_buffered_bytes)
+                    if (buffered_size() + static_cast<size_t>(count) > max_buffered_server_bytes)
                         throw std::runtime_error{"RFB input exceeds resource limit"};
                     m_input.insert(m_input.end(), chunk.begin(), chunk.begin() + count);
                     continue;
@@ -443,7 +479,7 @@ public:
     }
 
     void append_server_data(std::span<const uint8_t> bytes) {
-        if (buffered_size() + bytes.size() > max_buffered_bytes)
+        if (buffered_size() + bytes.size() > max_buffered_server_bytes)
             throw std::runtime_error{"RFB input exceeds resource limit"};
         m_input.insert(m_input.end(), bytes.begin(), bytes.end());
         m_cached_message_size.reset();
@@ -451,11 +487,6 @@ public:
 
 private:
     static constexpr size_t max_reads_per_poll = 4;
-    static constexpr size_t max_buffered_bytes = 64 * 1024 * 1024;
-    static constexpr size_t max_clipboard_bytes = 16 * 1024 * 1024;
-    static constexpr size_t max_encoded_rectangle_bytes = 32 * 1024 * 1024;
-    static constexpr size_t max_framebuffer_bytes = 256 * 1024 * 1024;
-    static constexpr uint16_t max_rectangles = 4096;
 
     size_t buffered_size() const { return m_input.size() - m_consumed; }
     uint8_t byte_at(size_t offset) const { return m_input[m_consumed + offset]; }
@@ -483,7 +514,7 @@ private:
         if (m_consumed == m_input.size()) {
             m_input.clear();
             m_consumed = 0;
-            if (m_input.capacity() > max_buffered_bytes / 4) {
+            if (m_input.capacity() > max_buffered_server_bytes / 4) {
                 std::vector<uint8_t>{}.swap(m_input);
             }
         }
@@ -521,11 +552,11 @@ private:
     std::optional<size_t> framebuffer_update_size() {
         if (buffered_size() < 4) return {};
         auto rectangles = from_big_endian_bytes(byte_at(2), byte_at(3));
-        if (rectangles > max_rectangles)
+        if (rectangles > max_framebuffer_rectangles)
             throw std::runtime_error{"framebuffer rectangle count exceeds resource limit"};
         size_t offset = 4;
-        auto fb_width = static_cast<uint16_t>(parent::get_width());
-        auto fb_height = static_cast<uint16_t>(parent::get_height());
+        auto fb_width = m_fb_width;
+        auto fb_height = m_fb_height;
         for (uint16_t i = 0; i < rectangles; ++i) {
             if (buffered_size() < checked_add(offset, 12)) return {};
             auto x = from_big_endian_bytes(byte_at(offset), byte_at(offset + 1));
@@ -564,7 +595,7 @@ private:
                 }
             }
             offset = checked_add(offset, payload);
-            if (offset > max_buffered_bytes)
+            if (offset > max_buffered_server_bytes)
                 throw std::runtime_error{"RFB server message exceeds resource limit"};
             if (buffered_size() < offset) return {};
         }
@@ -577,6 +608,7 @@ private:
     std::optional<size_t> m_message_size;
     size_t m_message_offset{};
     bool m_closed{};
+    uint16_t m_fb_width{}, m_fb_height{};
 };
 
 struct pixel_format {
@@ -642,6 +674,8 @@ public:
         server_pixel_format.padding2 = server_init_buf[19];
 
         name_length = from_big_endian_bytes(server_init_buf[20], server_init_buf[21], server_init_buf[22], server_init_buf[23]);
+        if (name_length > max_server_name_bytes)
+            throw std::runtime_error{"server name exceeds resource limit"};
         std::cerr << "name length: " << name_length << std::endl;
         name.resize(name_length);
         try{
@@ -1058,8 +1092,10 @@ public:
     add_client_cut_text(const configure auto& conf) : parent{conf} {
     }
 
-    void client_cut_text(auto& str) {
-        uint32_t length = str.size();
+    void client_cut_text(const auto& str) {
+        if (str.size() > max_clipboard_bytes)
+            throw std::runtime_error{"clipboard payload exceeds resource limit"};
+        uint32_t length = static_cast<uint32_t>(str.size());
         std::array<uint8_t, 8> client_cut_text = {
             6, 0, 0, 0,
             to_big_endian_byte(length, 0), to_big_endian_byte(length, 1),
@@ -1085,13 +1121,17 @@ public:
     init_rfb(const configure auto& conf) : parent{conf} {
         parent::client_init();
         server_info = parent::server_init();
+        if constexpr (requires { parent::set_buffer_framebuffer_size(
+                                    server_info.fb_width, server_info.fb_height); })
+            parent::set_buffer_framebuffer_size(server_info.fb_width,
+                                                server_info.fb_height);
         parent::set_format();
         parent::set_encodings();
     }
-    auto get_width() {
+    auto get_width() const {
         return server_info.fb_width;
     }
-    auto get_height() {
+    auto get_height() const {
         return server_info.fb_height;
     }
     // The served size changes when the peer rescales, which is the whole
@@ -1099,6 +1139,8 @@ public:
     void set_framebuffer_size(uint16_t width, uint16_t height) {
         server_info.fb_width = width;
         server_info.fb_height = height;
+        if constexpr (requires { parent::set_buffer_framebuffer_size(width, height); })
+            parent::set_buffer_framebuffer_size(width, height);
     }
 private:
     server_init_message server_info;
@@ -1151,6 +1193,8 @@ public:
         }
 
         uint32_t length = from_big_endian_bytes(length_buf[0], length_buf[1], length_buf[2], length_buf[3]);
+        if (length > max_clipboard_bytes)
+            throw std::runtime_error{"clipboard payload exceeds resource limit"};
 
         std::vector<char> text(length);
         try{

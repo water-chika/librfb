@@ -3,6 +3,8 @@
 #include <array>
 #include <cassert>
 #include <span>
+#include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -14,8 +16,8 @@ public:
     no_socket(const cpp_helper::configure auto& conf)
         : cpp_helper::empty_configurable_class{conf} {}
     socket_helper::socket_t get_socket() { return socket_helper::invalid_socket; }
-    int get_width() const { return 1920; }
-    int get_height() const { return 1080; }
+    int get_width() const { return 7680; }
+    int get_height() const { return 4320; }
     void rfb_read(auto&) { assert(false && "buffered reads must not reach socket"); }
 };
 
@@ -92,10 +94,63 @@ void complete_messages_are_separated() {
     assert(input.has_complete_server_message());
 }
 
+bool rejects(buffer& input, const std::vector<uint8_t>& message) {
+    try {
+        input.append_server_data(message);
+        input.has_complete_server_message();
+    } catch (const std::runtime_error&) {
+        return true;
+    }
+    return false;
+}
+
+void eight_k_edges_and_limits() {
+    static_assert(static_cast<std::size_t>(7680) * 4320 * 4 <=
+                  rfb::max_encoded_rectangle_bytes);
+    static_assert(static_cast<std::size_t>(7680) * 4320 * 4 <=
+                  rfb::max_framebuffer_bytes);
+    buffer valid{test_config{}};
+    // One encoded pixel at the bottom-right edge of 7680x4320 is valid.
+    std::vector<uint8_t> edge{
+        0, 0, 0, 1,
+        0x1d, 0xff, 0x10, 0xdf, 0, 1, 0, 1,
+        0, 0, 0, 16,
+        0, 0, 0, 1, 0,
+    };
+    valid.append_server_data(edge);
+    assert(valid.has_complete_server_message());
+
+    buffer x_overflow{test_config{}};
+    auto bad_x = edge;
+    bad_x[4] = 0x1e; bad_x[5] = 0;
+    assert(rejects(x_overflow, bad_x));
+
+    buffer y_overflow{test_config{}};
+    auto bad_y = edge;
+    bad_y[6] = 0x10; bad_y[7] = 0xe0;
+    assert(rejects(y_overflow, bad_y));
+
+    buffer too_many{test_config{}};
+    std::vector<uint8_t> count{0, 0, 0x10, 0x01};
+    assert(rejects(too_many, count));
+
+    buffer too_large{test_config{}};
+    auto length = static_cast<uint32_t>(rfb::max_encoded_rectangle_bytes + 1);
+    std::vector<uint8_t> encoded{
+        0, 0, 0, 1,
+        0, 0, 0, 0, 0, 1, 0, 1,
+        0, 0, 0, 16,
+        rfb::to_big_endian_byte(length, 0), rfb::to_big_endian_byte(length, 1),
+        rfb::to_big_endian_byte(length, 2), rfb::to_big_endian_byte(length, 3),
+    };
+    assert(rejects(too_large, encoded));
+}
+
 } // namespace
 
 int main() {
     fragmented_raw_update();
     fragmented_variable_messages();
     complete_messages_are_separated();
+    eight_k_edges_and_limits();
 }

@@ -367,7 +367,21 @@ build\librfb\Release\rfb_window_win32.exe 127.0.0.1 5900 h264,zrle,raw ^
 ```
 
 The control port is disabled by default and binds only to `127.0.0.1` when
-enabled. D3D11, DXGI, User32 and GDI32 come from the Windows SDK; vcpkg supplies
+enabled. For multi-step automation, keep one viewer alive and drive its control
+port instead of reconnecting `rfb_capture`/`rfb_input` for every operation.
+Control coordinates are full RFB framebuffer coordinates; negative and
+out-of-frame pointer commands are rejected. `clipboard-set <base64>` and
+`clipboard-read` provide binary-safe clipboard transport. Use `--password-file`
+for authenticated RFB servers and never expose the unauthenticated control port
+on a non-loopback interface. This persistent path needs no TigerVNC, Xvfb, X11,
+or libX11 layer.
+
+`rfb_capture` requests one retained full framebuffer and defaults to a 60-second
+deadline suitable for large desktops; override it with `--timeout <ms>`. PNGs
+are written to a same-directory temporary file and atomically published, so a
+failed capture cannot masquerade as a fresh result.
+
+D3D11, DXGI, User32 and GDI32 come from the Windows SDK; vcpkg supplies
 zlib, OpenSSL and FFmpeg. Visual Studio 2022 with current C++20 library support
 is required.
 

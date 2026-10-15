@@ -4,6 +4,7 @@
 
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,11 +28,12 @@ public:
         if (!m_has_server_cut_text) {
             return false;
         }
-        text = std::move(m_server_cut_text);
-        m_server_cut_text.clear();
+        text = m_server_cut_text;
         m_has_server_cut_text = false;
         return true;
     }
+
+    std::string_view server_cut_text() const { return m_server_cut_text; }
 
 private:
     std::string m_server_cut_text;
@@ -70,9 +72,10 @@ public:
     viewer_client(const configure auto& conf)
         : parent{conf}, m_view_only{conf.view_only} {}
 
-    void get_rfb(std::span<std::uint8_t> frame) { parent::get_frame(frame); }
-    int get_fb_width() { return parent::get_width(); }
-    int get_fb_height() { return parent::get_height(); }
+    void get_rfb(std::span<std::uint8_t> frame) const { parent::get_frame(frame); }
+    int get_fb_width() const { return parent::get_width(); }
+    int get_fb_height() const { return parent::get_height(); }
+    std::string_view server_cut_text() const { return parent::server_cut_text(); }
 
     void send_key_event(int key, int state) {
         if (m_view_only) return;
@@ -81,6 +84,8 @@ public:
     }
     void send_pointer_event(std::uint32_t mask, int x, int y) {
         if (m_view_only) return;
+        if (x < 0 || y < 0 || x >= get_fb_width() || y >= get_fb_height())
+            throw std::out_of_range{"pointer coordinates out of bounds"};
         send_pointer_event_unchecked(mask, x, y);
         m_pointer_mask = mask;
         m_pointer_x = x;

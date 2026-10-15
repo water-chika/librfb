@@ -26,6 +26,8 @@ struct fake_session {
     std::uint32_t pointer_mask{};
     int key{}, key_state{};
     std::string record_dir;
+    std::string sent_clipboard;
+    std::string received_clipboard{"remote text"};
     int get_fb_width() const { return width; }
     int get_fb_height() const { return height; }
     void get_rfb(std::span<std::uint8_t>) {}
@@ -33,6 +35,8 @@ struct fake_session {
         pointer_mask = mask; pointer_x = x; pointer_y = y;
     }
     void send_key_event(int value, int state) { key = value; key_state = state; }
+    void send_cut_text(std::string_view text) { sent_clipboard = text; }
+    std::string_view server_cut_text() const { return received_clipboard; }
     std::string record_start(const std::string& dir, int) { record_dir = dir; return "ok trace"; }
     std::string record_stop() { return "ok trace"; }
     std::string record_mark(const std::string&) { return "ok"; }
@@ -62,11 +66,25 @@ int main() {
     CHECK(run_command(session, "host", 5900, "size") == "ok 800 600");
     CHECK(run_command(session, "host", 5900, "pointer 12 34 2") == "ok");
     CHECK(session.pointer_x == 12 && session.pointer_y == 34 && session.pointer_mask == 2);
+    CHECK(run_command(session, "host", 5900, "pointer 799 599 0") == "ok");
+    CHECK(run_command(session, "host", 5900, "pointer -1 0 0") ==
+          "error pointer coordinates out of bounds");
+    CHECK(run_command(session, "host", 5900, "pointer 800 0 0") ==
+          "error pointer coordinates out of bounds");
+    CHECK(run_command(session, "host", 5900, "click 0 600 0") ==
+          "error click coordinates out of bounds");
     CHECK(run_command(session, "host", 5900, "key 65293 1") == "ok");
     CHECK(session.key == 65293 && session.key_state == 1);
     CHECK(run_command(session, "host", 5900, "pointer bad 2 1") == "error pointer needs x y buttons");
     CHECK(run_command(session, "host", 5900, "pointer 1 2 256") == "error pointer needs x y buttons");
     CHECK(run_command(session, "host", 5900, "key 65 3") == "error key needs keysym state");
+    CHECK(run_command(session, "host", 5900, "clipboard-set aGVsbG8A") == "ok");
+    CHECK(session.sent_clipboard.size() == 6);
+    CHECK((session.sent_clipboard == std::string_view{"hello\0", 6}));
+    CHECK(run_command(session, "host", 5900, "clipboard-read") ==
+          "ok cmVtb3RlIHRleHQ=");
+    CHECK(run_command(session, "host", 5900, "clipboard-set bad!") ==
+          "error clipboard-set needs valid bounded base64");
     CHECK(run_command(session, "host", 5900,
         "record start \"C:\\\\Program Files\\\\rfb trace\" 50") == "ok trace");
     CHECK(session.record_dir == "C:\\Program Files\\rfb trace");

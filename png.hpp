@@ -9,17 +9,23 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace rfb_png {
 
 // Encodes the decoded BGRA framebuffer to a PNG file using libavcodec's PNG
 // encoder, so no extra image library is needed.
-inline void write_png(const char* path, const uint8_t* bgra, int width, int height) {
+inline void write_png_direct(const char* path, const uint8_t* bgra, int width, int height) {
     const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
     if (!codec) {
         throw std::runtime_error("png encoder not found in this ffmpeg build");
@@ -87,6 +93,33 @@ inline void write_png(const char* path, const uint8_t* bgra, int width, int heig
         throw;
     }
     cleanup();
+}
+
+// Write beside the destination and publish only a complete, closed PNG. Rename
+// is atomic on the supported filesystems; Windows requires removing an existing
+// destination first, but a failed encode still always preserves it.
+inline void write_png(const char* path, const uint8_t* bgra, int width, int height) {
+    namespace fs = std::filesystem;
+    fs::path destination{path};
+    auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    fs::path temporary = destination;
+    temporary += std::format(".tmp.{}", stamp);
+    try {
+        write_png_direct(temporary.string().c_str(), bgra, width, height);
+#ifdef _WIN32
+        if (!::MoveFileExW(temporary.c_str(), destination.c_str(),
+                           MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            throw std::runtime_error{std::format(
+                "could not replace output file: {} ({})", path, GetLastError())};
+#else
+        fs::rename(temporary, destination);
+#endif
+    }
+    catch (...) {
+        std::error_code ignored;
+        fs::remove(temporary, ignored);
+        throw;
+    }
 }
 
 } // namespace rfb_png
