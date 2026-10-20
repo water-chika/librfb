@@ -245,19 +245,48 @@ private:
     int button_mask;
 };
 
+enum class presentation_mode {
+    legacy,
+    release_gated,
+};
+
 template<typename T>
 class add_presentation_copy : public T {
 public:
     using parent = T;
 
-    add_presentation_copy(const configure auto& conf) : parent{conf} {
+    add_presentation_copy(const configure auto& conf) : parent{conf},
+        mode{conf.presentation}
+    {
+        select_hip_device();
         ensure_upload();
-        create_generation();
+        if (mode == presentation_mode::release_gated &&
+                parent::has_linux_drm_syncobj_manager() &&
+                drm_helper::supports_timeline_syncobj(parent::get_drm_fd())) {
+            sync_surface = wp_linux_drm_syncobj_manager_v1_get_surface(
+                    parent::get_linux_drm_syncobj_manager(),
+                    parent::get_wayland_surface());
+            explicit_sync = sync_surface != nullptr;
+        }
+        std::clog << "presentation: "
+                  << (mode == presentation_mode::legacy ? "legacy" : "release-gated")
+                  << ", synchronization: "
+                  << (explicit_sync ? "linux-drm-syncobj-v1" : "implicit")
+                  << std::endl;
+        if (mode == presentation_mode::legacy) {
+            create_legacy_buffer();
+        } else {
+            create_generation();
+        }
     }
 
     ~add_presentation_copy() {
         shutting_down = true;
+        legacy_slot.reset();
         slots.clear();
+        if (sync_surface != nullptr) {
+            wp_linux_drm_syncobj_surface_v1_destroy(sync_surface);
+        }
         if (upload_ptr != nullptr) {
             (void)hipHostFree(upload_ptr);
         }
@@ -269,12 +298,46 @@ public:
     }
 
     void recreate_surface() {
-        create_generation();
         presentation_pending = true;
+        if (mode == presentation_mode::legacy) {
+            create_legacy_buffer();
+            present_latest();
+            return;
+        }
+        auto retired_busy = std::ranges::count_if(slots, [](const auto& slot) {
+            return slot->retired && slot->busy;
+        });
+        if (retired_busy >= slot_count) {
+            resize_deferred = true;
+            return;
+        }
+        create_generation();
         present_latest();
     }
 
 private:
+    void select_hip_device() {
+        drmDevicePtr device = nullptr;
+        if (drmGetDevice2(parent::get_drm_fd(), 0, &device) != 0 ||
+                device == nullptr || !(device->bustype == DRM_BUS_PCI) ||
+                device->businfo.pci == nullptr) {
+            if (device != nullptr) drmFreeDevice(&device);
+            throw std::runtime_error{"cannot map selected DRM device to HIP PCI device"};
+        }
+        auto* pci = device->businfo.pci;
+        std::string bus_id = std::format("{:04x}:{:02x}:{:02x}.{}",
+                pci->domain, pci->bus, pci->dev, pci->func);
+        drmFreeDevice(&device);
+        int hip_device = -1;
+        int ret = hipDeviceGetByPCIBusId(&hip_device, bus_id.c_str());
+        if (ret != hipSuccess || hipSetDevice(hip_device) != hipSuccess) {
+            throw std::runtime_error{std::format(
+                    "HIP cannot select presentation GPU {}", bus_id)};
+        }
+        std::clog << "HIP device: " << hip_device << " (" << bus_id << ")"
+                  << std::endl;
+    }
+
     struct presentation_slot {
         add_presentation_copy* owner{};
         uint64_t generation{};
@@ -286,10 +349,17 @@ private:
         hipExternalMemory_t external_memory{};
         void* mapped{};
         wl_buffer* buffer{};
+        std::optional<drm_helper::syncobj_timeline> timeline;
+        wp_linux_drm_syncobj_timeline_v1* wayland_timeline{};
+        uint64_t next_point{1};
+        uint64_t release_point{};
         bool busy{};
         bool retired{};
 
         ~presentation_slot() {
+            if (wayland_timeline != nullptr) {
+                wp_linux_drm_syncobj_timeline_v1_destroy(wayland_timeline);
+            }
             if (buffer != nullptr) {
                 wl_buffer_destroy(buffer);
             }
@@ -325,7 +395,8 @@ private:
     };
 
     std::unique_ptr<presentation_slot> create_slot(uint64_t generation,
-            uint32_t width, uint32_t height) {
+            uint32_t width, uint32_t height, bool listen_for_release = true,
+            bool legacy_stride = false) {
         auto slot = std::make_unique<presentation_slot>();
         slot->owner = this;
         slot->generation = generation;
@@ -381,8 +452,12 @@ private:
         }
 
         auto* params = zwp_linux_dmabuf_v1_create_params(parent::get_dmabuf());
+        if (params == nullptr) {
+            close(wayland_fd);
+            throw std::runtime_error{"zwp_linux_dmabuf_v1_create_params failed"};
+        }
         zwp_linux_buffer_params_v1_add(params, wayland_fd, 0, 0,
-                slot->stride, 0, 0);
+                legacy_stride ? width : slot->stride, 0, 0);
         slot->buffer = zwp_linux_buffer_params_v1_create_immed(params,
                 width, height, DRM_FORMAT_XRGB8888, 0);
         zwp_linux_buffer_params_v1_destroy(params);
@@ -390,19 +465,62 @@ private:
         if (slot->buffer == nullptr) {
             throw std::runtime_error{"zwp_linux_buffer_params_v1_create_immed failed"};
         }
-        if (wl_buffer_add_listener(slot->buffer, &buffer_listener, slot.get()) < 0) {
+        if (explicit_sync && listen_for_release) {
+            slot->timeline.emplace(parent::get_drm_fd());
+            int timeline_fd = slot->timeline->export_fd();
+            slot->wayland_timeline =
+                wp_linux_drm_syncobj_manager_v1_import_timeline(
+                    parent::get_linux_drm_syncobj_manager(), timeline_fd);
+            close(timeline_fd);
+            if (slot->wayland_timeline == nullptr) {
+                throw std::runtime_error{"syncobj timeline import failed"};
+            }
+        } else if (listen_for_release &&
+                wl_buffer_add_listener(slot->buffer, &buffer_listener, slot.get()) < 0) {
             throw std::runtime_error{"wl_buffer_add_listener failed"};
         }
         return slot;
     }
 
-    void create_generation() {
+    std::optional<std::pair<uint32_t, uint32_t>> validated_surface_size() {
         auto [width_value, height_value] = parent::get_surface_resolution();
         if (width_value <= 0 || height_value <= 0) {
-            return;
+            return std::nullopt;
         }
         auto width = static_cast<uint32_t>(width_value);
         auto height = static_cast<uint32_t>(height_value);
+        constexpr size_t pixel_size = sizeof(uint32_t);
+        if (width > UINT32_MAX / pixel_size ||
+                width > rfb::max_framebuffer_bytes / pixel_size / height) {
+            std::cerr << std::format(
+                    "presentation size {}x{} exceeds the {} byte limit\n",
+                    width, height, rfb::max_framebuffer_bytes);
+            return std::nullopt;
+        }
+        return std::pair{width, height};
+    }
+
+    void create_legacy_buffer() {
+        auto size = validated_surface_size();
+        if (!size) {
+            return;
+        }
+        auto [width, height] = *size;
+        auto replacement = create_slot(0, width, height, false, true);
+        slots.clear();
+        legacy_slot = std::move(replacement);
+        auto* surface = parent::get_wayland_surface();
+        wl_surface_attach(surface, legacy_slot->buffer, 0, 0);
+        wl_surface_commit(surface);
+        wl_display_flush(parent::get_display());
+    }
+
+    void create_generation() {
+        auto size = validated_surface_size();
+        if (!size) {
+            return;
+        }
+        auto [width, height] = *size;
         uint64_t new_generation = generation + 1;
         std::vector<std::unique_ptr<presentation_slot>> created;
         created.reserve(slot_count);
@@ -440,7 +558,30 @@ private:
         upload_size = needed;
     }
 
+    void poll_explicit_releases() {
+        if (!explicit_sync) {
+            return;
+        }
+        for (auto& slot : slots) {
+            if (slot->busy && slot->release_point != 0 &&
+                    slot->timeline->reached(slot->release_point)) {
+                slot->busy = false;
+                slot->release_point = 0;
+            }
+        }
+        std::erase_if(slots, [](const auto& slot) {
+            return slot->retired && !slot->busy;
+        });
+        if (resize_deferred && std::ranges::none_of(slots, [](const auto& slot) {
+                return slot->retired && slot->busy;
+            })) {
+            resize_deferred = false;
+            create_generation();
+        }
+    }
+
     presentation_slot* free_current_slot() {
+        poll_explicit_releases();
         for (auto& slot : slots) {
             if (!slot->retired && slot->generation == generation && !slot->busy) {
                 return slot.get();
@@ -453,7 +594,12 @@ private:
         if (shutting_down || !presentation_pending) {
             return;
         }
-        auto* slot = free_current_slot();
+        presentation_slot* slot = nullptr;
+        if (mode == presentation_mode::legacy) {
+            slot = legacy_slot.get();
+        } else {
+            slot = free_current_slot();
+        }
         if (slot == nullptr) {
             return;
         }
@@ -473,8 +619,22 @@ private:
         }
 
         auto* surface = parent::get_wayland_surface();
-        slot->busy = true;
-        wl_surface_attach(surface, slot->buffer, 0, 0);
+        if (mode == presentation_mode::release_gated) {
+            slot->busy = true;
+            if (explicit_sync) {
+                uint64_t acquire_point = slot->next_point++;
+                slot->release_point = slot->next_point++;
+                slot->timeline->signal(acquire_point);
+                wp_linux_drm_syncobj_surface_v1_set_acquire_point(
+                        sync_surface, slot->wayland_timeline,
+                        acquire_point >> 32, acquire_point & UINT32_MAX);
+                wp_linux_drm_syncobj_surface_v1_set_release_point(
+                        sync_surface, slot->wayland_timeline,
+                        slot->release_point >> 32,
+                        slot->release_point & UINT32_MAX);
+            }
+            wl_surface_attach(surface, slot->buffer, 0, 0);
+        }
         wl_surface_damage(surface, 0, 0, slot->width, slot->height);
         wl_surface_commit(surface);
         wl_display_flush(parent::get_display());
@@ -487,6 +647,15 @@ private:
             std::erase_if(slots, [released](const auto& slot) {
                 return slot.get() == released;
             });
+        }
+        if (resize_deferred) {
+            auto retired_busy = std::ranges::count_if(slots, [](const auto& slot) {
+                return slot->retired && slot->busy;
+            });
+            if (retired_busy < slot_count) {
+                resize_deferred = false;
+                create_generation();
+            }
         }
         present_latest();
     }
@@ -507,11 +676,16 @@ private:
     }
 
     static constexpr size_t slot_count = 3;
+    presentation_mode mode;
+    bool explicit_sync{};
+    wp_linux_drm_syncobj_surface_v1* sync_surface{};
+    std::unique_ptr<presentation_slot> legacy_slot;
     std::vector<std::unique_ptr<presentation_slot>> slots;
     uint32_t* upload_ptr{};
     size_t upload_size{};
     uint64_t generation{};
     bool presentation_pending{};
+    bool resize_deferred{};
     bool shutting_down{};
 };
 template<class T>
@@ -928,6 +1102,7 @@ struct config : public empty_configure {
     bool view_only;
     std::string password;
     uint16_t control_port;
+    presentation_mode presentation;
 };
 
 int main(int argc, const char* argv[]) {
@@ -950,6 +1125,11 @@ int main(int argc, const char* argv[]) {
                 "--control-port <port>   accept line-oriented control\n"
                 "                        commands on 127.0.0.1:<port>\n"
                 "                        (off unless given)\n"
+                "--presentation-mode <legacy|release-gated>\n"
+                "  legacy               repeatedly update one attached buffer\n"
+                "                        (default; fullscreen compatibility)\n"
+                "  release-gated        rotate three buffers and reuse only\n"
+                "                        after wl_buffer.release\n"
                 ;
     if (argc < 3) {
         throw std::logic_error(
@@ -965,6 +1145,13 @@ int main(int argc, const char* argv[]) {
     bool view_only = false;
     std::string password{};
     uint16_t control_port = 0;
+    auto presentation = presentation_mode::legacy;
+    auto require_value = [&](int i, std::string_view option) -> const char* {
+        if (i + 1 >= argc) {
+            throw std::logic_error{std::format("{} requires a value", option)};
+        }
+        return argv[i + 1];
+    };
     for (int i = 1, pos_arg=0; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] == '-') {
             if (strcmp(&argv[i][2], "log") == 0) {
@@ -996,6 +1183,18 @@ int main(int argc, const char* argv[]) {
             }
             else if (strcmp(&argv[i][2], "password-file") == 0) {
                 password = read_password_file(argv[i+1]);
+                i += 1;
+            }
+            else if (strcmp(&argv[i][2], "presentation-mode") == 0) {
+                std::string_view value = require_value(i, "--presentation-mode");
+                if (value == "legacy") {
+                    presentation = presentation_mode::legacy;
+                } else if (value == "release-gated") {
+                    presentation = presentation_mode::release_gated;
+                } else {
+                    throw std::logic_error{std::format(
+                            "unknown presentation mode: {}", value)};
+                }
                 i += 1;
             }
             else {
@@ -1038,19 +1237,17 @@ int main(int argc, const char* argv[]) {
     // then never sends a scale request, so nothing is wedged either way.
     encodings.emplace_back(rfb::to_big_endian(
             static_cast<uint32_t>(rfb::encoding::scale_ext)));
-    // An explicit --gpu path always wins; otherwise probe for the default.
-    std::string resolved_drm_device_path =
-        (drm_device_path[0] != '\0') ? drm_device_path : pick_default_drm_device();
     auto conf = config{
         .address=address, .port=port,
         .supported_encodings = std::move(encodings),
         .enabled_logs = enabled_logs,
         .width = width,
         .height = height,
-        .drm_device_path = resolved_drm_device_path.c_str(),
+        .drm_device_path = drm_device_path,
         .view_only = view_only,
         .password = std::move(password),
         .control_port = control_port,
+        .presentation = presentation,
     };
     auto app = draw_app{conf};
   } catch (rfb::connection_closed &e) {

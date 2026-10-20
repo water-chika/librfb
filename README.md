@@ -48,8 +48,37 @@ using draw_app = add_event_loop<app_input>;
 ```
 
 For stateful resources with coupled lifetimes, prefer one cohesive policy layer
-(such as the release-gated presentation buffer pool) over scattering one
-resource across many tiny inheritance layers.
+(such as the multi-mode presentation policy) over scattering one resource
+across many tiny inheritance layers.
+
+## rfb_window_demo presentation modes
+
+The Wayland viewer supports two GPU DMA-BUF presentation methods:
+
+```text
+--presentation-mode legacy|release-gated
+```
+
+`legacy` is the default for fullscreen compatibility. It creates one BO, attaches
+its `wl_buffer` once, and repeatedly copies into and commits that same storage.
+It also preserves the original viewer's nonstandard DMA-BUF stride metadata for
+exact compatibility. This mode may rewrite a buffer while the compositor still
+owns it and therefore does not follow the normal Wayland buffer ownership
+contract; use it only where reproducing the historical scanout behavior matters.
+
+`release-gated` rotates three BOs. Each frame is copied into a free BO, attached,
+and committed; a BO is reused only after `wl_buffer.release`. Frames coalesce to
+the latest decoded image while all three slots are busy, and old resize
+generations remain alive until release. This is the protocol-correct mode, but
+on the current AMD/Sway setup its physical fullscreen scanout can be white even
+though composited capture is correct.
+
+Examples:
+
+```bash
+rfb_window_demo 127.0.0.1 5900 zrle,raw --presentation-mode legacy
+rfb_window_demo 127.0.0.1 5900 zrle,raw --presentation-mode release-gated
+```
 
 ## rfb_server
 
