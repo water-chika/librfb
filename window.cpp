@@ -506,7 +506,7 @@ private:
             return;
         }
         auto [width, height] = *size;
-        auto replacement = create_slot(0, width, height, false, true);
+        auto replacement = create_slot(0, width, height, false);
         slots.clear();
         legacy_slot = std::move(replacement);
         auto* surface = parent::get_wayland_surface();
@@ -1145,7 +1145,7 @@ int main(int argc, const char* argv[]) {
     bool view_only = false;
     std::string password{};
     uint16_t control_port = 0;
-    auto presentation = presentation_mode::legacy;
+    auto presentation = presentation_mode::release_gated;
     auto require_value = [&](int i, std::string_view option) -> const char* {
         if (i + 1 >= argc) {
             throw std::logic_error{std::format("{} requires a value", option)};

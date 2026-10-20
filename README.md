@@ -59,12 +59,11 @@ The Wayland viewer supports two GPU DMA-BUF presentation methods:
 --presentation-mode legacy|release-gated
 ```
 
-`legacy` is the default for fullscreen compatibility. It creates one BO, attaches
-its `wl_buffer` once, and repeatedly copies into and commits that same storage.
-It also preserves the original viewer's nonstandard DMA-BUF stride metadata for
-exact compatibility. This mode may rewrite a buffer while the compositor still
-owns it and therefore does not follow the normal Wayland buffer ownership
-contract; use it only where reproducing the historical scanout behavior matters.
+`legacy` creates one BO, attaches its `wl_buffer` once, and repeatedly copies
+into and commits that same storage. It uses the correct XRGB8888 byte stride,
+but may rewrite a buffer while the compositor still owns it and therefore does
+not follow the normal Wayland buffer ownership contract; use it only for
+compatibility experiments.
 
 `release-gated` rotates three BOs. Each frame is copied into a free BO, attached,
 and committed; a BO is reused only after `wl_buffer.release`. Frames coalesce to
