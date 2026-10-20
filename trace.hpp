@@ -19,8 +19,9 @@
 // the screen as it stood after the previous input had time to take effect,
 // so a trace naturally reads as (input, resulting screen, next input).
 //
-// This is a policy mixin in the codebase's existing style. It must be
-// composed BELOW the input layers (add_rfb_process_keysym /
+// This is a linear policy mixin in the codebase's existing style (not CRTP):
+// it inherits from its parent policy in a compile-time decorator stack. It must
+// be composed BELOW the input layers (add_rfb_process_keysym /
 // add_rfb_process_pointer) and directly above add_rfb, because those layers
 // call downwards into their parent: sitting here is what lets it see every
 // key and pointer event, whether it came from the window or from the control

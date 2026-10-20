@@ -11,9 +11,10 @@
 // grabbing frames in a loop. Reusing one live viewer session pays the startup
 // cost once and ships only incremental updates afterwards.
 //
-// This is written as a policy mixin, in the same style as the rest of the
-// codebase, so it is not tied to rfb_window_demo: any tool whose stack
-// provides the operations listed below can compose it.
+// This is a linear policy mixin, in the same style as the rest of the
+// codebase (not CRTP): it inherits from its parent policy and contributes to
+// the compile-time decorator stack. It is not tied to rfb_window_demo: any
+// tool whose stack provides the operations listed below can compose it.
 //
 // Required from the parent stack:
 //   FDS_SIZE, get_fds(), process_events(fds)   - the posix poll-loop protocol

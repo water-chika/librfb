@@ -22,6 +22,8 @@
 #include <cerrno>
 #include <cstring>
 #include <algorithm>
+#include <cstdint>
+#include <vector>
 
 using cpp_helper::empty_class;
 using cpp_helper::configure;
@@ -244,112 +246,252 @@ private:
 };
 
 template<typename T>
-class set_bo_alloc_size : public T {
+class add_presentation_copy : public T {
 public:
     using parent = T;
-    set_bo_alloc_size(const configure auto& conf) : parent{conf}
-    {}
-    auto get_bo_alloc_size() {
-        auto [width,height] = parent::get_surface_resolution();
-        return width*height*sizeof(uint32_t);
-    }
-    auto get_dma_buf_size() {
-        return get_bo_alloc_size();
-    }
-};
 
-template<typename T>
-class attach_dma_buf_fd_to_surface : public T {
-public:
-    using parent = T;
-    attach_dma_buf_fd_to_surface(const configure auto& conf) : parent{conf}
-    {
-        create();
-    }
-    ~attach_dma_buf_fd_to_surface() {
-        destroy();
+    add_presentation_copy(const configure auto& conf) : parent{conf} {
+        ensure_upload();
+        create_generation();
     }
 
-    void create() {
-        auto [width,height] = parent::get_surface_resolution();
-        uint32_t dma_buf_fd = parent::get_dma_buf_fd();
-        auto dmabuf = parent::get_dmabuf();
-        buffer_params = zwp_linux_dmabuf_v1_create_params(dmabuf);
-        zwp_linux_buffer_params_v1_add(buffer_params, dma_buf_fd, 0, 0, width, 0, 0);
-        buffer = zwp_linux_buffer_params_v1_create_immed(buffer_params, width, height, DRM_FORMAT_XRGB8888, 0);
-        assert(buffer != nullptr);
-        auto surface = parent::get_wayland_surface();
-        wl_surface_attach(surface, buffer, 0, 0);
-        wl_surface_commit(surface);
+    ~add_presentation_copy() {
+        shutting_down = true;
+        slots.clear();
+        if (upload_ptr != nullptr) {
+            (void)hipHostFree(upload_ptr);
+        }
     }
-    void destroy() {
-        wl_buffer_destroy(buffer);
-        zwp_linux_buffer_params_v1_destroy(buffer_params);
+
+    void draw() {
+        presentation_pending = true;
+        present_latest();
     }
-    auto get_buffer() {
-        return buffer;
+
+    void recreate_surface() {
+        create_generation();
+        presentation_pending = true;
+        present_latest();
     }
+
 private:
-    zwp_linux_buffer_params_v1* buffer_params;
-    wl_buffer* buffer;
-};
+    struct presentation_slot {
+        add_presentation_copy* owner{};
+        uint64_t generation{};
+        uint32_t width{};
+        uint32_t height{};
+        uint32_t stride{};
+        size_t size{};
+        amdgpu_bo_handle bo{};
+        hipExternalMemory_t external_memory{};
+        void* mapped{};
+        wl_buffer* buffer{};
+        bool busy{};
+        bool retired{};
 
-template<typename T>
-class add_hip_draw : public T {
-public:
-    using parent = T;
-    add_hip_draw(const configure auto& conf) : parent{conf},
-        upload_ptr{}
-    {
-        auto fb_width = parent::get_fb_width();
-        auto fb_height = parent::get_fb_height();
-        upload_size = static_cast<size_t>(fb_width) * fb_height
-                * sizeof(uint32_t);
-        int ret = hipHostMalloc(&upload_ptr, upload_size);
+        ~presentation_slot() {
+            if (buffer != nullptr) {
+                wl_buffer_destroy(buffer);
+            }
+            if (mapped != nullptr) {
+                auto ret = hipFree(mapped);
+                if (ret != hipSuccess) {
+                    std::cerr << std::format("hipFree presentation buffer failed: {}\n", static_cast<int>(ret));
+                }
+            }
+            if (external_memory != nullptr) {
+                auto ret = hipDestroyExternalMemory(external_memory);
+                if (ret != hipSuccess) {
+                    std::cerr << std::format("hipDestroyExternalMemory failed: {}\n", static_cast<int>(ret));
+                }
+            }
+            if (bo != nullptr) {
+                int ret = amdgpu_bo_free(bo);
+                if (ret < 0) {
+                    std::cerr << std::format("amdgpu_bo_free failed: {}\n", ret);
+                }
+            }
+        }
+    };
+
+    static void buffer_release(void* data, wl_buffer*) {
+        auto* slot = static_cast<presentation_slot*>(data);
+        assert(slot != nullptr && slot->owner != nullptr);
+        slot->owner->release_slot(slot);
+    }
+
+    static constexpr wl_buffer_listener buffer_listener{
+        .release = buffer_release,
+    };
+
+    std::unique_ptr<presentation_slot> create_slot(uint64_t generation,
+            uint32_t width, uint32_t height) {
+        auto slot = std::make_unique<presentation_slot>();
+        slot->owner = this;
+        slot->generation = generation;
+        slot->width = width;
+        slot->height = height;
+        slot->stride = width * sizeof(uint32_t);
+        slot->size = static_cast<size_t>(slot->stride) * height;
+
+        amdgpu_bo_alloc_request request{
+            .alloc_size = slot->size,
+            .phys_alignment = 4096,
+            .preferred_heap = AMDGPU_GEM_DOMAIN_VRAM,
+            .flags = AMDGPU_GEM_CREATE_CPU_GTT_USWC,
+        };
+        int ret = amdgpu_bo_alloc(parent::get_amdgpu_device(), &request, &slot->bo);
+        if (ret < 0) {
+            throw std::runtime_error{"amdgpu_bo_alloc failed"};
+        }
+
+        uint32_t exported_fd = 0;
+        ret = amdgpu_bo_export(slot->bo, amdgpu_bo_handle_type_dma_buf_fd,
+                &exported_fd);
+        if (ret < 0) {
+            throw std::runtime_error{"amdgpu_bo_export failed"};
+        }
+        int hip_fd = static_cast<int>(exported_fd);
+        int wayland_fd = dup(hip_fd);
+        if (wayland_fd < 0) {
+            close(hip_fd);
+            throw std::runtime_error{"dup dma-buf fd failed"};
+        }
+
+        hipExternalMemoryHandleDesc external_desc{};
+        external_desc.type = hipExternalMemoryHandleTypeOpaqueFd;
+        external_desc.handle.fd = hip_fd;
+        external_desc.size = slot->size;
+        ret = hipImportExternalMemory(&slot->external_memory, &external_desc);
+        if (ret != hipSuccess) {
+            close(hip_fd);
+            close(wayland_fd);
+            throw std::runtime_error{std::format("hipImportExternalMemory failed: {}", ret)};
+        }
+        // A successful opaque-fd import transfers ownership of hip_fd to HIP.
+
+        hipExternalMemoryBufferDesc buffer_desc{};
+        buffer_desc.size = slot->size;
+        ret = hipExternalMemoryGetMappedBuffer(&slot->mapped,
+                slot->external_memory, &buffer_desc);
+        if (ret != hipSuccess) {
+            close(wayland_fd);
+            throw std::runtime_error{std::format(
+                    "hipExternalMemoryGetMappedBuffer failed: {}", ret)};
+        }
+
+        auto* params = zwp_linux_dmabuf_v1_create_params(parent::get_dmabuf());
+        zwp_linux_buffer_params_v1_add(params, wayland_fd, 0, 0,
+                slot->stride, 0, 0);
+        slot->buffer = zwp_linux_buffer_params_v1_create_immed(params,
+                width, height, DRM_FORMAT_XRGB8888, 0);
+        zwp_linux_buffer_params_v1_destroy(params);
+        close(wayland_fd);
+        if (slot->buffer == nullptr) {
+            throw std::runtime_error{"zwp_linux_buffer_params_v1_create_immed failed"};
+        }
+        if (wl_buffer_add_listener(slot->buffer, &buffer_listener, slot.get()) < 0) {
+            throw std::runtime_error{"wl_buffer_add_listener failed"};
+        }
+        return slot;
+    }
+
+    void create_generation() {
+        auto [width_value, height_value] = parent::get_surface_resolution();
+        if (width_value <= 0 || height_value <= 0) {
+            return;
+        }
+        auto width = static_cast<uint32_t>(width_value);
+        auto height = static_cast<uint32_t>(height_value);
+        uint64_t new_generation = generation + 1;
+        std::vector<std::unique_ptr<presentation_slot>> created;
+        created.reserve(slot_count);
+        for (size_t i = 0; i < slot_count; ++i) {
+            created.push_back(create_slot(new_generation, width, height));
+        }
+
+        for (auto& slot : slots) {
+            slot->retired = true;
+        }
+        generation = new_generation;
+        for (auto& slot : created) {
+            slots.push_back(std::move(slot));
+        }
+        std::erase_if(slots, [](const auto& slot) {
+            return slot->retired && !slot->busy;
+        });
+    }
+
+    void ensure_upload() {
+        size_t needed = static_cast<size_t>(parent::get_fb_width())
+                * parent::get_fb_height() * sizeof(uint32_t);
+        if (needed <= upload_size) {
+            return;
+        }
+        if (upload_ptr != nullptr) {
+            (void)hipHostFree(upload_ptr);
+            upload_ptr = nullptr;
+            upload_size = 0;
+        }
+        int ret = hipHostMalloc(&upload_ptr, needed);
         if (ret != hipSuccess || upload_ptr == nullptr) {
             throw std::runtime_error{std::format("hipHostMalloc failed: {}", ret)};
         }
+        upload_size = needed;
     }
-    void draw() {
+
+    presentation_slot* free_current_slot() {
+        for (auto& slot : slots) {
+            if (!slot->retired && slot->generation == generation && !slot->busy) {
+                return slot.get();
+            }
+        }
+        return nullptr;
+    }
+
+    void present_latest() {
+        if (shutting_down || !presentation_pending) {
+            return;
+        }
+        auto* slot = free_current_slot();
+        if (slot == nullptr) {
+            return;
+        }
+
+        ensure_upload();
         auto fb_width = parent::get_fb_width();
         auto fb_height = parent::get_fb_height();
-        // The server can rescale mid-session, so the staging buffer is sized
-        // per draw rather than once at construction.
-        auto needed = static_cast<size_t>(fb_width) * fb_height
-                * sizeof(uint32_t);
-        if (needed > upload_size) {
-            if (upload_ptr) (void)hipHostFree(upload_ptr);
-            upload_ptr = nullptr;
-            int ret = hipHostMalloc(&upload_ptr, needed);
-            if (ret != hipSuccess || upload_ptr == nullptr) {
-                upload_size = 0;
-                throw std::runtime_error{std::format("hipHostMalloc failed: {}", ret)};
-            }
-            upload_size = needed;
-        }
-        auto [width,height] = parent::get_surface_resolution();
-        auto hip_memory = parent::get_external_memory();
-        auto frame_ptr = reinterpret_cast<uint32_t*>(parent::get_external_memory_buffer());
-
-        parent::get_rfb(std::span{reinterpret_cast<uint8_t*>(upload_ptr), fb_width*fb_height*sizeof(uint32_t)});
+        parent::get_rfb(std::span{reinterpret_cast<uint8_t*>(upload_ptr),
+                static_cast<size_t>(fb_width) * fb_height * sizeof(uint32_t)});
         copy_frame<<<dim3(8,8,1), dim3(32,1,1),0>>>(
-                frame_ptr, width, height,
+                static_cast<uint32_t*>(slot->mapped), slot->width, slot->height,
                 upload_ptr, fb_width, fb_height,
-                (width+32*8-1)/(32*8), (height+1*8-1)/(1*8));
+                (slot->width+32*8-1)/(32*8), (slot->height+1*8-1)/(1*8));
         int ret = hipDeviceSynchronize();
         if (ret != hipSuccess) {
             throw std::runtime_error{std::format("hipDeviceSynchronize failed: {}", ret)};
         }
 
-        auto surface = parent::get_wayland_surface();
-        auto buffer = parent::get_buffer();
-        wl_surface_damage(surface, 0, 0, width, height);
+        auto* surface = parent::get_wayland_surface();
+        slot->busy = true;
+        wl_surface_attach(surface, slot->buffer, 0, 0);
+        wl_surface_damage(surface, 0, 0, slot->width, slot->height);
         wl_surface_commit(surface);
-        auto display = parent::get_display();
-        wl_display_flush(display);
+        wl_display_flush(parent::get_display());
+        presentation_pending = false;
     }
-    __global__
-    static void copy_frame(
+
+    void release_slot(presentation_slot* released) {
+        released->busy = false;
+        if (released->retired) {
+            std::erase_if(slots, [released](const auto& slot) {
+                return slot.get() == released;
+            });
+        }
+        present_latest();
+    }
+
+    __global__ static void copy_frame(
             uint32_t* frame_ptr, uint32_t frame_width, uint32_t frame_height,
             uint32_t* src, uint32_t width, uint32_t height,
             uint32_t tile_width, uint32_t tile_height) {
@@ -363,11 +505,15 @@ public:
             }
         }
     }
-private:
-    uint32_t* upload_ptr;
-    size_t upload_size{};
-};
 
+    static constexpr size_t slot_count = 3;
+    std::vector<std::unique_ptr<presentation_slot>> slots;
+    uint32_t* upload_ptr{};
+    size_t upload_size{};
+    uint64_t generation{};
+    bool presentation_pending{};
+    bool shutting_down{};
+};
 template<class T>
 class add_rfb_latency_analyser : public T {
 public:
@@ -470,6 +616,11 @@ public:
     {
         set_callback();
     }
+    ~add_rfb_reduce_update() {
+        if (frame_callback != nullptr) {
+            wl_callback_destroy(frame_callback);
+        }
+    }
     void request_framebuffer_update(int x, int y, int width, int height, bool increment_update=true) {
         if (wayland_frame) {
             parent::request_framebuffer_update(x, y, width, height, increment_update);
@@ -486,17 +637,21 @@ public:
 private:
     static void static_frame_event(void* p, wl_callback* callback, uint32_t data) {
         auto t = reinterpret_cast<add_rfb_reduce_update*>(p);
-        t->frame_event();
+        t->frame_event(callback);
     }
     void set_callback() {
+        assert(frame_callback == nullptr);
         auto wayland_surface = parent::get_wayland_surface();
-        auto callback = wl_surface_frame(wayland_surface);
+        frame_callback = wl_surface_frame(wayland_surface);
         static struct wl_callback_listener callback_listener = {
             .done = static_frame_event,
         };
-        wl_callback_add_listener(callback, &callback_listener, this);
+        wl_callback_add_listener(frame_callback, &callback_listener, this);
     }
-    void frame_event() {
+    void frame_event(wl_callback* callback) {
+        assert(callback == frame_callback);
+        wl_callback_destroy(frame_callback);
+        frame_callback = nullptr;
         if (ignored_update) {
             parent::request_framebuffer_update();
             ignored_update = false;
@@ -520,6 +675,7 @@ private:
     }
     bool wayland_frame;
     bool ignored_update;
+    wl_callback* frame_callback{};
 };
 
 template<typename T>
@@ -615,16 +771,41 @@ private:
     clock::time_point previous_time;
 };
 
-using draw_app =
-    wayland_helper::run_wayland_event_loop<
-    wayland_helper::add_wayland_pollfds_loop<
-    posix::add_poll_events<
-    wayland_helper::add_wayland_pollfd<
-    wayland_helper::register_pointer_axis_callback<
-    wayland_helper::register_pointer_button_callback<
-    wayland_helper::register_pointer_motion_callback<
-    wayland_helper::register_key_callback<
-    wayland_helper::register_keyboard_leave_callback<
+using app_transport =
+    rfb::set_address<
+    rfb::set_port<
+    posix::add_empty_pollfd_array<
+    wayland_helper::add_wayland_surface<
+    cpp_helper::add_logger<
+    empty_class
+    >>>>>;
+
+using app_rfb =
+    rfb_trace::add_trace_recorder<
+    add_rfb<
+    app_transport
+    >>;
+
+using app_presentation =
+    add_rfb_process_keysym<
+    add_rfb_process_pointer<
+    wayland_helper::register_size_change_callback<
+    add_presentation_copy<
+    drm_helper::add_amdgpu_device<
+    drm_helper::add_drm_fd<
+    app_rfb
+    >>>>>>;
+
+using app_protocol =
+    add_info_printer<
+    rfb_control::add_control_port<
+    add_rfb_socket_pollfd<
+    add_rfb_reduce_update<
+    add_rfb_latency_analyser<
+    app_presentation
+    >>>>>;
+
+using app_keyboard =
     wayland_helper::add_repeat_key<
     posix::add_time_point_callbacks<
     wayland_helper::register_keyboard_modifiers_callback<
@@ -635,39 +816,26 @@ using draw_app =
     xkb_helper::add_state<
     xkb_helper::add_keymap<
     xkb_helper::add_context<
-    add_info_printer<
-    rfb_control::add_control_port<
-    add_rfb_socket_pollfd<
-    add_rfb_reduce_update<
-    add_rfb_latency_analyser<
-    add_rfb_process_keysym<
-    add_rfb_process_pointer<
-    add_hip_draw<
-    wayland_helper::register_size_change_callback<
-    wayland_helper::add_recreate_surface_for<
-    attach_dma_buf_fd_to_surface<
-    wayland_helper::add_recreate_surface_for<
-    hip_helper::add_external_memory_buffer<
-    wayland_helper::add_recreate_surface_for<
-    hip_helper::add_external_memory<
-    wayland_helper::add_recreate_surface_for<
-    drm_helper::add_dma_buf_fd_with_amdgpu_bo<
-    wayland_helper::add_recreate_surface_for<
-    drm_helper::add_amdgpu_bo<
-    set_bo_alloc_size<
-    wayland_helper::add_dummy_recreate_surface<
-    drm_helper::add_amdgpu_device<
-    drm_helper::add_drm_fd<
-    rfb_trace::add_trace_recorder<
-    add_rfb<
-    rfb::set_address<
-    rfb::set_port<
-    posix::add_empty_pollfd_array<
-    wayland_helper::add_wayland_surface<
-    cpp_helper::add_logger<
-    empty_class
-    >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-;
+    app_protocol
+    >>>>>>>>>>;
+
+using app_input =
+    wayland_helper::register_pointer_axis_callback<
+    wayland_helper::register_pointer_button_callback<
+    wayland_helper::register_pointer_motion_callback<
+    wayland_helper::register_key_callback<
+    wayland_helper::register_keyboard_leave_callback<
+    app_keyboard
+    >>>>>;
+
+using draw_app =
+    wayland_helper::run_wayland_event_loop<
+    wayland_helper::add_wayland_pollfds_loop<
+    posix::add_poll_events<
+    wayland_helper::add_wayland_pollfd<
+    app_input
+    >>>>;
+
 
 using namespace std::literals;
 

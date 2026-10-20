@@ -272,7 +272,7 @@ public:
     }
 private:
     std::vector<uint8_t> internal_frame;
-    bool frame_updated;
+    bool frame_updated{};
     encoding encoding_type{};
     uint32_t frame_network_byte_count{};
     uint16_t last_rectangle_count{};

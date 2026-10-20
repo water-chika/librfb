@@ -8,6 +8,49 @@ Library for Remote Frame Buffer protocol.
 2. ZRLE
 3. H264
 
+## Compile-time layer composition
+
+The Linux tools assemble features with **linear policy-mixin inheritance**. Each
+layer is a class template that inherits from the next layer and adds or
+intercepts part of its interface:
+
+```cpp
+template<class Parent>
+class add_logging : public Parent { /* ... */ };
+
+template<class Parent>
+class add_protocol : public Parent { /* ... */ };
+
+using app = add_logging<add_protocol<base_app>>;
+```
+
+This is **not CRTP**. In CRTP, a derived class passes itself to a base template,
+for example `class app : base<app>`. Here, each policy receives its parent layer
+instead; the final type is a compile-time decorator stack. Calls generally flow
+down through `parent::operation()`, while a layer can expose or override an
+operation for layers above it.
+
+Ordering is part of the contract. A layer must sit above the operations it
+calls and below the layers whose operations it needs to intercept. Comments in
+policy headers such as `control.hpp` and `trace.hpp` list those requirements.
+There are no virtual calls, but construction runs from the innermost base
+outward and destruction runs in reverse.
+
+Do not write the entire application as one deeply nested alias. Group related
+policies into named stages so dependencies and compiler errors remain readable:
+
+```cpp
+using app_transport = /* Wayland surface, polling, address and port */;
+using app_rfb = add_rfb<app_transport>;
+using app_presentation = add_presentation_copy<app_rfb>;
+using app_input = add_input<app_presentation>;
+using draw_app = add_event_loop<app_input>;
+```
+
+For stateful resources with coupled lifetimes, prefer one cohesive policy layer
+(such as the release-gated presentation buffer pool) over scattering one
+resource across many tiny inheritance layers.
+
 ## rfb_server
 
 `rfb_server` is the server half of the protocol: it exports the local desktop
