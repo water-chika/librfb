@@ -194,6 +194,8 @@ std::string run_command(Session& session, std::string_view host,
                 encodings.push_back(rfb::to_big_endian(static_cast<std::uint32_t>(value)));
             encodings.push_back(rfb::to_big_endian(
                 static_cast<std::uint32_t>(rfb::encoding::scale_ext)));
+            encodings.push_back(rfb::to_big_endian(
+                static_cast<std::uint32_t>(rfb::encoding::desktop_size)));
             session.set_supported_encodings(std::move(encodings));
             session.set_encodings();
             return std::format("ok {}", spec);

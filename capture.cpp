@@ -256,6 +256,8 @@ int main(int argc, const char* argv[]) {
         // an SSH tunnel and looks like a hang; ZRLE brings that down to ~3 s.
         encodings = {rfb::to_big_endian(uint32_t{16}), 0};
     }
+    encodings.emplace_back(rfb::to_big_endian(
+        static_cast<uint32_t>(rfb::encoding::desktop_size)));
 
     auto conf = config{
         .address = address, .port = port,

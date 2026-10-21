@@ -104,6 +104,15 @@ rfb_server --console-launcher [server options]   # Windows autostart helper
 - Clipboard transfers both ways on Windows.
 - Multiple viewers can connect at once; each gets its own thread, encoder and
   zlib stream.
+- Desktop geometry is polled on every Windows capture. When its width, height or
+  virtual-screen origin changes, GDI resources are rebuilt and clients that
+  advertised the standard DesktopSize pseudo-encoding (-223) receive a
+  standalone size announcement followed by a complete frame. Clients without
+  DesktopSize support are disconnected rather than sent out-of-bounds pixels.
+  The native Wayland and Win32 viewers and `rfb_capture` advertise and resize
+  safely; `rfb_input` and `rfb_recorder` intentionally do not, and the recorder
+  rejects an explicit `desktopsize` encoding because one output stream cannot
+  change dimensions.
 - `rfb_server` deliberately does not link the `rfb` library, so by default it
   needs only zlib and OpenSSL — no ffmpeg. Turning on `RFB_SERVER_H264` is the
   one thing that changes that.

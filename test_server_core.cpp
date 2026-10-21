@@ -39,6 +39,15 @@ int main() {
     assert(converted->pixels[4] == 60 && converted->pixels[5] == 50 &&
            converted->pixels[6] == 40);
 
+    auto resized = std::make_shared<remote_media::OwnedFrame>(
+        3, 2, remote_media::PixelFormat::bgra8);
+    assert(mailbox->publish(resized) == 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    converted = source.frame(generation);
+    assert(generation == 2 && converted);
+    assert(source.width() == 3 && source.height() == 2);
+    assert(converted->width == 3 && converted->height == 2);
+
     auto sink = std::make_shared<recording_sink>();
     input_forwarder input{sink};
     input.key_event('A', true);

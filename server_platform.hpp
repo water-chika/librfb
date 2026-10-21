@@ -270,6 +270,14 @@ public:
                 return false;
             }
         }
+        else {
+            int x = 0, y = 0, width = 0, height = 0;
+            if (try_query_geometry(x, y, width, height) &&
+                (x != m_origin_x || y != m_origin_y || width != m_width ||
+                 height != m_height)) {
+                if (!rebuild_gdi()) return false;
+            }
+        }
         // CAPTUREBLT includes layered windows, which is most of the modern
         // Windows 11 shell.
         if (!blit()) {
@@ -353,22 +361,25 @@ private:
         m_bits = nullptr;
     }
 
-    void query_geometry() {
+    bool try_query_geometry(int& x, int& y, int& width, int& height) const {
         if (m_options.all_monitors) {
-            m_origin_x = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
-            m_origin_y = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
-            m_width = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
-            m_height = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            x = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
+            y = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
+            width = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            height = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
         }
         else {
-            m_origin_x = 0;
-            m_origin_y = 0;
-            m_width = ::GetSystemMetrics(SM_CXSCREEN);
-            m_height = ::GetSystemMetrics(SM_CYSCREEN);
+            x = 0;
+            y = 0;
+            width = ::GetSystemMetrics(SM_CXSCREEN);
+            height = ::GetSystemMetrics(SM_CYSCREEN);
         }
-        if (m_width <= 0 || m_height <= 0) {
+        return width > 0 && height > 0;
+    }
+
+    void query_geometry() {
+        if (!try_query_geometry(m_origin_x, m_origin_y, m_width, m_height))
             throw std::runtime_error{"screen size query fail"};
-        }
     }
 
     void create_dib() {

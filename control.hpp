@@ -485,6 +485,8 @@ private:
         }
         encodings.emplace_back(rfb::to_big_endian(
                 static_cast<uint32_t>(rfb::encoding::scale_ext)));
+        encodings.emplace_back(rfb::to_big_endian(
+                static_cast<uint32_t>(rfb::encoding::desktop_size)));
         parent::set_supported_encodings(std::move(encodings));
         parent::set_encodings();
         return std::format("ok {}", spec);

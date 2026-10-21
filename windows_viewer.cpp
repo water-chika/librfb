@@ -476,6 +476,8 @@ int main(int argc, const char* argv[]) {
         if (encodings.empty()) encodings = {rfb::to_big_endian(50u), rfb::to_big_endian(16u), 0};
         encodings.push_back(rfb::to_big_endian(
             static_cast<std::uint32_t>(rfb::encoding::scale_ext)));
+        encodings.push_back(rfb::to_big_endian(
+            static_cast<std::uint32_t>(rfb::encoding::desktop_size)));
         config conf{.address = host, .port = port,
                     .supported_encodings = std::move(encodings),
                     .view_only = view_only, .password = std::move(password),

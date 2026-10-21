@@ -57,6 +57,9 @@ enum class encoding : uint32_t {
     raw = 0,
     zrle = 16,
     h264 = 50,
+    // Standard RFB DesktopSize pseudo-encoding (-223). The rectangle carries
+    // the new framebuffer dimensions and has no payload.
+    desktop_size = 0xFFFFFF21u,
     // Private librfb pseudo-encoding: "server supports live rescaling, and
     // the rectangle header carries the size it is now serving". -1729 as
     // unsigned. Pseudo-encodings are ignorable by definition, so a standard
@@ -67,6 +70,7 @@ static auto encoding_str_map = std::map<rfb::encoding, std::string_view>{
     {encoding::raw, "raw"},
     {encoding::zrle, "ZRLE"},
     {encoding::h264, "H264"},
+    {encoding::desktop_size, "DesktopSize"},
     {encoding::scale_ext, "SCALE_EXT"},
 };
 
@@ -151,14 +155,20 @@ public:
                 std::cerr << "height: " << height << std::endl;
                 std::cerr << "encoding_type: " << encoding_type << std::endl;
             }
-            if (encoding_type == encoding::scale_ext) {
-                // Carries no pixel data: the header IS the message. Seeing it
-                // at all is the server advertising support, so the client may
-                // start asking for scale changes from here on.
+            if (encoding_type == encoding::scale_ext ||
+                encoding_type == encoding::desktop_size) {
+                if (x != 0 || y != 0)
+                    throw std::runtime_error{"framebuffer size rectangle has nonzero origin"};
+                if (encoding_type == encoding::desktop_size && i + 1 != rectangles_count)
+                    throw std::runtime_error{"DesktopSize rectangle is not last"};
+                // Carries no pixel data: the header IS the message. Seeing a
+                // scale_ext also advertises that private extension; DesktopSize
+                // is the standard dynamic framebuffer-size notification.
                 auto frame_bytes = static_cast<size_t>(width) * height * 4;
                 if (!width || !height || frame_bytes > max_framebuffer_bytes)
                     throw std::runtime_error{"invalid framebuffer dimensions"};
-                scale_ext_supported = true;
+                if (encoding_type == encoding::scale_ext)
+                    scale_ext_supported = true;
                 parent::set_framebuffer_size(width, height);
                 internal_frame.assign(frame_bytes, 0);
                 fb_width = width;
@@ -568,7 +578,12 @@ private:
                 byte_at(offset + 10), byte_at(offset + 11)));
             offset += 12;
             size_t payload{};
-            if (type == encoding::scale_ext) {
+            if (type == encoding::scale_ext ||
+                type == encoding::desktop_size) {
+                if (x != 0 || y != 0)
+                    throw std::runtime_error{"framebuffer size rectangle has nonzero origin"};
+                if (type == encoding::desktop_size && i + 1 != rectangles)
+                    throw std::runtime_error{"DesktopSize rectangle is not last"};
                 checked_frame_bytes(width, height);
                 fb_width = width;
                 fb_height = height;

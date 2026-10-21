@@ -347,6 +347,10 @@ int main(int argc, const char* argv[]) {
                         std::string{"unknown encoding: "} + argv[i]};
                 }
                 for (auto v : *parsed) {
+                    if (v == static_cast<int32_t>(rfb::encoding::desktop_size)) {
+                        throw std::runtime_error{
+                            "rfb_recorder does not support DesktopSize"};
+                    }
                     encodings.emplace_back(
                         rfb::to_big_endian(static_cast<uint32_t>(v)));
                 }

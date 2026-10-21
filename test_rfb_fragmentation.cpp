@@ -146,6 +146,67 @@ void eight_k_edges_and_limits() {
     assert(rejects(too_large, encoded));
 }
 
+void fragmented_desktop_size_then_pixels() {
+    buffer input{test_config{}};
+    const std::vector<uint8_t> resize{
+        0, 0, 0, 1,
+        0, 0, 0, 0, 0, 3, 0, 2,
+        0xff, 0xff, 0xff, 0x21,
+    };
+    const std::vector<uint8_t> pixels{
+        0, 0, 0, 1,
+        0, 0, 0, 0, 0, 3, 0, 2,
+        0, 0, 0, 0,
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+        13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    };
+
+    for (size_t i = 0; i < resize.size(); ++i) {
+        append(input, resize, i, i + 1);
+        assert(input.has_complete_server_message() == (i + 1 == resize.size()));
+    }
+    input.begin_complete_server_message();
+    std::vector<uint8_t> decoded(resize.size());
+    input.rfb_read(decoded);
+    input.finish_complete_server_message();
+    assert(decoded == resize);
+
+    // The framing layer must now validate against 3x2, not ServerInit's size.
+    for (size_t i = 0; i < pixels.size(); ++i) {
+        append(input, pixels, i, i + 1);
+        assert(input.has_complete_server_message() == (i + 1 == pixels.size()));
+    }
+}
+
+void desktop_size_rejects_invalid_geometry() {
+    buffer input{test_config{}};
+    const std::vector<uint8_t> zero_width{
+        0, 0, 0, 1,
+        0, 0, 0, 0, 0, 0, 0, 2,
+        0xff, 0xff, 0xff, 0x21,
+    };
+    assert(rejects(input, zero_width));
+
+    buffer nonzero_origin{test_config{}};
+    const std::vector<uint8_t> bad_origin{
+        0, 0, 0, 1,
+        0, 1, 0, 0, 0, 3, 0, 2,
+        0xff, 0xff, 0xff, 0x21,
+    };
+    assert(rejects(nonzero_origin, bad_origin));
+
+    buffer not_last{test_config{}};
+    const std::vector<uint8_t> desktop_size_not_last{
+        0, 0, 0, 2,
+        0, 0, 0, 0, 0, 3, 0, 2,
+        0xff, 0xff, 0xff, 0x21,
+        0, 0, 0, 0, 0, 1, 0, 1,
+        0, 0, 0, 0,
+        1, 2, 3, 4,
+    };
+    assert(rejects(not_last, desktop_size_not_last));
+}
+
 } // namespace
 
 int main() {
@@ -153,4 +214,6 @@ int main() {
     fragmented_variable_messages();
     complete_messages_are_separated();
     eight_k_edges_and_limits();
+    fragmented_desktop_size_then_pixels();
+    desktop_size_rejects_invalid_geometry();
 }

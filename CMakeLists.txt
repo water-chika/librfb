@@ -275,6 +275,21 @@ if(BUILD_TESTING)
         target_link_libraries(rfb_server_core_tests PRIVATE Threads::Threads)
     endif()
     add_test(NAME rfb_server_core_tests COMMAND rfb_server_core_tests)
+
+    add_executable(rfb_server_session_tests test_server_session.cpp)
+    target_compile_features(rfb_server_session_tests PRIVATE cxx_std_20)
+    target_link_libraries(rfb_server_session_tests PRIVATE
+        rfb::server_core
+        ${RFB_PLATFORM_LIBS}
+    )
+    if(WIN32)
+        target_link_libraries(rfb_server_session_tests PRIVATE gdi32 user32)
+        target_compile_definitions(rfb_server_session_tests PRIVATE
+            ${RFB_PLATFORM_DEFINITIONS})
+    else()
+        target_link_libraries(rfb_server_session_tests PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME rfb_server_session_tests COMMAND rfb_server_session_tests)
 endif()
 
 # The window demo renders through Wayland + DRM/amdgpu + HIP external

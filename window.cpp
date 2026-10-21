@@ -1237,6 +1237,8 @@ int main(int argc, const char* argv[]) {
     // then never sends a scale request, so nothing is wedged either way.
     encodings.emplace_back(rfb::to_big_endian(
             static_cast<uint32_t>(rfb::encoding::scale_ext)));
+    encodings.emplace_back(rfb::to_big_endian(
+            static_cast<uint32_t>(rfb::encoding::desktop_size)));
     auto conf = config{
         .address=address, .port=port,
         .supported_encodings = std::move(encodings),

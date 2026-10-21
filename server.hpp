@@ -203,40 +203,45 @@ public:
     // The size the client is told about and every encoder works in, which is
     // the captured size only when no downscale is configured.
     int width() const override {
-        int w = 0, h = 0;
-        served_size(m_capture.width(), m_capture.height(), m_scale, m_max_width,
-                    w, h);
-        return w;
+        std::lock_guard lock{m_mutex};
+        return width_locked();
     }
     int height() const override {
-        int w = 0, h = 0;
-        served_size(m_capture.width(), m_capture.height(), m_scale, m_max_width,
-                    w, h);
-        return h;
+        std::lock_guard lock{m_mutex};
+        return height_locked();
     }
     void set_scale(double scale) override {
         std::lock_guard lock{m_mutex};
         m_scale = scale;
     }
     bool scaling() const {
-        return width() != m_capture.width() || height() != m_capture.height();
+        std::lock_guard lock{m_mutex};
+        return scaling_locked();
     }
     // Maps a viewer coordinate back into the real desktop, so that a pointer
     // event still lands where the user aimed it when the image was shrunk.
     int to_capture_x(int x) const override {
-        int served = width();
+        std::lock_guard lock{m_mutex};
+        int served = width_locked();
         if (served <= 0 || served == m_capture.width()) return x;
         return static_cast<int>(static_cast<int64_t>(x) * m_capture.width() /
                                 served);
     }
     int to_capture_y(int y) const override {
-        int served = height();
+        std::lock_guard lock{m_mutex};
+        int served = height_locked();
         if (served <= 0 || served == m_capture.height()) return y;
         return static_cast<int>(static_cast<int64_t>(y) * m_capture.height() /
                                 served);
     }
-    int origin_x() const override { return m_capture.origin_x(); }
-    int origin_y() const override { return m_capture.origin_y(); }
+    int origin_x() const override {
+        std::lock_guard lock{m_mutex};
+        return m_capture.origin_x();
+    }
+    int origin_y() const override {
+        std::lock_guard lock{m_mutex};
+        return m_capture.origin_y();
+    }
 
     // Returns the newest frame, capturing a fresh one if the previous is
     // older than the frame interval. generation changes whenever the pixels
@@ -250,10 +255,11 @@ public:
             // session will encode. With one, it goes through m_raw first and
             // only the shrunk copy is ever published.
             bool captured = false;
-            if (scaling()) {
+            if (scaling_locked()) {
                 captured = m_capture.capture(m_raw);
                 if (captured) {
-                    downscale_frame(m_raw, *next, width(), height(), m_box_filter);
+                    downscale_frame(m_raw, *next, width_locked(), height_locked(),
+                                    m_box_filter);
                 }
             }
             else {
@@ -305,6 +311,23 @@ public:
     }
 
 private:
+    int width_locked() const {
+        int width = 0, height = 0;
+        served_size(m_capture.width(), m_capture.height(), m_scale, m_max_width,
+                    width, height);
+        return width;
+    }
+    int height_locked() const {
+        int width = 0, height = 0;
+        served_size(m_capture.width(), m_capture.height(), m_scale, m_max_width,
+                    width, height);
+        return height;
+    }
+    bool scaling_locked() const {
+        return width_locked() != m_capture.width() ||
+               height_locked() != m_capture.height();
+    }
+
     // Reuses buffers no session still holds, instead of allocating several
     // megabytes per captured frame.
     std::shared_ptr<frame_buffer> acquire_buffer() {
@@ -496,6 +519,7 @@ private:
 inline constexpr uint32_t encoding_raw = 0;
 inline constexpr uint32_t encoding_zrle = 16;
 inline constexpr uint32_t encoding_h264 = 50;
+inline constexpr uint32_t encoding_desktop_size = static_cast<uint32_t>(-223);
 // Private librfb pseudo-encoding (-1729) and the matching client message
 // type. See rfb.hpp for the negotiation rules: the server only ever emits the
 // pseudo-encoding to a client that advertised it, and only such a client will
@@ -675,7 +699,9 @@ private:
 
         uint8_t shared_flag{};
         read_exact(&shared_flag, 1);
-        send_server_init();
+        auto initial_size = send_server_init();
+        m_desktop_width = initial_size.width;
+        m_desktop_height = initial_size.height;
     }
 
     void send_security_result(bool ok) {
@@ -740,11 +766,12 @@ private:
         }
     }
 
-    void send_server_init() {
+    rectangle send_server_init() {
         auto format = native_pixel_format();
+        rectangle size{0, 0, m_screen.width(), m_screen.height()};
         std::vector<uint8_t> message{};
-        push_u16(message, static_cast<uint16_t>(m_screen.width()));
-        push_u16(message, static_cast<uint16_t>(m_screen.height()));
+        push_u16(message, static_cast<uint16_t>(size.width));
+        push_u16(message, static_cast<uint16_t>(size.height));
         message.push_back(format.bits_per_pixel);
         message.push_back(format.depth);
         message.push_back(format.big_endian_flag);
@@ -760,6 +787,7 @@ private:
         message.insert(message.end(), m_options.desktop_name.begin(),
                        m_options.desktop_name.end());
         write_bytes(message);
+        return size;
     }
 
     // -- main loop ---------------------------------------------------------
@@ -891,6 +919,19 @@ private:
 
     // One rectangle, no pixel payload: the header tells the client the size
     // now being served. Also doubles as the support advertisement.
+    void send_desktop_size_announcement(int width, int height) {
+        std::vector<uint8_t> message{};
+        message.push_back(0); // FramebufferUpdate
+        message.push_back(0); // padding
+        push_u16(message, 1);
+        push_u16(message, 0);
+        push_u16(message, 0);
+        push_u16(message, static_cast<uint16_t>(width));
+        push_u16(message, static_cast<uint16_t>(height));
+        push_u32(message, encoding_desktop_size);
+        write_bytes(message);
+    }
+
     void send_scale_announcement() {
         std::vector<uint8_t> message{};
         message.push_back(0); // FramebufferUpdate
@@ -920,9 +961,17 @@ private:
         // list, so the whole list is always scanned.
         auto chosen = encoding_raw;
         bool picked = false;
+        // SetEncodings replaces, rather than augments, the previous list.
+        m_desktop_size = false;
+        m_scale_ext = false;
+        m_announce_scale = false;
         int quality_level = -1;
         for (uint16_t i = 0; i < count; i++) {
             auto encoding = read_u32(&body[static_cast<size_t>(i) * 4]);
+            if (encoding == encoding_desktop_size) {
+                m_desktop_size = true;
+                continue;
+            }
             if (encoding == encoding_scale_ext) {
                 // The client speaks the extension, so it is safe to answer
                 // with the pseudo-encoding rectangle.
@@ -1195,6 +1244,30 @@ private:
         if (frame == nullptr || frame->width == 0) {
             return;
         }
+        if (frame->width != m_desktop_width || frame->height != m_desktop_height) {
+            if (m_desktop_size) {
+                send_desktop_size_announcement(frame->width, frame->height);
+                // DesktopSize supersedes a pending private scale announcement.
+                m_announce_scale = false;
+            }
+            else if (m_scale_ext && m_announce_scale) {
+                // Older librfb viewers know only the private scale rectangle.
+                send_scale_announcement();
+            }
+            else {
+                throw client_gone{
+                    "desktop size changed but client advertised no size capability"};
+            }
+            // Size announcements stand alone. Reset stale coordinates and send
+            // a complete frame in the following FramebufferUpdate.
+            m_desktop_width = frame->width;
+            m_desktop_height = frame->height;
+            m_requested = rectangle{0, 0, frame->width, frame->height};
+            m_incremental = false;
+            m_previous = frame_buffer{};
+            m_force_keyframe = true;
+            return;
+        }
         if (m_announce_scale) {
             send_scale_announcement();
         }
@@ -1449,7 +1522,10 @@ private:
     bool m_update_pending{false};
     bool m_incremental{false};
     bool m_scale_ext{false};
+    bool m_desktop_size{false};
     bool m_announce_scale{false};
+    int m_desktop_width{};
+    int m_desktop_height{};
     uint32_t m_encoding{encoding_raw};
     bool m_force_keyframe{true};
     uint64_t m_sent_generation{0};
